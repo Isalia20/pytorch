@@ -627,9 +627,13 @@ TORCH_META_FUNC(linalg_lu_factor_ex)(const Tensor& A, bool pivot, bool check_err
   const auto m = sizes.cend()[-2];
   const auto n = sizes.cend()[-1];
 
-  // make column major strides for BLAS
-  auto LU_strides = at::native::batched_matrix_contiguous_strides(sizes, /*f-contig*=*/true);
-  set_output_strided(0, sizes, LU_strides, A.options(), {});
+  if (A.device().type() == at::kMPS){
+    auto LU_strides = at::native::batched_matrix_contiguous_strides(sizes, /*f-contig*=*/false);
+    set_output_strided(0, sizes, LU_strides, A.options(), {});
+  } else{
+    auto LU_strides = at::native::batched_matrix_contiguous_strides(sizes, /*f-contig*=*/true);
+    set_output_strided(0, sizes, LU_strides, A.options(), {});
+  }
 
   // Set sizes to the size of pivots
   sizes.pop_back();
