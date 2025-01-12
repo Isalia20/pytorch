@@ -104,10 +104,9 @@ static void linalg_lu_factor_ex_out_mps_impl(const Tensor& A,
   uint64_t aElemSize = A_t.element_size();
   uint64_t numPivots = std::min(aRows, aCols);
   std::vector<int64_t> pivot_sizes(A_t.sizes().begin(), A_t.sizes().end() - 2);
-  std::vector<int64_t> info_sizes(A_t.sizes().begin(), A_t.sizes().end() - 2);
+  resize_output(info, pivot_sizes);
   pivot_sizes.push_back(numPivots);
   resize_output(pivots, pivot_sizes);
-  resize_output(info, info_sizes);
 
   if (A_t.numel() == 0) {
     return;
@@ -189,9 +188,9 @@ static void linalg_lu_factor_ex_out_mps_impl(const Tensor& A,
     pivots.copy_(stacked_pivots.view(pivot_sizes));
   } else {
     pivots.copy_(stacked_pivots);
-    // info.copy_(stacked_status.view(info_sizes));
   }
-  info.copy_(stacked_status.view(info_sizes));
+  pivot_sizes.pop_back();
+  info.copy_(stacked_status.view(pivot_sizes));
   pivots.add_(1); // PyTorch's `pivots` is 1-index.
   if (check_errors) {
     for (const auto i : c10::irange(status_tensors.size())) {

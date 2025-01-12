@@ -2737,11 +2737,11 @@ class TestMPS(TestCaseMPS):
         make_fullrank = make_fullrank_matrices_with_distinct_singular_values
         make_arg = partial(make_fullrank, device="cpu", dtype=torch.float32)
 
-        def run_lu_factor_ex_test(size, *batch_dims, upper):
+        def run_lu_factor_ex_test(size, *batch_dims, check_errors):
             input_cpu = make_arg(*batch_dims, size, size)
             input_mps = input_cpu.to('mps')
-            out_cpu = torch.linalg.lu_factor_ex(input_cpu)
-            out_mps = torch.linalg.lu_factor_ex(input_mps)
+            out_cpu = torch.linalg.lu_factor_ex(input_cpu, check_errors=check_errors)
+            out_mps = torch.linalg.lu_factor_ex(input_mps, check_errors=check_errors)
             self.assertEqual(out_cpu, out_mps)
 
         # test with different even/odd matrix sizes
@@ -2749,13 +2749,13 @@ class TestMPS(TestCaseMPS):
         # even/odd batch sizes
         batch_sizes = [1, 2, 4]
 
-        for upper in [True, False]:
+        for check_errors in [True, False]:
             for size in matrix_sizes:
                 for batch_size in batch_sizes:
-                    run_lu_factor_ex_test(size, batch_size, upper=upper)
+                    run_lu_factor_ex_test(size, batch_size, check_errors=check_errors)
         # test >3D matrices
-        run_lu_factor_ex_test(64, 10, 10, upper=False)
-        run_lu_factor_ex_test(64, 2, 2, 2, 2, 10, 10, upper=True)
+        run_lu_factor_ex_test(32, 10, 10, check_errors=False)
+        run_lu_factor_ex_test(32, 2, 2, 2, 2, 10, 10, check_errors=True)
 
     def test_layer_norm(self):
         # TODO: Test non-contiguous
