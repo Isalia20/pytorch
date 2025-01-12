@@ -98,6 +98,7 @@ static void linalg_lu_factor_ex_out_mps_impl(const Tensor& A,
   TORCH_CHECK(!c10::isComplexType(A.scalar_type()) && !c10::isComplexType(LU.scalar_type()),
               "linalg.lu_factor(): MPS doesn't support complex types.");
   TORCH_CHECK(pivot, "linalg.lu_factor(): MPS doesn't allow pivot == False.");
+
   Tensor A_t = A;
   uint64_t aRows = A_t.size(-2);
   uint64_t aCols = A_t.size(-1);
@@ -121,7 +122,7 @@ static void linalg_lu_factor_ex_out_mps_impl(const Tensor& A,
   status_tensors.reserve(batchSize);
   pivots_list.reserve(batchSize);
   for ([[maybe_unused]] const auto i : c10::irange(batchSize)) {
-    status_tensors.push_back(at::zeros({1}, kInt, std::nullopt, kMPS, std::nullopt));
+    status_tensors.push_back(at::zeros(1, kInt, std::nullopt, kMPS, std::nullopt));
     pivots_list.push_back(at::zeros(numPivots, kInt, std::nullopt, kMPS, std::nullopt));
   }
 
