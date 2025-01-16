@@ -725,7 +725,7 @@ static Tensor& linalg_solve_triangular_mps_impl(const Tensor& A,
     @autoreleasepool {
       mpsStream->endKernelCoalescing();
       id<MTLCommandBuffer> commandBuffer = mpsStream->commandBuffer();
-      uint64_t batchSize = std::accumulate(A.sizes().begin(), A.sizes().end() - 2, 1ULL, std::multiplies<uint64_t>());
+      uint64_t batchSize = A_.sizes().size() > 2 ? A_.size(0) : 1;
       uint64_t aRows = A_.size(-2);
       uint64_t bRows = B_.size(-2);
       uint64_t aCols = A_.size(-1);
@@ -817,7 +817,7 @@ static Tensor& linalg_cholesky_mps_impl(const Tensor& input, bool upper, Tensor&
   Tensor success = at::empty({B}, input.options().dtype(kInt)).fill_(1);
   id<MTLBuffer> successBuffer = getMTLBufferStorage(success);
 
-  MTLSize threadGroupSize = MTLSizeMake(256, 1, 1);
+  MTLSize threadGroupSize = MTLSizeMake(32, 8, 1);
   id<MTLBuffer> outBuffer = getMTLBufferStorage(out);
   id<MTLComputeCommandEncoder> computeEncoder = stream->commandEncoder();
   [computeEncoder setBuffer:outBuffer offset:0 atIndex:0];
