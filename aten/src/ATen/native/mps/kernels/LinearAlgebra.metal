@@ -259,7 +259,9 @@ kernel void applySYRK(
     uint numSbY = actSize_j / 8; // How many 8-tall blocks
     uint totalSubBlocks = numSbX * numSbY;
 
-    for (uint sb = warp_id; sb < totalSubBlocks; sb += 8) { // TODO Irakli can we get simdgroup count here somehow to not hardcode 8?
+    for (uint sb = warp_id; sb < totalSubBlocks;
+         sb += 8) { // TODO Irakli can we get simdgroup count here somehow to
+                    // not hardcode 8?
       uint sb_y = (sb / numSbX) * 8;
       uint sb_x = (sb % numSbX) * 8;
 
@@ -274,7 +276,6 @@ kernel void applySYRK(
           Cfrag, &A[batch_offset + (row0 + sb_y) * N + (col0 + sb_x)], N);
 
       for (uint kk = 0; kk < actSize_k; kk += 8) {
-
         simdgroup_load(
             Afrag, &A[batch_offset + (row0 + sb_y) * N + (k * NB + kk)], N);
         simdgroup_load(
