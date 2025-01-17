@@ -194,13 +194,8 @@ kernel void applyTRSM(
     for (uint row = linear_tid; row < actSize_j; row += group_size) {
       float sum = target[row * actSize_k + col];
 
-      // kahan sum
-      float c = 0.0f;
-      for (uint p = 0; p < col; p++) {
-        float y = -target[row * actSize_k + p] * diag[col * actSize_k + p] - c;
-        float t = sum + y;
-        c = (t - sum) - y;
-        sum = t;
+      for (uint p = 0; p < col; p++) { //
+        sum = fma(target[row * actSize_k + p], -diag[col * actSize_k + p], sum);
       }
       target[row * actSize_k + col] = sum / diag_val;
     }
@@ -222,13 +217,10 @@ kernel void applySYRK(
     uint3 tid [[thread_position_in_threadgroup]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 tpg [[threads_per_threadgroup]],
-    uint tid_in_simdgroup [[thread_index_in_simdgroup]],
     uint sgitg [[simdgroup_index_in_threadgroup]]) {
   // Flatten 2D portion of tid
   uint tx = tid.x;
   uint ty = tid.y;
-  uint linear_tid = ty * tpg.x + tx;
-  uint group_size = tpg.x * tpg.y; // total threads in this threadgroup
 
   // Batch index and pairID from threadgroup grid
   uint b = tgid.x;
