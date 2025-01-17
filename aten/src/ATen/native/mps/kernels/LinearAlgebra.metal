@@ -175,9 +175,6 @@ kernel void applyTRSM(
     uint c = i % actSize_k;
     diag[i] = A[batch_offset + (k * NB + r) * N + (k * NB + c)];
   }
-  // ---------------------------------------------------
-  // 2) Load the target block (actSize_j x actSize_k)
-  // ---------------------------------------------------
   for (uint i = linear_tid; i < actSize_j * actSize_k; i += group_size) {
     uint r = i / actSize_k;
     uint c = i % actSize_k;
@@ -194,7 +191,7 @@ kernel void applyTRSM(
     for (uint row = linear_tid; row < actSize_j; row += group_size) {
       float sum = target[row * actSize_k + col];
 
-      for (uint p = 0; p < col; p++) { //
+      for (uint p = 0; p < col; p++) {
         sum = fma(target[row * actSize_k + p], -diag[col * actSize_k + p], sum);
       }
       target[row * actSize_k + col] = sum / diag_val;
@@ -218,99 +215,104 @@ kernel void applySYRK(
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 tpg [[threads_per_threadgroup]],
     uint sgitg [[simdgroup_index_in_threadgroup]]) {
-  // Flatten 2D portion of tid
   uint tx = tid.x;
   uint ty = tid.y;
-
-  // Batch index and pairID from threadgroup grid
   uint b = tgid.x;
   uint pairID = tgid.y;
 
-  // Decompose pairID into (jRel, hRel) using the inverse triangular mapping
   uint jRel = (uint)((-1.0 + sqrt(1.0 + 8.0 * float(pairID))) / 2.0);
   uint hRel = pairID - ((jRel * (jRel + 1)) >> 1);
 
-  // Starting block indices
-  // NOTE: If your block decomposition uses a different formula for j/h, change
-  // here:
   uint startJ = (k + 1);
   uint j = startJ + jRel;
   uint h = startJ + hRel;
 
-  uint row0 = j * NB; // top-left row of the j-th block
-  uint col0 = h * NB; // top-left column of the h-th block
+  uint row0 = j * NB;
+  uint col0 = h * NB;
 
-  // Actual block sizes (to handle boundary conditions)
   const uint actSize_k = min(int64_t(N - k * NB), int64_t(NB));
   const uint actSize_j = min((uint)(N - row0), NB);
   const uint actSize_h = min((uint)(N - col0), NB);
 
   const uint batch_offset = b * N * N;
 
-  // If there is no valid work in this block region, exit early
   if (actSize_j == 0 || actSize_h == 0 || actSize_k == 0) {
     return;
   }
 
-  // --------------------------------------------------------------------------------
-  //    SYRK update, i.e. C = C - A * A^T, using simdgroup_matrix instructions.
-  //    We'll process the whole matrix of C in 8×8 chunks.
-  //
-  //    NOTE: This assumes actSize_j, actSize_h, actSize_k are multiples of 8.
-  // --------------------------------------------------------------------------------
+  // Check if dimensions are multiples of 8
+  // so we can use simdoup matrices
+  bool use_simdgroup =
+      (actSize_j % 8 == 0) && (actSize_h % 8 == 0) && (actSize_k % 8 == 0);
 
-  // Warp ID and lane ID within the warp
-  uint warp_id = sgitg; // [0..7] (assuming 8 warps of 32 threads each)
+  if (use_simdgroup) {
+    uint warp_id = sgitg;
 
-  simdgroup_matrix<float, 8, 8> negative_identity =
-      simdgroup_matrix<float, 8, 8>(-1.0);
-  simdgroup_matrix<float, 8, 8> identity = simdgroup_matrix<float, 8, 8>(1.0);
-  simdgroup_matrix<float, 8, 8> Prod;
-  simdgroup_matrix<float, 8, 8> Afrag;
-  simdgroup_matrix<float, 8, 8> Bfrag;
+    simdgroup_matrix<float, 8, 8> negative_identity =
+        simdgroup_matrix<float, 8, 8>(-1.0);
+    simdgroup_matrix<float, 8, 8> identity = simdgroup_matrix<float, 8, 8>(1.0);
+    simdgroup_matrix<float, 8, 8> Prod;
+    simdgroup_matrix<float, 8, 8> Afrag;
+    simdgroup_matrix<float, 8, 8> Bfrag;
 
-// Each warp handles 2 sub-blocks because we have 16 sub-blocks and 8 warps.
-#pragma unroll 2
-  for (uint sb = warp_id; sb < 16; sb += 8) {
-    // sub-block (sb) => (sb_x, sb_y), each in multiples of 8
-    uint sb_x = (sb % 4) * 8;
-    uint sb_y = (sb / 4) * 8;
+    uint numSbX = actSize_h / 8; // How many 8-wide blocks
+    uint numSbY = actSize_j / 8; // How many 8-tall blocks
+    uint totalSubBlocks = numSbX * numSbY;
 
-    // If j == h, skip upper triangular sub-blocks to match typical SYRK usage
-    if (j == h && sb_y < sb_x) {
-      continue;
-    }
+    for (uint sb = warp_id; sb < totalSubBlocks; sb += 8) { // TODO Irakli can we get simdgroup count here somehow to not hardcode 8?
+      uint sb_y = (sb / numSbX) * 8;
+      uint sb_x = (sb % numSbX) * 8;
 
-    // Load Cfrag (8×8) from global memory
-    simdgroup_matrix<float, 8, 8> Cfrag;
-    simdgroup_load(
-        Cfrag, &A[batch_offset + (row0 + sb_y) * N + col0 + sb_x], N);
+      // Skip elements that are below diagonal if j == h
+      if (j == h && sb_y < sb_x) {
+        continue;
+      }
 
-    // For each chunk of size 8 in the k-dimension
-    for (uint kk = 0; kk < actSize_k; kk += 8) {
+      // Same logic to load/store Cfrag, Afrag, Bfrag...
+      simdgroup_matrix<float, 8, 8> Cfrag;
       simdgroup_load(
-          Afrag, &A[batch_offset + (row0 + sb_y) * N + k * NB + kk], N);
+          Cfrag, &A[batch_offset + (row0 + sb_y) * N + (col0 + sb_x)], N);
 
-      simdgroup_load(
-          Bfrag,
-          &A[batch_offset + (col0 + sb_x) * N + k * NB + kk],
-          N,
-          0,
-          true);
+      for (uint kk = 0; kk < actSize_k; kk += 8) {
 
-      // Multiply Afrag × Bfrag
-      simdgroup_multiply(Prod, Afrag, Bfrag);
+        simdgroup_load(
+            Afrag, &A[batch_offset + (row0 + sb_y) * N + (k * NB + kk)], N);
+        simdgroup_load(
+            Bfrag,
+            &A[batch_offset + (col0 + sb_x) * N + (k * NB + kk)],
+            N,
+            0,
+            /* transpose = */ true);
 
-      // Make it negative, then subtract from Cfrag => Cfrag -= Afrag × Bfrag
-      simdgroup_multiply(Prod, Prod, negative_identity);
-      simdgroup_multiply_accumulate(Cfrag, Cfrag, identity, Prod);
+        simdgroup_multiply(Prod, Afrag, Bfrag);
+        simdgroup_multiply(Prod, Prod, negative_identity);
+        simdgroup_multiply_accumulate(Cfrag, Cfrag, identity, Prod);
+      }
+
+      simdgroup_store(
+          Cfrag, &A[batch_offset + (row0 + sb_y) * N + (col0 + sb_x)], N);
     }
+  } else {
+    // Fallback for non-multiple-of-8 dimensions
+    for (uint y = ty; y < actSize_j; y += tpg.y) {
+      for (uint x = tx; x < actSize_h; x += tpg.x) {
+        if (j == h && y < x) {
+          continue;
+        }
 
-    // Store updated Cfrag back into global memory
-    simdgroup_store(
-        Cfrag,
-        &A[batch_offset + (row0 + sb_y) * N + col0 + sb_x],
-        N); //
+        float sum = 0.0f;
+        for (uint i = 0; i < actSize_k; i++) {
+          float a_val = A[batch_offset + (row0 + y) * N + k * NB + i];
+          float b_val = A[batch_offset + (col0 + x) * N + k * NB + i];
+          sum += a_val * b_val;
+        }
+
+        atomic_fetch_add_explicit(
+            (device atomic_float*)&A[batch_offset + (row0 + y) * N + col0 + x],
+            -sum,
+            memory_order_relaxed);
+      }
+    }
   }
 }
 
