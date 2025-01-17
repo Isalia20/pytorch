@@ -98,8 +98,7 @@ kernel void factorDiagonalBlock(
         float val = tile[kk][i];
         partialSum = fma(val, val, partialSum);
       }
-      diagElt =
-          blockReduceSum(reduceScratch, partialSum, linear_tid);
+      diagElt = blockReduceSum(reduceScratch, partialSum, linear_tid);
     }
 
     if (linear_tid == 0) {
@@ -216,120 +215,111 @@ kernel void applyTRSM(
 }
 
 kernel void applySYRK(
-    device float* A               [[buffer(0)]],
-    constant uint& N              [[buffer(2)]],
-    constant uint& NB             [[buffer(3)]],
-    constant uint& k              [[buffer(4)]],
-    uint3        tid              [[thread_position_in_threadgroup]],
-    uint3        tgid             [[threadgroup_position_in_grid]],
-    uint3        tpg              [[threads_per_threadgroup]],
+    device float* A [[buffer(0)]],
+    constant uint& N [[buffer(2)]],
+    constant uint& NB [[buffer(3)]],
+    constant uint& k [[buffer(4)]],
+    uint3 tid [[thread_position_in_threadgroup]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threads_per_threadgroup]],
     uint tid_in_simdgroup [[thread_index_in_simdgroup]],
-    uint sgitg            [[simdgroup_index_in_threadgroup]]
-)
-{
-    // Flatten 2D portion of tid
-    uint tx         = tid.x;
-    uint ty         = tid.y;
-    uint linear_tid = ty * tpg.x + tx;
-    uint group_size = tpg.x * tpg.y;  // total threads in this threadgroup
+    uint sgitg [[simdgroup_index_in_threadgroup]]) {
+  // Flatten 2D portion of tid
+  uint tx = tid.x;
+  uint ty = tid.y;
+  uint linear_tid = ty * tpg.x + tx;
+  uint group_size = tpg.x * tpg.y; // total threads in this threadgroup
 
-    // Batch index and pairID from threadgroup grid
-    uint b      = tgid.x;
-    uint pairID = tgid.y;
+  // Batch index and pairID from threadgroup grid
+  uint b = tgid.x;
+  uint pairID = tgid.y;
 
-    // Decompose pairID into (jRel, hRel) using the inverse triangular mapping
-    uint jRel = (uint)((-1.0 + sqrt(1.0 + 8.0 * float(pairID))) / 2.0);
-    uint hRel = pairID - ((jRel * (jRel + 1)) >> 1);
+  // Decompose pairID into (jRel, hRel) using the inverse triangular mapping
+  uint jRel = (uint)((-1.0 + sqrt(1.0 + 8.0 * float(pairID))) / 2.0);
+  uint hRel = pairID - ((jRel * (jRel + 1)) >> 1);
 
-    // Starting block indices
-    // NOTE: If your block decomposition uses a different formula for j/h, change here:
-    uint startJ = (k + 1);
-    uint j      = startJ + jRel;
-    uint h      = startJ + hRel;
+  // Starting block indices
+  // NOTE: If your block decomposition uses a different formula for j/h, change
+  // here:
+  uint startJ = (k + 1);
+  uint j = startJ + jRel;
+  uint h = startJ + hRel;
 
-    uint row0 = j * NB;  // top-left row of the j-th block
-    uint col0 = h * NB;  // top-left column of the h-th block
+  uint row0 = j * NB; // top-left row of the j-th block
+  uint col0 = h * NB; // top-left column of the h-th block
 
-    // Actual block sizes (to handle boundary conditions)
-    const uint actSize_k = min(int64_t(N - k * NB), int64_t(NB));
-    const uint actSize_j = min((uint)(N - row0), NB);
-    const uint actSize_h = min((uint)(N - col0), NB);
+  // Actual block sizes (to handle boundary conditions)
+  const uint actSize_k = min(int64_t(N - k * NB), int64_t(NB));
+  const uint actSize_j = min((uint)(N - row0), NB);
+  const uint actSize_h = min((uint)(N - col0), NB);
 
-    const uint batch_offset = b * N * N;
+  const uint batch_offset = b * N * N;
 
-    // If there is no valid work in this block region, exit early
-    if (actSize_j == 0 || actSize_h == 0 || actSize_k == 0) {
-        return;
+  // If there is no valid work in this block region, exit early
+  if (actSize_j == 0 || actSize_h == 0 || actSize_k == 0) {
+    return;
+  }
+
+  // --------------------------------------------------------------------------------
+  //    SYRK update, i.e. C = C - A * A^T, using simdgroup_matrix instructions.
+  //    We'll process the whole matrix of C in 8×8 chunks.
+  //
+  //    NOTE: This assumes actSize_j, actSize_h, actSize_k are multiples of 8.
+  // --------------------------------------------------------------------------------
+
+  // Warp ID and lane ID within the warp
+  uint warp_id = sgitg; // [0..7] (assuming 8 warps of 32 threads each)
+
+  simdgroup_matrix<float, 8, 8> negative_identity =
+      simdgroup_matrix<float, 8, 8>(-1.0);
+  simdgroup_matrix<float, 8, 8> identity = simdgroup_matrix<float, 8, 8>(1.0);
+  simdgroup_matrix<float, 8, 8> Prod;
+  simdgroup_matrix<float, 8, 8> Afrag;
+  simdgroup_matrix<float, 8, 8> Bfrag;
+
+// Each warp handles 2 sub-blocks because we have 16 sub-blocks and 8 warps.
+#pragma unroll 2
+  for (uint sb = warp_id; sb < 16; sb += 8) {
+    // sub-block (sb) => (sb_x, sb_y), each in multiples of 8
+    uint sb_x = (sb % 4) * 8;
+    uint sb_y = (sb / 4) * 8;
+
+    // If j == h, skip upper triangular sub-blocks to match typical SYRK usage
+    if (j == h && sb_y < sb_x) {
+      continue;
     }
 
-    // --------------------------------------------------------------------------------
-    //    SYRK update, i.e. C = C - A * A^T, using simdgroup_matrix instructions.
-    //    We'll process the whole matrix of C in 8×8 chunks.
-    //
-    //    NOTE: This assumes actSize_j, actSize_h, actSize_k are multiples of 8.
-    // --------------------------------------------------------------------------------
+    // Load Cfrag (8×8) from global memory
+    simdgroup_matrix<float, 8, 8> Cfrag;
+    simdgroup_load(
+        Cfrag, &A[batch_offset + (row0 + sb_y) * N + col0 + sb_x], N);
 
-    // Warp ID and lane ID within the warp
-    uint warp_id = sgitg;            // [0..7] (assuming 8 warps of 32 threads each)
+    // For each chunk of size 8 in the k-dimension
+    for (uint kk = 0; kk < actSize_k; kk += 8) {
+      simdgroup_load(
+          Afrag, &A[batch_offset + (row0 + sb_y) * N + k * NB + kk], N);
 
-    simdgroup_matrix<float, 8, 8> negative_identity = simdgroup_matrix<float, 8, 8>(-1.0);
-    simdgroup_matrix<float, 8, 8> identity = simdgroup_matrix<float, 8, 8>(1.0);
-    simdgroup_matrix<float, 8, 8> Prod;
-    simdgroup_matrix<float, 8, 8> Afrag;
-    simdgroup_matrix<float, 8, 8> Bfrag;
+      simdgroup_load(
+          Bfrag,
+          &A[batch_offset + (col0 + sb_x) * N + k * NB + kk],
+          N,
+          0,
+          true);
 
-    // Each warp handles 2 sub-blocks because we have 16 sub-blocks and 8 warps.
-    #pragma unroll 2
-    for (uint sb = warp_id; sb < 16; sb += 8) {
-        // sub-block (sb) => (sb_x, sb_y), each in multiples of 8
-        uint sb_x = (sb % 4) * 8;
-        uint sb_y = (sb / 4) * 8;
+      // Multiply Afrag × Bfrag
+      simdgroup_multiply(Prod, Afrag, Bfrag);
 
-        // If j == h, skip upper triangular sub-blocks to match typical SYRK usage
-        if (j == h && sb_y < sb_x) {
-            continue;
-        }
-
-        // Load Cfrag (8×8) from global memory
-        simdgroup_matrix<float, 8, 8> Cfrag;
-        simdgroup_load(
-            Cfrag,
-            &A[batch_offset + (row0 + sb_y) * N + col0 + sb_x],
-            N
-        );
-
-        // For each chunk of size 8 in the k-dimension
-        for (uint kk = 0; kk < actSize_k; kk += 8)
-        {
-            simdgroup_load(
-                Afrag,
-                &A[batch_offset + (row0 + sb_y) * N + k * NB + kk],
-                N
-            );
-
-            simdgroup_load(
-                Bfrag,
-                &A[batch_offset + (col0 + sb_x) * N + k * NB + kk],
-                N,
-                0,
-                true
-            );
-
-            // Multiply Afrag × Bfrag
-            simdgroup_multiply(Prod, Afrag, Bfrag);
-
-            // Make it negative, then subtract from Cfrag => Cfrag -= Afrag × Bfrag
-            simdgroup_multiply(Prod, Prod, negative_identity); 
-            simdgroup_multiply_accumulate(Cfrag, Cfrag, identity, Prod);
-        }
-
-        // Store updated Cfrag back into global memory
-        simdgroup_store(
-            Cfrag,
-            &A[batch_offset + (row0 + sb_y) * N + col0 + sb_x],
-            N
-        ); //
+      // Make it negative, then subtract from Cfrag => Cfrag -= Afrag × Bfrag
+      simdgroup_multiply(Prod, Prod, negative_identity);
+      simdgroup_multiply_accumulate(Cfrag, Cfrag, identity, Prod);
     }
+
+    // Store updated Cfrag back into global memory
+    simdgroup_store(
+        Cfrag,
+        &A[batch_offset + (row0 + sb_y) * N + col0 + sb_x],
+        N); //
+  }
 }
 
 #define INSTANTIATE_NAIVE_MM(DTYPE)                          \
@@ -347,4 +337,3 @@ INSTANTIATE_NAIVE_MM(half);
 #if __METAL_VERSION__ >= 310
 INSTANTIATE_NAIVE_MM(bfloat);
 #endif
-
