@@ -259,20 +259,21 @@ kernel void applySYRK(
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 tpg [[threads_per_threadgroup]],
     uint sgitg [[simdgroup_index_in_threadgroup]]) {
-  uint tx = tid.x;
-  uint ty = tid.y;
-  uint b = tgid.x;
-  uint pairID = tgid.y;
+  const uint tx = tid.x;
+  const uint ty = tid.y;
+  const uint simdGroupsPerThreadgroup = (tpg.x * tpg.y + 31) / 32;
+  const uint b = tgid.x;
+  const uint pairID = tgid.y;
 
-  uint jRel = (uint)((-1.0 + sqrt(1.0 + 8.0 * float(pairID))) / 2.0);
-  uint hRel = pairID - ((jRel * (jRel + 1)) >> 1);
+  const uint jRel = (uint)((-1.0 + sqrt(1.0 + 8.0 * float(pairID))) / 2.0);
+  const uint hRel = pairID - ((jRel * (jRel + 1)) >> 1);
 
-  uint startJ = (k + 1);
-  uint j = startJ + jRel;
-  uint h = startJ + hRel;
+  const uint startJ = (k + 1);
+  const uint j = startJ + jRel;
+  const uint h = startJ + hRel;
 
-  uint row0 = j * NB;
-  uint col0 = h * NB;
+  const uint row0 = j * NB;
+  const uint col0 = h * NB;
 
   const uint actSize_k = min(int64_t(N - k * NB), int64_t(NB));
   const uint actSize_j = min((uint)(N - row0), NB);
@@ -303,9 +304,7 @@ kernel void applySYRK(
     uint numSbY = actSize_j / 8; // How many 8-tall blocks
     uint totalSubBlocks = numSbX * numSbY;
 
-    for (uint sb = warp_id; sb < totalSubBlocks;
-         sb += 8) { // TODO Irakli can we get simdgroup count here somehow to
-                    // not hardcode 8?
+    for (uint sb = warp_id; sb < totalSubBlocks; sb += simdGroupsPerThreadgroup) {
       uint sb_y = (sb / numSbX) * 8;
       uint sb_x = (sb % numSbX) * 8;
 
