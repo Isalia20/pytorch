@@ -339,6 +339,14 @@ kernel void applySYRK(
     }
   } else {
     // Fallback for non-multiple-of-8 dimensions
+    threadgroup float sum_accumulator[32 * 32];
+    for (uint y = ty; y < actSize_j; y += tpg.y) {
+      for (uint x = tx; x < actSize_h; x += tpg.x) {
+        // since we use this for accumulator, better to set it to 0.0
+        // to avoid random values
+        sum_accumulator[y * tpg.x + x] = 0.0f;
+      }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint y = ty; y < actSize_j; y += tpg.y) {
       for (uint x = tx; x < actSize_h; x += tpg.x) {
         if (j == h && y < x) {
@@ -349,13 +357,15 @@ kernel void applySYRK(
         for (uint i = 0; i < actSize_k; i++) {
           float a_val = A[batch_offset + (row0 + y) * N + k * NB + i];
           float b_val = A[batch_offset + (col0 + x) * N + k * NB + i];
-          sum += a_val * b_val;
+          sum = fma(a_val, b_val, sum);
         }
-
-        atomic_fetch_add_explicit(
-            (device atomic_float*)&A[batch_offset + (row0 + y) * N + col0 + x],
-            -sum,
-            memory_order_relaxed);
+        sum_accumulator[y * tpg.x + x] += sum;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint y = ty; y < actSize_j; y += tpg.y) {
+      for (uint x = tx; x < actSize_h; x += tpg.x) {
+        A[batch_offset + (row0 + y) * N + col0 + x] -= sum_accumulator[y * tpg.x + x];
       }
     }
   }
