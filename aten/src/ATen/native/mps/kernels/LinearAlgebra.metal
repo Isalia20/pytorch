@@ -68,11 +68,10 @@ kernel void factorDiagonalBlock(
     uint3 tid [[thread_position_in_threadgroup]],
     uint3 bid [[threadgroup_position_in_grid]],
     uint3 tpg [[threads_per_threadgroup]]) {
-  // Compute a linear thread ID from (tid.x, tid.y)
   uint tx = tid.x;
   uint ty = tid.y;
-  uint linear_tid = ty * tpg.x + tx; // = ty*32 + tx
-  uint group_size = tpg.x * tpg.y; // = 256
+  uint linear_tid = ty * tpg.x + tx;
+  uint group_size = tpg.x * tpg.y;
 
   const uint actSize = min(N - k * NB, NB);
   const uint batch_offset = bid.x * N * N;
@@ -80,7 +79,7 @@ kernel void factorDiagonalBlock(
   const uint col0 = k * NB;
 
   threadgroup float tile[32][33];
-  threadgroup float reduceScratch[8]; // 256 (threads) / 32(warp_size)
+  threadgroup float reduceScratch[8];
   const uint tileSize = actSize * actSize;
 
   for (uint i = linear_tid; i < tileSize; i += group_size) {
@@ -90,11 +89,28 @@ kernel void factorDiagonalBlock(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
+#pragma unroll 4
   for (uint kk = 0; kk < actSize; kk++) {
     float diagElt = 0.0f;
     if (kk > 0) {
-      float partialSum = 0.0f;
-      for (uint i = linear_tid; i < kk; i += group_size) {
+      float4 partialSum4 = float4(0.0f);
+      uint i = linear_tid * 4;
+      // vectorized reduce
+      for (; i + 4 <= kk; i += group_size * 4) {
+        float4 val4;
+        val4.x = (i < kk) ? tile[kk][i] : 0.0f;
+        val4.y = (i + 1 < kk) ? tile[kk][i + 1] : 0.0f;
+        val4.z = (i + 2 < kk) ? tile[kk][i + 2] : 0.0f;
+        val4.w = (i + 3 < kk) ? tile[kk][i + 3] : 0.0f;
+
+        partialSum4 = fma(val4, val4, partialSum4);
+      }
+
+      float partialSum =
+          partialSum4.x + partialSum4.y + partialSum4.z + partialSum4.w;
+
+      // remaining elements
+      for (i = linear_tid + (kk / 4) * 4; i < kk; i += group_size) {
         float val = tile[kk][i];
         partialSum = fma(val, val, partialSum);
       }
@@ -104,7 +120,7 @@ kernel void factorDiagonalBlock(
     if (linear_tid == 0) {
       float diagVal = tile[kk][kk] - diagElt;
       if (diagVal <= 0.0f) {
-        success[bid.x] = 0; // matrix is not positive definite
+        success[bid.x] = 0;
         return;
       }
       tile[kk][kk] = sqrt(diagVal);
@@ -114,8 +130,21 @@ kernel void factorDiagonalBlock(
     float pivot = tile[kk][kk];
 
     for (uint j = kk + 1 + linear_tid; j < actSize; j += group_size) {
-      float partialSum = 0.0f;
-      for (uint i = 0; i < kk; i++) {
+      float4 partialSum4 = float4(0.0f);
+      uint i = 0;
+
+      // 4 elements at a time
+      for (; i + 4 <= kk; i += 4) {
+        float4 row4 =
+            float4(tile[j][i], tile[j][i + 1], tile[j][i + 2], tile[j][i + 3]);
+        float4 diag4 = float4(
+            tile[kk][i], tile[kk][i + 1], tile[kk][i + 2], tile[kk][i + 3]);
+        partialSum4 = fma(row4, diag4, partialSum4);
+      }
+      float partialSum =
+          partialSum4.x + partialSum4.y + partialSum4.z + partialSum4.w;
+      // remaining elements
+      for (; i < kk; i++) {
         partialSum = fma(tile[j][i], tile[kk][i], partialSum);
       }
       float val = tile[j][kk];
@@ -141,86 +170,84 @@ kernel void applyTRSM(
     uint3 tid [[thread_position_in_threadgroup]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 tpg [[threads_per_threadgroup]]) {
-    // Thread indexing
-    const uint tx = tid.x;
-    const uint ty = tid.y;
-    const uint linear_tid = ty * tpg.x + tx;
-    const uint group_size = tpg.x * tpg.y;
-    const uint b = tgid.x;
-    const uint idxJ = tgid.y;
+  // Thread indexing
+  const uint tx = tid.x;
+  const uint ty = tid.y;
+  const uint linear_tid = ty * tpg.x + tx;
+  const uint group_size = tpg.x * tpg.y;
+  const uint b = tgid.x;
+  const uint idxJ = tgid.y;
 
-    // Size calculations
-    const uint actSize_k = min(int64_t(N - k * NB), int64_t(NB));
-    const uint j = (k + 1) + idxJ;
-    const uint row0 = j * NB;
-    const uint col0 = k * NB;
-    const uint actSize_j = min((int)(N - row0), (int)NB);
-    const uint batch_offset = b * N * N;
+  // Size calculations
+  const uint actSize_k = min(int64_t(N - k * NB), int64_t(NB));
+  const uint j = (k + 1) + idxJ;
+  const uint row0 = j * NB;
+  const uint col0 = k * NB;
+  const uint actSize_j = min((int)(N - row0), (int)NB);
+  const uint batch_offset = b * N * N;
 
-    // Early exit conditions
-    if (actSize_k == 0 || j >= (N + NB - 1) / NB || j == k || actSize_j == 0) {
-        return;
-    }
+  // Early exit conditions
+  if (actSize_k == 0 || j >= (N + NB - 1) / NB || j == k || actSize_j == 0) {
+    return;
+  }
 
-    threadgroup float diag[32 * 32];
-    threadgroup float target[32 * 32];
+  threadgroup float diag[32 * 32];
+  threadgroup float target[32 * 32];
 
-    for (uint i = linear_tid; i < actSize_k * actSize_k; i += group_size) {
-        uint r = i / actSize_k;
-        uint c = i % actSize_k;
-        diag[i] = A[batch_offset + (k * NB + r) * N + (k * NB + c)];
-    }
-    for (uint i = linear_tid; i < actSize_j * actSize_k; i += group_size) {
-        uint r = i / actSize_k;
-        uint c = i % actSize_k;
-        target[i] = A[batch_offset + (row0 + r) * N + (col0 + c)];
+  for (uint i = linear_tid; i < actSize_k * actSize_k; i += group_size) {
+    uint r = i / actSize_k;
+    uint c = i % actSize_k;
+    diag[i] = A[batch_offset + (k * NB + r) * N + (k * NB + c)];
+  }
+  for (uint i = linear_tid; i < actSize_j * actSize_k; i += group_size) {
+    uint r = i / actSize_k;
+    uint c = i % actSize_k;
+    target[i] = A[batch_offset + (row0 + r) * N + (col0 + c)];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+// forward substitution with loop unrolling and vectorization
+#pragma unroll 4
+  for (uint col = 0; col < actSize_k; col++) {
+    float diag_val = diag[col * actSize_k + col];
+    diag_val = (fabs(diag_val) < 1e-6f) ? copysign(1e-6f, diag_val) : diag_val;
+
+    // multiple rows per thread
+    for (uint row = linear_tid; row < actSize_j; row += group_size) {
+      float sum = target[row * actSize_k + col];
+      // vectorized accumulation
+      float4 sum4 = float4(0.0);
+      uint p = 0;
+      for (; p + 4 <= col; p += 4) {
+        float4 target4 = float4(
+            target[row * actSize_k + p],
+            target[row * actSize_k + p + 1],
+            target[row * actSize_k + p + 2],
+            target[row * actSize_k + p + 3]);
+        float4 diag4 = float4(
+            diag[col * actSize_k + p],
+            diag[col * actSize_k + p + 1],
+            diag[col * actSize_k + p + 2],
+            diag[col * actSize_k + p + 3]);
+        sum4 = fma(target4, -diag4, sum4);
+      }
+      sum += sum4.x + sum4.y + sum4.z + sum4.w;
+
+      // remaining elements
+      for (; p < col; p++) {
+        sum = fma(target[row * actSize_k + p], -diag[col * actSize_k + p], sum);
+      }
+      target[row * actSize_k + col] = sum / diag_val;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
 
-    // forward substitution with loop unrolling and vectorization
-    #pragma unroll 4
-    for (uint col = 0; col < actSize_k; col++) {
-        float diag_val = diag[col * actSize_k + col];
-        diag_val = (fabs(diag_val) < 1e-6f) ? copysign(1e-6f, diag_val) : diag_val;
-
-        // multiple rows per thread
-        for (uint row = linear_tid; row < actSize_j; row += group_size) {
-            float sum = target[row * actSize_k + col];
-            // vectorized accumulation
-            float4 sum4 = float4(0.0);
-            uint p = 0;
-            for (; p + 4 <= col; p += 4) {
-                float4 target4 = float4(
-                    target[row * actSize_k + p],
-                    target[row * actSize_k + p + 1],
-                    target[row * actSize_k + p + 2],
-                    target[row * actSize_k + p + 3]
-                );
-                float4 diag4 = float4(
-                    diag[col * actSize_k + p],
-                    diag[col * actSize_k + p + 1],
-                    diag[col * actSize_k + p + 2],
-                    diag[col * actSize_k + p + 3]
-                );
-                sum4 = fma(target4, -diag4, sum4);
-            }
-            sum += sum4.x + sum4.y + sum4.z + sum4.w;
-
-            // remaining elements
-            for (; p < col; p++) {
-                sum = fma(target[row * actSize_k + p], -diag[col * actSize_k + p], sum);
-            }
-            target[row * actSize_k + col] = sum / diag_val;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    // results back to global memory
-    for (uint i = linear_tid; i < actSize_j * actSize_k; i += group_size) {
-        uint r = i / actSize_k;
-        uint c = i % actSize_k;
-        A[batch_offset + (row0 + r) * N + (col0 + c)] = target[i];
-    }
+  // results back to global memory
+  for (uint i = linear_tid; i < actSize_j * actSize_k; i += group_size) {
+    uint r = i / actSize_k;
+    uint c = i % actSize_k;
+    A[batch_offset + (row0 + r) * N + (col0 + c)] = target[i];
+  }
 }
 
 kernel void applySYRK(
