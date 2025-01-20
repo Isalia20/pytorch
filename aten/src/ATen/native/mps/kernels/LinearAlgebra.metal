@@ -304,7 +304,8 @@ kernel void applySYRK(
     uint numSbY = actSize_j / 8; // How many 8-tall blocks
     uint totalSubBlocks = numSbX * numSbY;
 
-    for (uint sb = warp_id; sb < totalSubBlocks; sb += simdGroupsPerThreadgroup) {
+    for (uint sb = warp_id; sb < totalSubBlocks;
+         sb += simdGroupsPerThreadgroup) {
       uint sb_y = (sb / numSbX) * 8;
       uint sb_x = (sb % numSbX) * 8;
 
@@ -344,7 +345,8 @@ kernel void applySYRK(
         // since we use this for accumulator, better to set it to 0.0
         // to avoid random values
         sum_accumulator[y * tpg.x + x] = 0.0f;
-      }}
+      }
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint y = ty; y < actSize_j; y += tpg.y) {
       for (uint x = tx; x < actSize_h; x += tpg.x) {
@@ -364,7 +366,8 @@ kernel void applySYRK(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint y = ty; y < actSize_j; y += tpg.y) {
       for (uint x = tx; x < actSize_h; x += tpg.x) {
-        A[batch_offset + (row0 + y) * N + col0 + x] -= sum_accumulator[y * tpg.x + x];
+        A[batch_offset + (row0 + y) * N + col0 + x] -=
+            sum_accumulator[y * tpg.x + x];
       }
     }
   }
