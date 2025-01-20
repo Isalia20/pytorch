@@ -179,7 +179,7 @@ kernel void applyTRSM(
   const uint idxJ = tgid.y;
 
   // Size calculations
-  const uint actSize_k = min(int64_t(N - k * NB), int64_t(NB));
+  const uint actSize_k = min(int32_t(N - k * NB), int32_t(NB));
   const uint j = (k + 1) + idxJ;
   const uint row0 = j * NB;
   const uint col0 = k * NB;
@@ -275,7 +275,7 @@ kernel void applySYRK(
   const uint row0 = j * NB;
   const uint col0 = h * NB;
 
-  const uint actSize_k = min(int64_t(N - k * NB), int64_t(NB));
+  const uint actSize_k = min(int32_t(N - k * NB), int32_t(NB));
   const uint actSize_j = min((uint)(N - row0), NB);
   const uint actSize_h = min((uint)(N - col0), NB);
 
