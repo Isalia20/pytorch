@@ -272,6 +272,56 @@ kernel void atomic_index_put_accumulate(
   atomic_fetch_add_relaxed<T>(out, *in);
 }
 
+kernel void optimized_masked_fill(
+    device float* input [[buffer(0)]],
+    device const bool* mask [[buffer(1)]],
+    constant float& value [[buffer(2)]],
+    constant uint& total_elements [[buffer(3)]],
+    uint thread_index [[thread_position_in_grid]],
+    uint thread_pos [[thread_position_in_threadgroup]],
+    uint threadgroup_size [[threads_per_threadgroup]])
+{
+    // vectorized loads if possible
+    constexpr uint vector_size = 4;
+    uint vector_elements = total_elements / vector_size;
+    uint remaining_elements = total_elements % vector_size;
+    
+    // 4 elementss at a time
+    if (thread_index < vector_elements) {
+        uint base_idx = thread_index * vector_size;
+        
+        vec<float, vector_size> input_vec;
+        vec<bool, vector_size> mask_vec;
+        
+        for (uint i = 0; i < vector_size; i++) {
+            input_vec[i] = input[base_idx + i];
+            mask_vec[i] = mask[base_idx + i];
+        }
+        
+        // vec masked fill
+        for (uint i = 0; i < vector_size; i++) {
+            input_vec[i] = mask_vec[i] ? value : input_vec[i];
+        }
+        
+        // vec store
+        for (uint i = 0; i < vector_size; i++) {
+            input[base_idx + i] = input_vec[i];
+        }
+    }
+    
+    // remaining elements
+    if (thread_index == 0) {
+        uint base_idx = vector_elements * vector_size;
+        for (uint i = 0; i < remaining_elements; i++) {
+            if (mask[base_idx + i]) {
+                input[base_idx + i] = value;
+            }
+        }
+    }
+    
+    threadgroup_barrier(mem_flags::mem_device);
+}
+
 template [[host_name("index_put_accumulate_32bit_float_idx32")]] kernel void
 atomic_index_put_accumulate<float, uint3>(
     constant IndexAB* indexAB [[buffer(0)]],
