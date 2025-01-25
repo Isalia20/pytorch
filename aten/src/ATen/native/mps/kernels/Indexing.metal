@@ -273,29 +273,47 @@ kernel void atomic_index_put_accumulate(
 }
 
 kernel void masked_fill(
-    device float* input [[buffer(0)]],
-    device const bool* mask [[buffer(1)]],
-    constant int64_t* mask_sizes[[buffer(2)]],
-    constant int64_t* mask_strides[[buffer(3)]],
-    constant int64_t& mask_nsize[[buffer(4)]],
-    constant float& value [[buffer(5)]],
-    constant uint& total_elements [[buffer(6)]],
-    uint thread_pos_grid [[thread_position_in_grid]]) {
-  // vectorized loads if possible
-  if (thread_pos_grid > total_elements) {return;};
-  int64_t mask_idx = 0;
-  int64_t temp_pos = thread_pos_grid;
-  // For each dimension in mask
-  for (uint i = 0; i < mask_nsize; i++) {
-      if (mask_strides[i] != 0) {  // Only process non-broadcast dimensions
-          int64_t dim_idx = temp_pos / mask_strides[i];
-          dim_idx = dim_idx % mask_sizes[i];
-          mask_idx += dim_idx * mask_strides[i];
-      }
-      temp_pos %= mask_strides[i];
+    device float* input          [[buffer(0)]],
+    device const bool* mask      [[buffer(1)]],
+    constant int64_t* input_sizes[[buffer(2)]],
+    constant int64_t* input_strides[[buffer(3)]],
+    constant int64_t* mask_sizes [[buffer(4)]],
+    constant int64_t* mask_strides[[buffer(5)]],
+    constant int64_t& mask_nsize [[buffer(6)]],
+    constant float& value        [[buffer(7)]],
+    constant uint& total_elements[[buffer(8)]],
+    uint thread_pos_grid         [[thread_position_in_grid]])
+{
+  if (thread_pos_grid >= total_elements) return;
+
+  // input index for non-contiguous input tensor
+  int64_t input_idx = 0;
+  {
+    int64_t temp = thread_pos_grid;
+    for (uint i = 0; i < mask_nsize; i++) {
+      const int64_t size_i = input_sizes[i];
+      const int64_t stride_i = input_strides[i];
+      const int64_t dim_idx = temp % size_i;
+      temp /= size_i;
+      input_idx += dim_idx * stride_i;
+    }
   }
-  input[thread_pos_grid] = mask[mask_idx] ? value : input[thread_pos_grid];
-  threadgroup_barrier(mem_flags::mem_device); // TODO I Think this is not needed
+
+  // mask index for non-contiguous (or broadcasted) mask
+  int64_t mask_idx = 0;
+  {
+    int64_t temp = thread_pos_grid;
+    for (uint i = 0; i < mask_nsize; i++) {
+      // If mask has broadcasted dimension, mask_strides[i] might be 0
+      const int64_t size_i = mask_sizes[i];
+      const int64_t stride_i = mask_strides[i];
+      const int64_t dim_idx = temp % size_i;
+      temp /= size_i;
+      mask_idx += dim_idx * stride_i;
+    }
+  }
+  // masked fill
+  input[input_idx] = mask[mask_idx] ? value : input[input_idx];
 }
 
 template [[host_name("index_put_accumulate_32bit_float_idx32")]] kernel void

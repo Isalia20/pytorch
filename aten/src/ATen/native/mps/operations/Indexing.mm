@@ -704,19 +704,23 @@ Tensor& masked_fill__mps(Tensor& self, const Tensor& mask, const Scalar& value) 
       auto computeEncoder = stream->commandEncoder();
       [computeEncoder setComputePipelineState:maskedFillPSO];
 
-      auto typed_value = value; // TODO is there a better way to do this? ///
+      auto typed_value = value; // TODO is there a better way to do this? ////
       uint32_t total_elements = self.numel();
-      auto mask_strides = b_mask -> strides();
       auto mask_sizes = b_mask -> sizes();
+      auto mask_strides = b_mask -> strides();
+      auto input_sizes = self.sizes();
+      auto input_strides = self.strides();
       auto mask_nsizes = mask_sizes.size();
 
       [computeEncoder setBuffer:getMTLBufferStorage(self) offset:0 atIndex:0];
       [computeEncoder setBuffer:getMTLBufferStorage(*b_mask) offset:0 atIndex:1];
-      [computeEncoder setBytes:mask_sizes.data() length:sizeof(int64_t) * mask_nsizes atIndex:2];
-      [computeEncoder setBytes:mask_strides.data() length:sizeof(int64_t) * mask_strides.size() atIndex:3];
-      [computeEncoder setBytes:&mask_nsizes length:sizeof(int64_t) atIndex:4];
-      [computeEncoder setBytes:&typed_value length:sizeof(typed_value) atIndex:5];
-      [computeEncoder setBytes:&total_elements length:sizeof(total_elements) atIndex:6];
+      [computeEncoder setBytes:input_sizes.data() length:sizeof(int64_t) * input_sizes.size() atIndex:2];
+      [computeEncoder setBytes:input_strides.data() length:sizeof(int64_t) * input_strides.size() atIndex:3];
+      [computeEncoder setBytes:mask_sizes.data() length:sizeof(int64_t) * mask_nsizes atIndex:4];
+      [computeEncoder setBytes:mask_strides.data() length:sizeof(int64_t) * mask_strides.size() atIndex:5];
+      [computeEncoder setBytes:&mask_nsizes length:sizeof(int64_t) atIndex:6];
+      [computeEncoder setBytes:&typed_value length:sizeof(typed_value) atIndex:7];
+      [computeEncoder setBytes:&total_elements length:sizeof(total_elements) atIndex:8];
 
       NSUInteger maxThreadsPerThreadgroup = maskedFillPSO.maxTotalThreadsPerThreadgroup;
       NSUInteger threadGroupSize = std::min(maxThreadsPerThreadgroup, (NSUInteger)256);
