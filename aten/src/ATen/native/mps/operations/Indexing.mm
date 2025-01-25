@@ -696,12 +696,12 @@ Tensor& masked_fill__mps(Tensor& self, const Tensor& mask, const Scalar& value) 
   }
   auto stream = getCurrentMPSStream();
   auto device = MPSDevice::getInstance()->device();
-  auto maskedFillPSO = lib.getPipelineStateForFunc("optimized_masked_fill");// + mps::scalarToMetalTypeString(self));
+  auto maskedFillPSO = lib.getPipelineStateForFunc("optimized_masked_fill"); // + mps::scalarToMetalTypeString(self));
 
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
       getMPSProfiler().beginProfileKernel(maskedFillPSO, "optimized_masked_fill", {self, mask});
-      
+
       auto computeEncoder = stream->commandEncoder();
       [computeEncoder setComputePipelineState:maskedFillPSO];
 
@@ -721,8 +721,7 @@ Tensor& masked_fill__mps(Tensor& self, const Tensor& mask, const Scalar& value) 
       MTLSize gridSize = MTLSizeMake(numThreadgroups * threadGroupSize, 1, 1);
       MTLSize threadgroupSize = MTLSizeMake(threadGroupSize, 1, 1);
 
-      [computeEncoder dispatchThreads:gridSize
-                threadsPerThreadgroup:threadgroupSize];
+      [computeEncoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
 
       getMPSProfiler().endProfileKernel(maskedFillPSO);
     }
