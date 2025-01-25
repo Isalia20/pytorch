@@ -694,24 +694,29 @@ Tensor& masked_fill__mps(Tensor& self, const Tensor& mask, const Scalar& value) 
   if (self.numel() == 0) {
     return self;
   }
+  c10::MaybeOwned<Tensor> b_mask = expand_inplace(self, mask, "masked_fill_");
   auto stream = getCurrentMPSStream();
   auto device = MPSDevice::getInstance()->device();
-  auto maskedFillPSO = lib.getPipelineStateForFunc("optimized_masked_fill"); // + mps::scalarToMetalTypeString(self));
+  auto maskedFillPSO = lib.getPipelineStateForFunc("masked_fill"); /// + mps::scalarToMetalTypeString(self));
 
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
-      getMPSProfiler().beginProfileKernel(maskedFillPSO, "optimized_masked_fill", {self, mask});
-
       auto computeEncoder = stream->commandEncoder();
       [computeEncoder setComputePipelineState:maskedFillPSO];
 
-      auto typed_value = value;
+      auto typed_value = value; // TODO is there a better way to do this? ///
       uint32_t total_elements = self.numel();
+      auto mask_strides = b_mask -> strides();
+      auto mask_sizes = b_mask -> sizes();
+      auto mask_nsizes = mask_sizes.size();
 
       [computeEncoder setBuffer:getMTLBufferStorage(self) offset:0 atIndex:0];
-      [computeEncoder setBuffer:getMTLBufferStorage(mask) offset:0 atIndex:1];
-      [computeEncoder setBytes:&typed_value length:sizeof(typed_value) atIndex:2];
-      [computeEncoder setBytes:&total_elements length:sizeof(total_elements) atIndex:3];
+      [computeEncoder setBuffer:getMTLBufferStorage(*b_mask) offset:0 atIndex:1];
+      [computeEncoder setBytes:mask_sizes.data() length:sizeof(int64_t) * mask_nsizes atIndex:2];
+      [computeEncoder setBytes:mask_strides.data() length:sizeof(int64_t) * mask_strides.size() atIndex:3];
+      [computeEncoder setBytes:&mask_nsizes length:sizeof(int64_t) atIndex:4];
+      [computeEncoder setBytes:&typed_value length:sizeof(typed_value) atIndex:5];
+      [computeEncoder setBytes:&total_elements length:sizeof(total_elements) atIndex:6];
 
       NSUInteger maxThreadsPerThreadgroup = maskedFillPSO.maxTotalThreadsPerThreadgroup;
       NSUInteger threadGroupSize = std::min(maxThreadsPerThreadgroup, (NSUInteger)256);
@@ -722,8 +727,6 @@ Tensor& masked_fill__mps(Tensor& self, const Tensor& mask, const Scalar& value) 
       MTLSize threadgroupSize = MTLSizeMake(threadGroupSize, 1, 1);
 
       [computeEncoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
-
-      getMPSProfiler().endProfileKernel(maskedFillPSO);
     }
   });
 
