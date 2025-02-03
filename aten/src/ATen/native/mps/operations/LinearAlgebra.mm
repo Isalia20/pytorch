@@ -22,6 +22,7 @@
 #include <ATen/ops/linalg_cholesky_native.h>
 #include <ATen/ops/linalg_lu_factor_ex_native.h>
 #include <ATen/ops/linalg_lu_factor_native.h>
+#include <ATen/ops/linalg_lu_solve_native.h>
 #include <ATen/ops/linalg_solve_triangular_native.h>
 #include <ATen/ops/mm_native.h>
 #include <ATen/ops/stack.h>
@@ -239,6 +240,84 @@ static void linalg_lu_factor_ex_out_mps_impl(const Tensor& A,
           status,
           ". See https://developer.apple.com/documentation/metalperformanceshaders/mpsmatrixdecompositionstatus for details.");
     }
+  }
+}
+
+static void linalg_lu_solve_out_mps_impl(
+    const at::Tensor& LU,
+    const at::Tensor& pivots,
+    const at::Tensor& B,
+    bool left,
+    bool adjoint,
+    const at::Tensor& out
+) {
+  using namespace mps;
+
+  TORCH_CHECK(out.is_mps(), "LU solve: Output tensor must be on MPS device");
+  TORCH_CHECK(B.scalar_type() == at::ScalarType::Float,
+              "LU solve: Input tensor must be float32");
+  TORCH_CHECK(LU.dim() >= 2, "LU solve: LU must be at least 2D"); ///
+
+  if (B.numel() == 0 || out.numel() == 0) {
+    out.zero_();
+    return;
+  }
+
+  resize_output(out, B.sizes());
+  out.copy_(B); //
+
+  // support only left-side systems for now
+  TORCH_CHECK(left, "LU solve: Right-hand side systems are not supported yet on MPS");
+
+  int64_t ndim = out.dim();
+  int64_t N = LU.size(-1);
+  int64_t NRHS = B.size(-1);
+  int64_t batch = 1;
+  for (int64_t i = 0; i < ndim - 2; i++) {
+    batch *= B.size(i);
+  }
+
+  MPSStream* stream = getCurrentMPSStream();
+
+  auto applyPivotPSO = lib.getPipelineStateForFunc("applyPivot");
+  auto forwardSolvePSO = lib.getPipelineStateForFunc("forwardSolve");
+  auto backwardSolvePSO = lib.getPipelineStateForFunc("backwardSolve");
+
+  @autoreleasepool {
+    dispatch_sync_with_rethrow(stream->queue(), [&](){
+      MTLSize threadGroupSize = MTLSizeMake(32, 8, 1);
+      auto computeEncoder = stream->commandEncoder();
+      MTLSize gridSize = MTLSizeMake(batch, NRHS, 1);
+
+      // Apply pivot permutation in ascending order
+      {
+        [computeEncoder setComputePipelineState:applyPivotPSO];
+        mtl_setArgs(computeEncoder, out, pivots,
+                    (uint32_t)N, (uint32_t)NRHS);
+        [computeEncoder dispatchThreadgroups:gridSize
+                       threadsPerThreadgroup:threadGroupSize];
+      }
+
+      // Forward substitution
+      {
+        [computeEncoder setComputePipelineState:forwardSolvePSO];
+        uint32_t adjointFlag = adjoint ? 1 : 0;
+        mtl_setArgs(computeEncoder, LU, out,
+                    (uint32_t)N, (uint32_t)NRHS, adjointFlag);
+        [computeEncoder dispatchThreadgroups:gridSize
+                       threadsPerThreadgroup:threadGroupSize];
+      }
+
+      // Backward substitution
+      {
+        [computeEncoder setComputePipelineState:backwardSolvePSO];
+        uint32_t adjointFlag = adjoint ? 1 : 0;
+        mtl_setArgs(computeEncoder, LU, out,
+                    (uint32_t)N, (uint32_t)NRHS, adjointFlag);
+        [computeEncoder dispatchThreadgroups:gridSize
+                       threadsPerThreadgroup:threadGroupSize];
+      }
+    });
   }
 }
 
@@ -1137,5 +1216,10 @@ std::tuple<Tensor, Tensor> linalg_lu_factor_mps(const Tensor& A, bool pivot) {
 TORCH_IMPL_FUNC(linalg_lu_factor_ex_out_mps)
 (const Tensor& A, bool pivot, bool check_errors, const Tensor& LU, const Tensor& pivots, const Tensor& info) {
   mps::linalg_lu_factor_ex_out_mps_impl(A, pivot, LU, pivots, info, check_errors);
+}
+
+TORCH_IMPL_FUNC(linalg_lu_solve_out_mps)
+(const Tensor& LU, const Tensor& pivots, const Tensor& B, bool left, bool adjoint, const Tensor& out) {
+  mps::linalg_lu_solve_out_mps_impl(LU, pivots, B, left, adjoint, out);
 }
 } // namespace at::native

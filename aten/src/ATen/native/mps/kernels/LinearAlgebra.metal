@@ -395,6 +395,128 @@ kernel void applySYRK(
   }
 }
 
+
+kernel void applyPivot(
+    device float* out              [[ buffer(0) ]],
+    device const int* pivots       [[ buffer(1) ]],
+    constant uint& N               [[ buffer(2) ]],
+    constant uint& NRHS            [[ buffer(3) ]],
+    uint3 tid                      [[ thread_position_in_threadgroup ]],
+    uint3 tgid                     [[ threadgroup_position_in_grid ]],
+    uint3 tpg                      [[ threads_per_threadgroup ]]
+) {
+    if (tid.x == 0 && tid.y == 0 && tid.z == 0) {
+        uint batch = tgid.x;
+        uint rhs = tgid.y;
+        uint batch_offset = batch * N * NRHS;
+        for (uint i = 0; i < N; ++i) {
+            uint pivot_idx = pivots[batch * N + i] - 1;
+            if (pivot_idx != i) {
+                uint idx_i = batch_offset + i * NRHS + rhs;
+                uint idx_p = batch_offset + pivot_idx * NRHS + rhs;
+                float temp = out[idx_i];
+                out[idx_i] = out[idx_p];
+                out[idx_p] = temp;
+            }
+        }
+    }
+}
+
+
+kernel void forwardSolve(
+    device const float* LU         [[ buffer(0) ]],
+    device float* out              [[ buffer(1) ]],
+    constant uint& N               [[ buffer(2) ]],
+    constant uint& NRHS            [[ buffer(3) ]],
+    constant uint& adjoint         [[ buffer(4) ]],
+    uint3 tid                      [[ thread_position_in_threadgroup ]],
+    uint3 tgid                     [[ threadgroup_position_in_grid ]],
+    uint3 tpg                      [[ threads_per_threadgroup ]]
+) {
+    if (tid.x == 0 && tid.y == 0 && tid.z == 0) {
+        uint batch = tgid.x;
+        uint rhs = tgid.y;
+        uint L_batch_offset = batch * N * N;
+        uint out_batch_offset = batch * N * NRHS + rhs;
+        
+        for (uint i = 0; i < N; ++i) {
+            float sum_known = 0.0f;
+            
+            for (uint j = 0; j < i; ++j) {
+                sum_known += LU[L_batch_offset + i * N + j] * out[out_batch_offset + j * NRHS];
+            }
+            
+            if (adjoint == 0) {
+                out[out_batch_offset + i * NRHS] = out[out_batch_offset + i * NRHS] - sum_known;
+            } else {
+                out[out_batch_offset + i * NRHS] = 
+                    (out[out_batch_offset + i * NRHS] - sum_known) / LU[L_batch_offset + i * N + i];
+            }
+        }
+    }
+}
+
+
+kernel void backwardSolve(
+    device const float* LU         [[ buffer(0) ]],
+    device float* out              [[ buffer(1) ]],
+    constant uint& N               [[ buffer(2) ]],
+    constant uint& NRHS            [[ buffer(3) ]],
+    constant uint& adjointFlag     [[ buffer(4) ]],
+    uint3 tid                      [[ thread_position_in_threadgroup ]],
+    uint3 tgid                     [[ threadgroup_position_in_grid ]],
+    uint3 tpg                      [[ threads_per_threadgroup ]]
+) {
+    uint batch = tgid.x;
+    uint rhs   = tgid.y;
+    const uint totalThreads = tpg.x * tpg.y * tpg.z;
+    uint lid = tid.y * tpg.x + tid.x;
+    threadgroup float shared[256];
+
+    uint LU_offset  = batch * N * N;
+    uint out_offset = batch * N * NRHS;
+
+    for (int i = int(N) - 1; i >= 0; --i) {
+        float partial = 0.0f;
+        uint count = (uint)(N - (i + 1));
+        
+        for (uint idx = lid; idx < count; idx += totalThreads) {
+            uint j = i + 1 + idx;
+            uint out_j_index = out_offset + j * NRHS + rhs;
+            float xj = out[out_j_index];
+            float A_val = 0.0f;
+            if (adjointFlag == 0) {
+                A_val = LU[LU_offset + i * N + j];
+            } else {
+                A_val = LU[LU_offset + j * N + i];
+            }
+            partial += A_val * xj;
+        }
+        
+        shared[lid] = partial;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        
+        for (uint stride = totalThreads / 2; stride > 0; stride /= 2) {
+            if (lid < stride) {
+                shared[lid] += shared[lid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        
+        if (lid == 0) {
+            uint index_i = out_offset + uint(i) * NRHS + rhs;
+            float yi = out[index_i];
+            if (adjointFlag == 1) {
+                out[index_i] = yi - shared[0];
+            } else {
+                float diag = LU[LU_offset + uint(i) * N + uint(i)];
+                out[index_i] = (yi - shared[0]) / diag;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 #define INSTANTIATE_NAIVE_MM(DTYPE)                          \
   template [[host_name("naive_matmul_" #DTYPE)]] kernel void \
   naive_matmul<DTYPE>(                                       \
