@@ -438,18 +438,18 @@ kernel void forwardSolve(
         uint rhs = tgid.y;
         uint L_batch_offset = batch * N * N;
         uint out_batch_offset = batch * N * NRHS + rhs;
-        
+
         for (uint i = 0; i < N; ++i) {
             float sum_known = 0.0f;
-            
+
             for (uint j = 0; j < i; ++j) {
                 sum_known += LU[L_batch_offset + i * N + j] * out[out_batch_offset + j * NRHS];
             }
-            
+
             if (adjoint == 0) {
                 out[out_batch_offset + i * NRHS] = out[out_batch_offset + i * NRHS] - sum_known;
             } else {
-                out[out_batch_offset + i * NRHS] = 
+                out[out_batch_offset + i * NRHS] =
                     (out[out_batch_offset + i * NRHS] - sum_known) / LU[L_batch_offset + i * N + i];
             }
         }
@@ -479,7 +479,7 @@ kernel void backwardSolve(
     for (int i = int(N) - 1; i >= 0; --i) {
         float partial = 0.0f;
         uint count = (uint)(N - (i + 1));
-        
+
         for (uint idx = lid; idx < count; idx += totalThreads) {
             uint j = i + 1 + idx;
             uint out_j_index = out_offset + j * NRHS + rhs;
@@ -492,17 +492,17 @@ kernel void backwardSolve(
             }
             partial += A_val * xj;
         }
-        
+
         shared[lid] = partial;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        
+
         for (uint stride = totalThreads / 2; stride > 0; stride /= 2) {
             if (lid < stride) {
                 shared[lid] += shared[lid + stride];
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        
+
         if (lid == 0) {
             uint index_i = out_offset + uint(i) * NRHS + rhs;
             float yi = out[index_i];

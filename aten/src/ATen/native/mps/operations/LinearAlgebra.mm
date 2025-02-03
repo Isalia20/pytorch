@@ -243,19 +243,16 @@ static void linalg_lu_factor_ex_out_mps_impl(const Tensor& A,
   }
 }
 
-static void linalg_lu_solve_out_mps_impl(
-    const at::Tensor& LU,
-    const at::Tensor& pivots,
-    const at::Tensor& B,
-    bool left,
-    bool adjoint,
-    const at::Tensor& out
-) {
+static void linalg_lu_solve_out_mps_impl(const at::Tensor& LU,
+                                         const at::Tensor& pivots,
+                                         const at::Tensor& B,
+                                         bool left,
+                                         bool adjoint,
+                                         const at::Tensor& out) {
   using namespace mps;
 
   TORCH_CHECK(out.is_mps(), "LU solve: Output tensor must be on MPS device");
-  TORCH_CHECK(B.scalar_type() == at::ScalarType::Float,
-              "LU solve: Input tensor must be float32");
+  TORCH_CHECK(B.scalar_type() == at::ScalarType::Float, "LU solve: Input tensor must be float32");
   TORCH_CHECK(LU.dim() >= 2, "LU solve: LU must be at least 2D"); ///
 
   if (B.numel() == 0 || out.numel() == 0) {
@@ -284,7 +281,7 @@ static void linalg_lu_solve_out_mps_impl(
   auto backwardSolvePSO = lib.getPipelineStateForFunc("backwardSolve");
 
   @autoreleasepool {
-    dispatch_sync_with_rethrow(stream->queue(), [&](){
+    dispatch_sync_with_rethrow(stream->queue(), [&]() {
       MTLSize threadGroupSize = MTLSizeMake(32, 8, 1);
       auto computeEncoder = stream->commandEncoder();
       MTLSize gridSize = MTLSizeMake(batch, NRHS, 1);
@@ -292,30 +289,24 @@ static void linalg_lu_solve_out_mps_impl(
       // Apply pivot permutation in ascending order
       {
         [computeEncoder setComputePipelineState:applyPivotPSO];
-        mtl_setArgs(computeEncoder, out, pivots,
-                    (uint32_t)N, (uint32_t)NRHS);
-        [computeEncoder dispatchThreadgroups:gridSize
-                       threadsPerThreadgroup:threadGroupSize];
+        mtl_setArgs(computeEncoder, out, pivots, (uint32_t)N, (uint32_t)NRHS);
+        [computeEncoder dispatchThreadgroups:gridSize threadsPerThreadgroup:threadGroupSize];
       }
 
       // Forward substitution
       {
         [computeEncoder setComputePipelineState:forwardSolvePSO];
         uint32_t adjointFlag = adjoint ? 1 : 0;
-        mtl_setArgs(computeEncoder, LU, out,
-                    (uint32_t)N, (uint32_t)NRHS, adjointFlag);
-        [computeEncoder dispatchThreadgroups:gridSize
-                       threadsPerThreadgroup:threadGroupSize];
+        mtl_setArgs(computeEncoder, LU, out, (uint32_t)N, (uint32_t)NRHS, adjointFlag);
+        [computeEncoder dispatchThreadgroups:gridSize threadsPerThreadgroup:threadGroupSize];
       }
 
       // Backward substitution
       {
         [computeEncoder setComputePipelineState:backwardSolvePSO];
         uint32_t adjointFlag = adjoint ? 1 : 0;
-        mtl_setArgs(computeEncoder, LU, out,
-                    (uint32_t)N, (uint32_t)NRHS, adjointFlag);
-        [computeEncoder dispatchThreadgroups:gridSize
-                       threadsPerThreadgroup:threadGroupSize];
+        mtl_setArgs(computeEncoder, LU, out, (uint32_t)N, (uint32_t)NRHS, adjointFlag);
+        [computeEncoder dispatchThreadgroups:gridSize threadsPerThreadgroup:threadGroupSize];
       }
     });
   }
