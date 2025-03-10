@@ -76,14 +76,20 @@ std::tuple<Tensor, Tensor> _scaled_dot_product_attention_math_mps(const Tensor& 
   int64_t seq_len_q = q_.size(2);
   int64_t head_dim = q_.size(-1);
   int64_t seq_len_k = k_.size(2);
+  const int Bc = 32; 
+  const int Br = 32;
+  const int Tc = (float)((seq_len_q + Bc - 1) / Bc) ;
+  const int Tr = (float)((seq_len_q + Br - 1) / Br);
   
   // Calculate scale factor
   auto scale_factor = sdp::calculate_scale(query, scale).expect_float();
   
   // Create output tensors
-  auto out = at::empty({batchSize, num_head, seq_len_q, seq_len_k}, query.options());
+  auto out = at::empty({batchSize, num_head, seq_len_q, head_dim}, query.options());
+  auto l = at::empty({batchSize, num_head, seq_len_q}, query.options()).fill_(0);
+  auto m = at::empty({batchSize, num_head, seq_len_q}, query.options()).fill_(-INFINITY);
   auto attn = at::empty({batchSize, num_head, seq_len_q, seq_len_k}, query.options());
-  
+
   // Empty tensors optimization
   if (q_.numel() == 0 || k_.numel() == 0 || v_.numel() == 0) {
     out.zero_();
@@ -101,14 +107,15 @@ std::tuple<Tensor, Tensor> _scaled_dot_product_attention_math_mps(const Tensor& 
   auto device = MPSDevice::getInstance()->device();
   auto attentionPSO = lib.getPipelineStateForFunc("attention");
 
+  const int sram_size = (3 * Bc * head_dim * sizeof(float)) + (Bc * Br * sizeof(float));
   const uint matrix_dim = query.size(-1);
   uint32_t tileSize = 8;
   uint32_t gridY = seq_len_q / tileSize;
   uint32_t gridZ = batchSize * num_head;
   uint32_t out_blocks_per_simdgroup = (seq_len_k + 255) / 256;
 
-  MTLSize threadGroupSize = MTLSizeMake(32, std::min<uint32_t>(32, seq_len_k / tileSize), 1);
-  MTLSize gridSize = MTLSizeMake(1, gridY, gridZ);
+  MTLSize gridSize = MTLSizeMake(batchSize, num_head, 1);
+  MTLSize threadGroupSize = MTLSizeMake(32, 1, 1);
 
   Tensor q_ref = q_;
   Tensor k_ref = k_.transpose(-2, -1);
@@ -118,9 +125,8 @@ std::tuple<Tensor, Tensor> _scaled_dot_product_attention_math_mps(const Tensor& 
     dispatch_sync_with_rethrow(stream->queue(), ^() {
       auto computeEncoder = stream->commandEncoder();
       [computeEncoder setComputePipelineState:attentionPSO];
-      mtl_setArgs(computeEncoder, q_ref, k_ref, v_ref, mask_ref, out, num_head, seq_len_q, seq_len_k, head_dim, scale_factor, is_causal, out_blocks_per_simdgroup);
-      [computeEncoder setThreadgroupMemoryLength:head_dim * 8 * sizeof(float) atIndex:0];
-      [computeEncoder setThreadgroupMemoryLength:seq_len_k * 8 * sizeof(float) atIndex:1];
+      mtl_setArgs(computeEncoder, q_ref, k_ref, v_ref, seq_len_q, head_dim, Tc, Tr, Bc, Br, scale_factor, l, m, out, num_head);
+      [computeEncoder setThreadgroupMemoryLength:sram_size atIndex:0];
       [computeEncoder dispatchThreadgroups:gridSize threadsPerThreadgroup:threadGroupSize];
     });
   }
