@@ -81,7 +81,6 @@ std::tuple<Tensor, Tensor> _scaled_dot_product_attention_math_mps(const Tensor& 
   auto scale_factor = sdp::calculate_scale(query, scale).expect_float();
   
   // Create output tensors
-  // auto out = at::empty({batchSize, num_head, seq_len_q, head_dim}, query.options());
   auto out = at::empty({batchSize, num_head, seq_len_q, seq_len_k}, query.options());
   auto attn = at::empty({batchSize, num_head, seq_len_q, seq_len_k}, query.options());
   
@@ -96,7 +95,7 @@ std::tuple<Tensor, Tensor> _scaled_dot_product_attention_math_mps(const Tensor& 
       shape.insert(shape.end(), {attn.size(1), attn.size(2), attn.size(3)});
       return attn.view(shape);
     }()) : attn;
-    return {std::move(final_out), std::move(final_attn)}; //
+    return {std::move(final_out), std::move(final_attn)};
   }
   auto stream = getCurrentMPSStream();
   auto device = MPSDevice::getInstance()->device();
@@ -106,7 +105,7 @@ std::tuple<Tensor, Tensor> _scaled_dot_product_attention_math_mps(const Tensor& 
   uint32_t tileSize = 8;
   uint32_t gridY = seq_len_q / tileSize;
   uint32_t gridZ = batchSize * num_head;
-  uint32_t out_blocks_per_simdgroup = (seq_len_k + 255) / 256; ////
+  uint32_t out_blocks_per_simdgroup = (seq_len_k + 255) / 256;
 
   MTLSize threadGroupSize = MTLSizeMake(32, std::min<uint32_t>(32, seq_len_k / tileSize), 1);
   MTLSize gridSize = MTLSizeMake(1, gridY, gridZ);
@@ -120,7 +119,8 @@ std::tuple<Tensor, Tensor> _scaled_dot_product_attention_math_mps(const Tensor& 
       auto computeEncoder = stream->commandEncoder();
       [computeEncoder setComputePipelineState:attentionPSO];
       mtl_setArgs(computeEncoder, q_ref, k_ref, v_ref, mask_ref, out, num_head, seq_len_q, seq_len_k, head_dim, scale_factor, is_causal, out_blocks_per_simdgroup);
-      [computeEncoder setThreadgroupMemoryLength:head_dim * 8 atIndex:0]; //
+      [computeEncoder setThreadgroupMemoryLength:head_dim * 8 * sizeof(float) atIndex:0];
+      [computeEncoder setThreadgroupMemoryLength:seq_len_k * 8 * sizeof(float) atIndex:1];
       [computeEncoder dispatchThreadgroups:gridSize threadsPerThreadgroup:threadGroupSize];
     });
   }
@@ -131,7 +131,7 @@ std::tuple<Tensor, Tensor> _scaled_dot_product_attention_math_mps(const Tensor& 
     std::vector<int64_t> shape(query.sizes().begin(), query.sizes().end() - 3);
     shape.insert(shape.end(), {attn.size(1), attn.size(2), attn.size(3)});
     return attn.view(shape);
-  }()) : attn; //
+  }()) : attn;
 
   return {std::move(final_out), std::move(final_attn)};
 }
