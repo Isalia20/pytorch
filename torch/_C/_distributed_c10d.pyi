@@ -362,6 +362,7 @@ class ProcessGroup:
         MPI = ...
         XCCL = ...
         CUSTOM = ...
+        MPS = ...
 
     def __init__(
         self,
@@ -868,6 +869,20 @@ class ProcessGroupXCCL(Backend):
         is_high_priority_stream: bool
 
         def __init__(self, is_high_priority_stream: bool = False): ...
+
+    def __init__(
+        self,
+        store: Store,
+        rank: int,
+        size: int,
+        options: Options,
+    ) -> None: ...
+    @property
+    def options(self) -> Options: ...  # type: ignore[override]
+
+class ProcessGroupMPS(Backend):
+    class Options(Backend.Options):
+        def __init__(self): ...
 
     def __init__(
         self,
