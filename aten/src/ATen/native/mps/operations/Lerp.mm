@@ -29,15 +29,21 @@ TORCH_IMPL_FUNC(lerp_Tensor_mps)(const Tensor& self, const Tensor& end, const Te
   auto end_expanded = end.expand(common_shape).contiguous();
   auto weight_expanded = weight.expand(common_shape).contiguous();
 
+  auto dst = out.is_contiguous() ? out : at::empty(common_shape, out.options());
+
   auto pso = lib.getPipelineStateForFunc("lerp_tensor_kernel_" + scalarToMetalTypeString(out));
-  auto numel = static_cast<uint32_t>(out.numel());
+  auto numel = static_cast<uint32_t>(dst.numel());
 
   dispatch_sync_with_rethrow(getCurrentMPSStream()->queue(), ^() {
     auto computeEncoder = getCurrentMPSStream()->commandEncoder();
     [computeEncoder setComputePipelineState:pso];
-    mtl_setArgs(computeEncoder, self_expanded, end_expanded, weight_expanded, out);
+    mtl_setArgs(computeEncoder, self_expanded, end_expanded, weight_expanded, dst);
     mtl_dispatch1DJob(computeEncoder, pso, numel);
   });
+
+  if (!out.is_contiguous()) {
+    out.copy_(dst);
+  }
 }
 
 } // namespace at::native
