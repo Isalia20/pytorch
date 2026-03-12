@@ -544,3 +544,84 @@ REGISTER_BINARY_ALPHA_OP(sub_alpha, float2, float2, float2);
 REGISTER_BINARY_ALPHA_OP(sub_alpha, half2, half2, half2);
 REGISTER_BINARY_ALPHA_OP(lerp_alpha, float2, float2, float2);
 REGISTER_BINARY_ALPHA_OP(lerp_alpha, half2, half2, half2);
+
+// lerp with tensor weight: lerp(s, e, w) = fma(w, e - s, s)
+template <typename T>
+inline T lerp_op(T s, T e, T w) {
+  return fma(w, e - s, s);
+}
+
+inline bfloat lerp_op(bfloat s, bfloat e, bfloat w) {
+  return static_cast<bfloat>(fma(float(w), float(e) - float(s), float(s)));
+}
+
+inline long lerp_op(long s, long e, long w) {
+  return s + w * (e - s);
+}
+
+inline float2 lerp_op(float2 s, float2 e, float2 w) {
+  return s + mul(w, e - s);
+}
+
+template <typename T>
+kernel void lerp_tensor_dense(
+    device T* out [[buffer(0)]],
+    device const T* self [[buffer(1)]],
+    device const T* end [[buffer(2)]],
+    device const T* weight [[buffer(3)]],
+    uint tid [[thread_position_in_grid]]) {
+  out[tid] = lerp_op(self[tid], end[tid], weight[tid]);
+}
+
+template <typename T>
+kernel void lerp_tensor_strided(
+    device void* out_ptr [[buffer(0)]],
+    constant void* self_ptr [[buffer(1)]],
+    constant void* end_ptr [[buffer(2)]],
+    constant void* weight_ptr [[buffer(3)]],
+    constant long* sizes [[buffer(4)]],
+    constant long* out_strides [[buffer(5)]],
+    constant long* self_strides [[buffer(6)]],
+    constant long* end_strides [[buffer(7)]],
+    constant long* weight_strides [[buffer(8)]],
+    constant uint& ndim [[buffer(9)]],
+    uint tid [[thread_position_in_grid]]) {
+  int pos[max_ndim];
+  pos_from_thread_index(int(tid), pos, sizes, ndim);
+  auto self_off = offset_from_coord(pos, self_strides, ndim);
+  auto end_off = offset_from_coord(pos, end_strides, ndim);
+  auto weight_off = offset_from_coord(pos, weight_strides, ndim);
+  auto out_off = offset_from_coord(pos, out_strides, ndim);
+  T s = val_at_offs<T>(self_ptr, self_off);
+  T e = val_at_offs<T>(end_ptr, end_off);
+  T w = val_at_offs<T>(weight_ptr, weight_off);
+  ref_at_offs<T>(out_ptr, out_off) = lerp_op(s, e, w);
+}
+
+#define INSTANTIATE_LERP(DTYPE)                                     \
+  template [[host_name("lerp_tensor_dense_" #DTYPE)]] kernel void   \
+  lerp_tensor_dense<DTYPE>(                                         \
+      device DTYPE * out [[buffer(0)]],                             \
+      device const DTYPE* self [[buffer(1)]],                       \
+      device const DTYPE* end [[buffer(2)]],                        \
+      device const DTYPE* weight [[buffer(3)]],                     \
+      uint tid [[thread_position_in_grid]]);                        \
+  template [[host_name("lerp_tensor_strided_" #DTYPE)]] kernel void \
+  lerp_tensor_strided<DTYPE>(                                       \
+      device void* out_ptr [[buffer(0)]],                           \
+      constant void* self_ptr [[buffer(1)]],                        \
+      constant void* end_ptr [[buffer(2)]],                         \
+      constant void* weight_ptr [[buffer(3)]],                      \
+      constant long* sizes [[buffer(4)]],                           \
+      constant long* out_strides [[buffer(5)]],                     \
+      constant long* self_strides [[buffer(6)]],                    \
+      constant long* end_strides [[buffer(7)]],                     \
+      constant long* weight_strides [[buffer(8)]],                  \
+      constant uint& ndim [[buffer(9)]],                            \
+      uint tid [[thread_position_in_grid]]);
+
+INSTANTIATE_LERP(float);
+INSTANTIATE_LERP(half);
+INSTANTIATE_LERP(bfloat);
+INSTANTIATE_LERP(float2);
+INSTANTIATE_LERP(long);

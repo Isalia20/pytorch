@@ -186,6 +186,27 @@ static void lerp_scalar_mps_kernel(at::TensorIteratorBase& iter, const Scalar& w
   lib.exec_binary_kernel(iter, "lerp_alpha", weight);
 }
 
+static void lerp_tensor_mps_kernel(at::TensorIteratorBase& iter) {
+  using namespace mps;
+  auto type_str = scalarToMetalTypeString(iter.common_dtype());
+  auto contiguous = iter.is_contiguous();
+  auto kernel_name = contiguous ? "lerp_tensor_dense_" + type_str : "lerp_tensor_strided_" + type_str;
+  auto pso = lib.getPipelineStateForFunc(kernel_name);
+  auto numel = static_cast<uint32_t>(iter.numel());
+
+  dispatch_sync_with_rethrow(getCurrentMPSStream()->queue(), ^() {
+    auto computeEncoder = getCurrentMPSStream()->commandEncoder();
+    [computeEncoder setComputePipelineState:pso];
+    bind_iter_tensors(computeEncoder, iter);
+    if (!contiguous) {
+      auto ndim = static_cast<uint32_t>(iter.ndim());
+      mtl_setArgs<4>(
+          computeEncoder, iter.shape(), iter.strides(0), iter.strides(1), iter.strides(2), iter.strides(3), ndim);
+    }
+    mtl_dispatch1DJob(computeEncoder, pso, numel);
+  });
+}
+
 static void native_dropout_mask_and_scale_mps_kernel(at::TensorIteratorBase& iter, const Scalar& scale) {
   lib.exec_binary_kernel(iter, "native_dropout_mask_and_scale", scale);
 }
@@ -256,6 +277,7 @@ REGISTER_DISPATCH(hermite_polynomial_he_stub, &hermite_polynomial_he_mps_kernel)
 REGISTER_DISPATCH(polar_stub, &polar_mps_kernel);
 REGISTER_DISPATCH(complex_stub, &complex_mps_kernel);
 REGISTER_DISPATCH(lerp_kernel_scalar_weight, &lerp_scalar_mps_kernel)
+REGISTER_DISPATCH(lerp_kernel_tensor_weight, &lerp_tensor_mps_kernel)
 REGISTER_DISPATCH(mul_stub, &mul_mps_kernel)
 REGISTER_DISPATCH(div_true_stub, &div_true_mps_kernel)
 REGISTER_DISPATCH(div_floor_stub, &div_floor_mps_kernel)
