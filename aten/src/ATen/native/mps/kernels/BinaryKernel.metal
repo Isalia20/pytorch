@@ -579,9 +579,9 @@ kernel void lerp_tensor_scalar_weight(
     device T* out [[buffer(0)]],
     device const T* self [[buffer(1)]],
     device const T* end [[buffer(2)]],
-    device const T* weight [[buffer(3)]],
+    device const T& weight [[buffer(3)]],
     uint tid [[thread_position_in_grid]]) {
-  out[tid] = lerp_op(self[tid], end[tid], weight[0]);
+  out[tid] = lerp_op(self[tid], end[tid], weight);
 }
 
 // 2D strided: coordinates from 2D dispatch, no integer division
@@ -674,7 +674,7 @@ kernel void lerp_tensor_strided(
       device DTYPE * out [[buffer(0)]],                                   \
       device const DTYPE* self [[buffer(1)]],                             \
       device const DTYPE* end [[buffer(2)]],                              \
-      device const DTYPE* weight [[buffer(3)]],                           \
+      device const DTYPE& weight [[buffer(3)]],                           \
       uint tid [[thread_position_in_grid]]);                              \
   template [[host_name("lerp_tensor_strided_2d_" #DTYPE)]] kernel void    \
   lerp_tensor_strided_2d<DTYPE>(                                          \
