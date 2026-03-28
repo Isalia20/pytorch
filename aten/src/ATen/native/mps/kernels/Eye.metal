@@ -24,12 +24,12 @@ kernel void eye_diag(
 #define REGISTER_EYE_OP(DTYPE)                                            \
   template [[host_name("eye_" #DTYPE)]] kernel void eye<DTYPE>(           \
       device DTYPE * output [[buffer(0)]],                                \
-      constant long & stride0 [[buffer(1)]],                              \
-      constant long & stride1 [[buffer(2)]],                              \
+      constant long& stride0 [[buffer(1)]],                               \
+      constant long& stride1 [[buffer(2)]],                               \
       uint2 pos [[thread_position_in_grid]]);                             \
   template [[host_name("eye_diag_" #DTYPE)]] kernel void eye_diag<DTYPE>( \
       device DTYPE * output [[buffer(0)]],                                \
-      constant long & diag_stride [[buffer(1)]],                          \
+      constant long& diag_stride [[buffer(1)]],                           \
       uint index [[thread_position_in_grid]]);
 
 REGISTER_EYE_OP(float);
