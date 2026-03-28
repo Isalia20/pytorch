@@ -28,7 +28,6 @@ from torch.distributed.tensor._op_schema import (
     TupleStrategy,
 )
 from torch.distributed.tensor._ops.single_dim_strategy import (
-    _dijkstra_expand_single_dim_strategy_to_mesh,
     _expand_single_dim_strategy_to_mesh,
     _SingleDimStrategyInfo,
 )
@@ -43,10 +42,6 @@ from torch.utils._pytree import tree_map
 
 aten = torch.ops.aten
 
-# Disables the Dijkstra-based mincost search optimization for single-dim
-# strategy propagation, falling back to full O(S^N) strategy expansion.
-FORCE_FULLY_EXPAND_SINGLE_DIM: bool = False
-
 log = logging.getLogger(__name__)
 
 
@@ -58,14 +53,15 @@ def _length(obj) -> int:
     return len(obj)
 
 
-def _get_expected_num_tensor_outputs(op: OpOverload) -> int:
+def _get_expected_num_tensor_outputs(op: OpOverload) -> int | None:
     """
     Get the expected number of tensor outputs for an operator based on its schema.
 
     Returns:
         The number of tensor outputs expected. Returns 0 for ops that don't return tensors
         (e.g., _linalg_check_errors). Returns 1 for single tensor return, and >1 for
-        tuple returns where each element is a tensor.
+        tuple returns where each element is a tensor. Returns None for List[Tensor]
+        returns where the length is unknown at schema time.
     """
     return_types = op._schema.returns
     if len(return_types) == 0:
@@ -76,8 +72,8 @@ def _get_expected_num_tensor_outputs(op: OpOverload) -> int:
         # Could be single tensor or tuple of tensors
         return len(return_types)
     elif isinstance(first_return.type, torch.ListType):
-        # List[Tensor] - we don't know the length at schema time, treat as 1
-        return 1
+        # List[Tensor] - we don't know the length at schema time
+        return None
     else:
         # Not a tensor return type
         return 0
@@ -105,6 +101,16 @@ def _validate_tensor_meta_count(
         actual_outputs = 1
     else:
         actual_outputs = len(tensor_meta)
+
+    if expected_outputs is None:
+        # List[Tensor] return type: length unknown at schema time, but
+        # tensor_meta must be a list of TensorMeta.
+        if not isinstance(tensor_meta, list):
+            raise AssertionError(
+                f"Tensor meta for {op_schema.op} should be a list[TensorMeta] "
+                f"(op returns List[Tensor]), but got {type(tensor_meta).__name__}"
+            )
+        return
 
     if actual_outputs != expected_outputs:
         raise AssertionError(
@@ -351,6 +357,15 @@ class ShardingPropagator:
             aten.select_backward.default: 1,
             aten.slice_backward.default: 1,
         }
+        # squeeze ops that need dim arg rewritten to only globally-singleton dims
+        self.squeeze_op_to_dims_variant: dict[OpOverload, OpOverload] = {
+            aten.squeeze.default: aten.squeeze.dims,
+            aten.squeeze.dim: aten.squeeze.dims,
+            aten.squeeze.dims: aten.squeeze.dims,
+            aten.squeeze_.default: aten.squeeze_.dims,
+            aten.squeeze_.dim: aten.squeeze_.dims,
+            aten.squeeze_.dims: aten.squeeze_.dims,
+        }
 
     def register_sharding_prop_rule(
         self,
@@ -591,17 +606,23 @@ class ShardingPropagator:
         def spec_to_strategy(spec: object) -> object:
             if isinstance(spec, DTensorSpec):
                 return OpStrategy([OpSpec(spec)])
-            elif (
-                isinstance(spec, (list, tuple))
-                and len(spec) > 0
-                and isinstance(spec[0], DTensorSpec)
-            ):
-                # tensor list create tuple strategy
-                tuple_strategy = [spec_to_strategy(s) for s in spec]
-                tuple_strategy = cast(Sequence[StrategyType], tuple_strategy)
-                return TupleStrategy(
-                    tuple(tuple_strategy) if isinstance(spec, tuple) else tuple_strategy
-                )
+            elif isinstance(spec, (list, tuple)) and len(spec) > 0:
+                if all(isinstance(s, DTensorSpec) for s in spec):
+                    # tensor list create tuple strategy
+                    tuple_strategy = [spec_to_strategy(s) for s in spec]
+                    tuple_strategy = cast(Sequence[StrategyType], tuple_strategy)
+                    return TupleStrategy(
+                        tuple(tuple_strategy)
+                        if isinstance(spec, tuple)
+                        else tuple_strategy
+                    )
+                elif any(isinstance(s, DTensorSpec) for s in spec):
+                    # mixed list (e.g. [DTensorSpec, None, DTensorSpec]) for
+                    # ops like aten.index.Tensor; keep as list so pytree
+                    # flattening can extract OpStrategy items
+                    return [spec_to_strategy(s) for s in spec]
+                else:
+                    return spec
             else:
                 return spec
 
@@ -683,39 +704,14 @@ class ShardingPropagator:
                 mesh = try_find_mesh_from_args(op_schema.op, op_schema.args_schema)
                 if not isinstance(mesh, DeviceMesh):
                     raise AssertionError("Expected to find a valid mesh")
-                # Try PQ search first: fast path when inputs already match a
-                # strategy, otherwise Dijkstra over placement transitions.
-                # Computes redistribute costs directly via per-dim
-                # _compute_placement_transition_cost, avoiding the overhead of
-                # generate_redistribute_costs / _gen_transform_infos planning.
-                # Returns None for StridedShard/symbolic/TupleStrategy inputs.
-                # Note: we know the optimal sequence of operations needed to perform redistribution
-                # after the PQ search, and we could plumb this information through the OutputSharding
-                # so the subsequent redistribute() call can skip doing another graph-based transforminfo search,
-                # but this is not implemented now.
-                op_strategy = None
-                if not FORCE_FULLY_EXPAND_SINGLE_DIM:
-                    op_strategy = _dijkstra_expand_single_dim_strategy_to_mesh(
-                        mesh,
-                        strategy_schema,
-                        single_dim_strategy_info,
-                        out_tensor_meta,
-                    )
-                if op_strategy is None:
-                    # Fall back to full O(S^N) expansion
-                    # to generate the full set of strategy combinations, each one
-                    # with a redistribute cost, and then find the min strategy over those costs.
-                    _expanded_strategy_fn = _expand_single_dim_strategy_to_mesh(
-                        mesh,
-                        strategy_schema,
-                        single_dim_strategy_info,
-                        out_tensor_meta,
-                    )
-                    op_strategy = _expanded_strategy_fn(
-                        op_schema.op,
-                        strategy_schema.args_meta,
-                        strategy_schema.kwargs_meta,
-                    )
+                # expand to generate the full set of strategy combinations, each one
+                # with a redistribute cost, and then find the min strategy over those costs.
+                _expanded_strategy_fn = _expand_single_dim_strategy_to_mesh(
+                    mesh, strategy_schema, single_dim_strategy_info, out_tensor_meta
+                )
+                op_strategy = _expanded_strategy_fn(
+                    op_schema.op, strategy_schema.args_meta, strategy_schema.kwargs_meta
+                )
             else:
                 if op_strategy_func is None:
                     raise AssertionError
@@ -794,6 +790,15 @@ class ShardingPropagator:
                         needs_redistribute = True
                         use_val_from_redistribute_schema = True
 
+                # rewrite squeeze to use only globally-singleton dims
+                if op_schema.op in self.squeeze_op_to_dims_variant:
+                    schema = suggestion_schema or op_schema
+                    adjusted = self._adjust_squeeze_to_global_singletons(schema)
+                    if adjusted is not None:
+                        suggestion_schema = adjusted
+                        needs_redistribute = True
+                        use_val_from_redistribute_schema = True
+
                 # construct output spec for the op
                 if op_schema.return_type_tuple_tensor_like():
                     # for ops that return multiple tensors and the output_specs is not
@@ -835,7 +840,8 @@ class ShardingPropagator:
                         raise AssertionError
                     selected_strategy = _select_min_cost_strategy(strategy)
                     selected_strategies.append(selected_strategy)
-                    out_spec_list.append(selected_strategy.output_spec)
+                    if selected_strategy.output_specs is not None:
+                        out_spec_list.append(selected_strategy.output_spec)
 
                 needs_redistribute = False
                 suggestion_args: list[object] = []
@@ -969,14 +975,59 @@ class ShardingPropagator:
         expected_input_schema = list(schema.args_schema)
         # adjust shape to be the same as that of the _local_tensor
         # of the DTensor input arg at index 0, which is inferred
-        expected_input_schema[shape_idx], _ = compute_local_shape_and_global_offset(
+        local_shape, _ = compute_local_shape_and_global_offset(
             out_tensor_meta.shape, spec.mesh, spec.placements, skip_offset=True
         )
+        expected_input_schema[shape_idx] = local_shape
 
         # adjust the stride arg for aten.new_empty_strided.default
         if stride_idx:
             expected_input_schema[stride_idx] = compute_local_stride(
-                out_tensor_meta.stride, spec.mesh, spec.placements
+                out_tensor_meta.stride, local_shape
             )
 
         return OpSchema(schema.op, tuple(expected_input_schema), schema.kwargs_schema)
+
+    def _adjust_squeeze_to_global_singletons(self, schema: OpSchema) -> OpSchema | None:
+        """
+        Rewrite squeeze ops to squeeze.dims with only globally-singleton dims.
+        Fixes bug where sharded dims with local size 1 get incorrectly squeezed.
+        Returns None if no rewrite is needed (already squeeze.dims with correct args).
+        """
+        from torch.fx.experimental.symbolic_shapes import guard_or_false
+
+        input_spec = cast(DTensorSpec, schema.args_schema[0])
+        tensor_meta = input_spec.tensor_meta
+        if tensor_meta is None:
+            raise RuntimeError("squeeze requires tensor metadata")
+        global_shape = tensor_meta.shape
+        ndim = len(global_shape)
+
+        def normalize(d: int) -> int:
+            return d if d >= 0 else d + ndim
+
+        def is_singleton(d: int) -> bool:
+            nd = normalize(d)
+            return 0 <= nd < ndim and guard_or_false(global_shape[nd] == 1)
+
+        # guard_or_false: conservatively keep dims when size is symbolic/unknown
+        if schema.op in (aten.squeeze.default, aten.squeeze_.default):
+            target_dims = tuple(
+                i for i, s in enumerate(global_shape) if guard_or_false(s == 1)
+            )
+        elif schema.op in (aten.squeeze.dim, aten.squeeze_.dim):
+            dim = normalize(schema.args_schema[1])  # type: ignore[arg-type]
+            target_dims = (dim,) if is_singleton(dim) else ()
+        else:
+            dims = cast(Sequence[int], schema.args_schema[1])
+            target_dims = tuple(  # type: ignore[union-attr]
+                normalize(d) for d in dims if is_singleton(d)
+            )
+
+        dims_variant = self.squeeze_op_to_dims_variant[schema.op]
+        # Skip rewrite if already targeting the right op with the same dims
+        if schema.op == dims_variant and len(schema.args_schema) > 1:
+            existing_dims = schema.args_schema[1]
+            if existing_dims == target_dims:
+                return None
+        return OpSchema(dims_variant, (input_spec, target_dims), {})

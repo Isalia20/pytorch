@@ -63,14 +63,14 @@ struct fmin_functor {
 struct maximum_functor {
   template <typename T>
   inline T operator()(const T a, const T b) {
-    return max(a, b);
+    return c10::metal::max(a, b);
   }
 };
 
 struct minimum_functor {
   template <typename T>
   inline T operator()(const T a, const T b) {
-    return min(a, b);
+    return c10::metal::min(a, b);
   }
 };
 
@@ -119,6 +119,20 @@ struct logaddexp2_functor {
   template <typename T, enable_if_t<is_integral_v<T>, bool> = true>
   inline float operator()(const T a, const T b) {
     return c10::metal::logaddexp2(float(a), float(b));
+  }
+};
+
+struct xlogy_functor {
+  template <typename T, enable_if_t<is_floating_point_v<T>, bool> = true>
+  inline T operator()(const T a, const T b) {
+    return static_cast<T>(c10::metal::xlogy(a, b));
+  }
+  template <typename T, enable_if_t<is_integral_v<T>, bool> = true>
+  inline float operator()(const T a, const T b) {
+    return c10::metal::xlogy(float(a), float(b));
+  }
+  inline float operator()(const bool a, const bool b) {
+    return (a && !b) ? -INFINITY : 0;
   }
 };
 
@@ -449,6 +463,8 @@ REGISTER_FLOAT_BINARY_OP(logaddexp);
 REGISTER_INT2FLOAT_BINARY_OP(logaddexp);
 REGISTER_FLOAT_BINARY_OP(logaddexp2);
 REGISTER_INT2FLOAT_BINARY_OP(logaddexp2);
+REGISTER_FLOAT_BINARY_OP(xlogy);
+REGISTER_INT2FLOAT_BINARY_OP(xlogy);
 REGISTER_FLOAT_BINARY_OP(xlog1py);
 REGISTER_INT2FLOAT_BINARY_OP(xlog1py);
 REGISTER_FLOAT_BINARY_OP(chebyshev_polynomial_t);
@@ -579,9 +595,9 @@ kernel void lerp_tensor_scalar_weight(
     device T* out [[buffer(0)]],
     device const T* self [[buffer(1)]],
     device const T* end [[buffer(2)]],
-    device const T* weight [[buffer(3)]],
+    device const T& weight [[buffer(3)]],
     uint tid [[thread_position_in_grid]]) {
-  out[tid] = lerp_op(self[tid], end[tid], weight[0]);
+  out[tid] = lerp_op(self[tid], end[tid], weight);
 }
 
 // 2D strided: coordinates from 2D dispatch, no integer division
@@ -674,7 +690,7 @@ kernel void lerp_tensor_strided(
       device DTYPE * out [[buffer(0)]],                                   \
       device const DTYPE* self [[buffer(1)]],                             \
       device const DTYPE* end [[buffer(2)]],                              \
-      device const DTYPE* weight [[buffer(3)]],                           \
+      device const DTYPE& weight [[buffer(3)]],                           \
       uint tid [[thread_position_in_grid]]);                              \
   template [[host_name("lerp_tensor_strided_2d_" #DTYPE)]] kernel void    \
   lerp_tensor_strided_2d<DTYPE>(                                          \
