@@ -66,6 +66,7 @@ bool MPSDevice::isMacOS13Plus(MacOSVersion version) const {
   static bool _macos_15_1_plus = is_os_version_at_least(15, 1);
   static bool _macos_15_2_plus = is_os_version_at_least(15, 2);
   static bool _macos_26_0_plus = is_os_version_at_least(26, 0);
+  static bool _macos_26_2_plus = is_os_version_at_least(26, 2);
 
   switch (version) {
     case MacOSVersion::MACOS_VER_14_4_PLUS:
@@ -78,6 +79,8 @@ bool MPSDevice::isMacOS13Plus(MacOSVersion version) const {
       return _macos_15_2_plus;
     case MacOSVersion::MACOS_VER_26_0_PLUS:
       return _macos_26_0_plus;
+    case MacOSVersion::MACOS_VER_26_2_PLUS:
+      return _macos_26_2_plus;
     default:
       return false;
   }
@@ -119,6 +122,38 @@ bool is_available() {
 
 bool is_macos_13_or_newer(MacOSVersion version) {
   return MPSDevice::getInstance()->isMacOS13Plus(version);
+}
+
+bool is_nax_available() {
+  static bool result = []() {
+    if (!is_macos_13_or_newer(MacOSVersion::MACOS_VER_26_2_PLUS)) {
+      return false;
+    }
+    // Parse GPU architecture to check generation.
+    // Metal architecture strings look like "mtp17g", "mtp18p", etc.
+    // The two digits before the last character encode the generation.
+    // NAX requires gen >= 17 for base/pro/max/ultra, gen >= 18 for phone ('p').
+    @autoreleasepool {
+      auto device = MPSDevice::getInstance()->device();
+      NSString* arch = [device architecture].name;
+      if (!arch || [arch length] < 3) {
+        return false;
+      }
+      std::string arch_str = [arch UTF8String];
+      char tier = arch_str.back();
+      int ag_tens = 0, ag_ones = 0;
+      if (arch_str.size() >= 3) {
+        ag_tens = arch_str[arch_str.size() - 3] - '0';
+        ag_ones = arch_str[arch_str.size() - 2] - '0';
+        if (ag_tens < 0 || ag_tens > 9) ag_tens = 0;
+        if (ag_ones < 0 || ag_ones > 9) ag_ones = 0;
+      }
+      int gen = ag_tens * 10 + ag_ones;
+      int min_gen = (tier == 'p') ? 18 : 17;
+      return gen >= min_gen;
+    }
+  }();
+  return result;
 }
 
 } // namespace at::mps

@@ -167,6 +167,14 @@ def is_available() -> bool:
     return device_count() > 0
 
 
+def is_nax_available() -> bool:
+    r"""Check if NAX (Neural Accelerator Extension) is available.
+
+    Requires macOS 26.2+ and Apple Silicon with GPU generation 17+ (M5 family).
+    """
+    return is_available() and torch._C._mps_is_nax_available()
+
+
 from . import profiler
 from .event import Event
 
@@ -187,4 +195,5 @@ __all__ = [
     "profiler",
     "recommended_max_memory",
     "is_available",
+    "is_nax_available",
 ]

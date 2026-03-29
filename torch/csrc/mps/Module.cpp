@@ -13,6 +13,7 @@
 #include <memory>
 
 #ifdef USE_MPS
+#include <ATen/mps/MPSDevice.h>
 #include <ATen/mps/MPSProfiler.h>
 #include <ATen/native/mps/MetalShaderLibrary.h>
 #endif
@@ -39,6 +40,18 @@ static PyObject* MPSModule_isAvailable(PyObject* _unused, PyObject* noargs) {
   HANDLE_TH_ERRORS
   if (at::detail::getMPSHooks().hasMPS()) {
     torch::utils::register_fork_handler_for_device_init(at::kMPS);
+    Py_RETURN_TRUE;
+  } else {
+    Py_RETURN_FALSE;
+  }
+  END_HANDLE_TH_ERRORS
+}
+
+static PyObject* MPSModule_isNAXAvailable(
+    PyObject* _unused,
+    PyObject* noargs) {
+  HANDLE_TH_ERRORS
+  if (at::mps::is_nax_available()) {
     Py_RETURN_TRUE;
   } else {
     Py_RETURN_FALSE;
@@ -219,6 +232,10 @@ static struct PyMethodDef _MPSModule_methods[] = {
      nullptr},
     {"_mps_is_in_bad_fork", MPSModule_isInBadFork, METH_NOARGS, nullptr},
     {"_mps_is_available", MPSModule_isAvailable, METH_NOARGS, nullptr},
+    {"_mps_is_nax_available",
+     MPSModule_isNAXAvailable,
+     METH_NOARGS,
+     nullptr},
     {"_mps_is_on_macos_or_newer",
      MPSModule_isMacOSorNewer,
      METH_VARARGS,

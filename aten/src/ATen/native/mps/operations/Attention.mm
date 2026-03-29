@@ -5,6 +5,7 @@
 #include <optional>
 
 #include <ATen/core/Tensor.h>
+#include <ATen/mps/MPSDevice.h>
 #include <ATen/native/mps/OperationUtils.h>
 #include <ATen/native/transformers/attention.h>
 #include <ATen/native/transformers/sdp_utils_cpp.h>
@@ -26,6 +27,15 @@ static auto& lib = mps::MetalShaderLibrary::getBundledLibrary();
 #endif
 
 static constexpr int SIMD_SIZE = 32;
+
+// NAX cooperative tensor attention shader (Metal 4.0+).
+// The generated metallib header also declares a variable named `lib`, so we
+// include it inside a separate namespace to avoid colliding with the main one.
+#ifdef PYTORCH_JIT_COMPILE_SHADERS
+namespace nax_detail {
+#include <ATen/native/mps/CooperativeAttention_metallib.h>
+} // namespace nax_detail
+#endif
 
 // expand potential 3d to 4d tensor
 static inline std::tuple<Tensor, bool> ensure_4d(const Tensor& x) {
@@ -438,6 +448,102 @@ static std::tuple<Tensor, Tensor> sdpa_full_attention_mps(const Tensor& q_,
   return {std::move(final_out), std::move(final_out)};
 }
 
+// Implementation 4: NAX cooperative tensor attention (Metal 4.0+)
+// Uses hardware MMA units via cooperative tensors for QK^T and score*V.
+static std::tuple<Tensor, Tensor> sdpa_cooperative_nax_mps(const Tensor& q_,
+                                                            const Tensor& k_,
+                                                            const Tensor& v_,
+                                                            const std::optional<Tensor>& mask_,
+                                                            double dropout_p,
+                                                            bool is_causal,
+                                                            const std::optional<Tensor>& dropout_mask,
+                                                            std::optional<double> scale,
+                                                            const Tensor& orig_query,
+                                                            bool unsqueezed) {
+  using namespace mps;
+
+  int64_t batchSize = q_.size(0);
+  int64_t num_heads = q_.size(1);
+  int64_t qL = q_.size(2);
+  int64_t kL = k_.size(2);
+  int64_t headSize = q_.size(3);
+
+  auto q_batch_stride = q_.stride(0);
+  auto q_head_stride = q_.stride(1);
+  auto q_seq_stride = q_.stride(2);
+
+  auto k_batch_stride = k_.stride(0);
+  auto k_head_stride = k_.stride(1);
+  auto k_seq_stride = k_.stride(2);
+
+  auto v_batch_stride = v_.stride(0);
+  auto v_head_stride = v_.stride(1);
+  auto v_seq_stride = v_.stride(2);
+
+  float scale_factor = sdp::calculate_scale(orig_query, scale).expect_float();
+  auto out = at::empty_like(q_);
+
+  constexpr uint wm = 4;
+  constexpr uint bk = 32;
+  auto bd = headSize;
+  auto gqa_factor = static_cast<uint>(q_.size(1) / k_.size(1));
+  const uint BQ = wm * 16; // each SIMD group handles 16 rows, WM groups per threadgroup
+  const auto NQ = (qL + BQ - 1) / BQ;
+  const auto NK = (kL + bk - 1) / bk;
+
+  std::string kname =
+      fmt::format("cooperative_attention_{}_bk{}_bd{}_wm{}",
+                  scalarToMetalTypeString(q_), bk, bd, wm);
+
+  MPSStream* mpsStream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(mpsStream->queue(), ^{
+    @autoreleasepool {
+      auto computeEncoder = mpsStream->commandEncoder();
+
+      // The cooperative attention kernel requires Metal 4.0.
+      // In JIT mode it lives in a separate library; in bundled mode it's in the
+      // main library alongside the other attention kernels.
+#ifdef PYTORCH_JIT_COMPILE_SHADERS
+      auto attentionPSO = nax_detail::lib.getPipelineStateForFunc(kname);
+#else
+      auto attentionPSO = lib.getPipelineStateForFunc(kname);
+#endif
+      [computeEncoder setComputePipelineState:attentionPSO];
+      mtl_setArgs(computeEncoder,
+                  q_,
+                  k_,
+                  v_,
+                  out,
+                  static_cast<uint>(qL),
+                  static_cast<uint>(kL),
+                  gqa_factor,
+                  scale_factor,
+                  static_cast<uint>(NK),
+                  std::array<uint32_t, 3>{static_cast<uint32_t>(q_batch_stride),
+                                          static_cast<uint32_t>(q_head_stride),
+                                          static_cast<uint32_t>(q_seq_stride)},
+                  std::array<uint32_t, 3>{static_cast<uint32_t>(k_batch_stride),
+                                          static_cast<uint32_t>(k_head_stride),
+                                          static_cast<uint32_t>(k_seq_stride)},
+                  std::array<uint32_t, 3>{static_cast<uint32_t>(v_batch_stride),
+                                          static_cast<uint32_t>(v_head_stride),
+                                          static_cast<uint32_t>(v_seq_stride)},
+                  std::array<uint32_t, 3>{static_cast<uint32_t>(out.stride(0)),
+                                          static_cast<uint32_t>(out.stride(1)),
+                                          static_cast<uint32_t>(out.stride(2))});
+
+      // Grid: (NQ query tiles, num_heads, batchSize)
+      // Threads: (32 lanes per SIMD, WM SIMD groups, 1)
+      MTLSize grid_dims = MTLSizeMake(NQ, num_heads, batchSize);
+      MTLSize threadsPerGroup = MTLSizeMake(SIMD_SIZE, wm, 1);
+      [computeEncoder dispatchThreadgroups:grid_dims threadsPerThreadgroup:threadsPerGroup];
+    }
+  });
+
+  auto final_out = unsqueezed ? out.view_as(orig_query) : out;
+  return {std::move(final_out), std::move(final_out)};
+}
+
 std::tuple<Tensor, Tensor> _scaled_dot_product_attention_math_mps(const Tensor& query,
                                                                   const Tensor& key,
                                                                   const Tensor& value,
@@ -480,6 +586,21 @@ std::tuple<Tensor, Tensor> _scaled_dot_product_attention_math_mps(const Tensor& 
 
   // boolean to decide if we can use kernel paths
   bool supports_fast_sdpa = !is_causal && supports_sdpa_vector;
+
+  // NAX cooperative tensor attention: preferred path when hardware supports it.
+  // Requires: macOS 26.2+, Apple Silicon gen 17+, head_dim in {64, 128},
+  //           no attention mask, no causal, contiguous tensors, q/k/v same head dim.
+  bool nax_supported_head_dim = (query_head_dim == value_head_dim) &&
+      (query_head_dim == 64 || query_head_dim == 128);
+  bool supports_nax = at::mps::is_nax_available() && nax_supported_head_dim &&
+      !is_causal && !mask_.has_value() &&
+      q_.is_contiguous() && k_.is_contiguous() && v_.is_contiguous() &&
+      (q_.scalar_type() == at::kHalf || q_.scalar_type() == at::kBFloat16 ||
+       q_.scalar_type() == at::kFloat);
+  if (supports_nax) {
+    return sdpa_cooperative_nax_mps(
+        q_, k_, v_, mask_, dropout_p, is_causal, dropout_mask, scale, query, unsqueezed);
+  }
 
   // if none of the fast paths apply, fall back to the generic mps graph solution
   if (!supports_fast_sdpa) {
