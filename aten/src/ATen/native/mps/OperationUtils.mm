@@ -1068,7 +1068,8 @@ void MetalShaderLibrary::exec_binary_kernel(TensorIteratorBase& iter,
   convert_double_scalar(other);
 
   MPSStream* mpsStream = getCurrentMPSStream();
-  const auto cast_needed = input.scalar_type() != other.scalar_type();
+  const auto cast_needed =
+      input.scalar_type() != other.scalar_type() || input.scalar_type() != out.scalar_type();
   const auto suffix = iter.is_contiguous() ? "dense" : "strided";
   bool use_broadcast_kernel = false;
   bool use_scalar_kernel = false;
@@ -1101,7 +1102,8 @@ void MetalShaderLibrary::exec_binary_kernel(TensorIteratorBase& iter,
     }
   }
 
-  const auto alpha_type = scalar_arg_type.has_value() ? scalar_arg_type.value() : iter.common_dtype();
+  const auto alpha_type =
+      scalar_arg_type.has_value() ? scalar_arg_type.value() : (cast_needed ? out.scalar_type() : iter.common_dtype());
   const auto alpha_suffix = alpha.has_value() ? fmt::format("_{}", scalarToMetalTypeString(alpha_type)) : "";
 
   std::string kernel_name;
