@@ -54,6 +54,25 @@ kernel void unary_dense(
 }
 
 template <typename T, typename F>
+kernel void unary_dense_vec4(
+    device result_of<F, T>* output [[buffer(0)]],
+    constant T* input [[buffer(1)]],
+    constant uint& numel [[buffer(2)]],
+    uint index [[thread_position_in_grid]]) {
+  F f;
+  uint base = index * 4;
+  if (base + 4 <= numel) {
+    output[base] = f(input[base]);
+    output[base + 1] = f(input[base + 1]);
+    output[base + 2] = f(input[base + 2]);
+    output[base + 3] = f(input[base + 3]);
+  } else {
+    for (uint i = base; i < numel; i++)
+      output[i] = f(input[i]);
+  }
+}
+
+template <typename T, typename F>
 kernel void unary_strided(
     device result_of<F, T>* output [[buffer(0)]],
     constant T* input [[buffer(1)]],
@@ -75,19 +94,25 @@ kernel void unary_strided(
       ::metal::                                                                \
           is_same_v<DTYPE1, ::c10::metal::result_of<NAME##_functor, DTYPE0>>,  \
       "Output dtype mismatch for unary op " #NAME " and input " #DTYPE0);      \
-  template [[host_name(#NAME "_dense_" #DTYPE1 "_" #DTYPE0)]] kernel void ::   \
-      c10::metal::unary_dense<DTYPE0, NAME##_functor>(                         \
-          device ::c10::metal::result_of<NAME##_functor, DTYPE0> * output,     \
-          constant DTYPE0 * input,                                             \
-          uint index);                                                         \
-  template [[host_name(#NAME "_strided_" #DTYPE1 "_" #DTYPE0)]] kernel void :: \
-      c10::metal::unary_strided<DTYPE0, NAME##_functor>(                       \
-          device ::c10::metal::result_of<NAME##_functor, DTYPE0> * output,     \
-          constant DTYPE0 * input,                                             \
-          constant long* sizes,                                                \
-          constant long* input_strides,                                        \
-          constant long* output_strides,                                       \
-          constant uint& ndim,                                                 \
+  template [[host_name(#NAME "_dense_" #DTYPE1 "_" #DTYPE0)]] kernel void ::       \
+      c10::metal::unary_dense<DTYPE0, NAME##_functor>(                             \
+          device ::c10::metal::result_of<NAME##_functor, DTYPE0> * output,         \
+          constant DTYPE0 * input,                                                 \
+          uint index);                                                             \
+  template [[host_name(#NAME "_dense_vec4_" #DTYPE1 "_" #DTYPE0)]] kernel void ::  \
+      c10::metal::unary_dense_vec4<DTYPE0, NAME##_functor>(                        \
+          device ::c10::metal::result_of<NAME##_functor, DTYPE0> * output,         \
+          constant DTYPE0 * input,                                                 \
+          constant uint & numel,                                                   \
+          uint index);                                                             \
+  template [[host_name(#NAME "_strided_" #DTYPE1 "_" #DTYPE0)]] kernel void ::     \
+      c10::metal::unary_strided<DTYPE0, NAME##_functor>(                           \
+          device ::c10::metal::result_of<NAME##_functor, DTYPE0> * output,         \
+          constant DTYPE0 * input,                                                 \
+          constant long* sizes,                                                    \
+          constant long* input_strides,                                            \
+          constant long* output_strides,                                           \
+          constant uint& ndim,                                                     \
           uint index)
 
 #define DEFINE_UNARY_FLOATING_FUNCTOR(NAME)                                     \
@@ -336,6 +361,27 @@ kernel void binary_dense(
   out[tid] = static_cast<res_t>(f(om_t(input[tid]), om_t(other[tid])));
 }
 
+template <typename T, typename F, typename om_t = opmath_t<T>>
+kernel void binary_dense_vec4(
+    device result_of<F, T, T>* out [[buffer(0)]],
+    constant T* input [[buffer(1)]],
+    constant T* other [[buffer(2)]],
+    constant uint& numel [[buffer(3)]],
+    uint index [[thread_position_in_grid]]) {
+  F f;
+  using res_t = result_of<F, T, T>;
+  uint base = index * 4;
+  if (base + 4 <= numel) {
+    out[base] = static_cast<res_t>(f(om_t(input[base]), om_t(other[base])));
+    out[base + 1] = static_cast<res_t>(f(om_t(input[base + 1]), om_t(other[base + 1])));
+    out[base + 2] = static_cast<res_t>(f(om_t(input[base + 2]), om_t(other[base + 2])));
+    out[base + 3] = static_cast<res_t>(f(om_t(input[base + 3]), om_t(other[base + 3])));
+  } else {
+    for (uint i = base; i < numel; i++)
+      out[i] = static_cast<res_t>(f(om_t(input[i]), om_t(other[i])));
+  }
+}
+
 template <typename T, typename T2, typename F>
 kernel void binary_alpha_dense(
     device result_of<F, T, T, T2>* out [[buffer(0)]],
@@ -345,6 +391,27 @@ kernel void binary_alpha_dense(
     uint tid [[thread_position_in_grid]]) {
   F f;
   out[tid] = f(input[tid], other[tid], alpha);
+}
+
+template <typename T, typename T2, typename F>
+kernel void binary_alpha_dense_vec4(
+    device result_of<F, T, T, T2>* out [[buffer(0)]],
+    constant T* input [[buffer(1)]],
+    constant T* other [[buffer(2)]],
+    constant T2& alpha [[buffer(3)]],
+    constant uint& numel [[buffer(4)]],
+    uint index [[thread_position_in_grid]]) {
+  F f;
+  uint base = index * 4;
+  if (base + 4 <= numel) {
+    out[base] = f(input[base], other[base], alpha);
+    out[base + 1] = f(input[base + 1], other[base + 1], alpha);
+    out[base + 2] = f(input[base + 2], other[base + 2], alpha);
+    out[base + 3] = f(input[base + 3], other[base + 3], alpha);
+  } else {
+    for (uint i = base; i < numel; i++)
+      out[i] = f(input[i], other[i], alpha);
+  }
 }
 
 template <typename T, typename F, typename om_t = T>
@@ -648,6 +715,14 @@ kernel void binary_alpha_dense_scalar_lhs_cast(
           constant DTYPEI * input_,                                            \
           constant DTYPEI * other_,                                            \
           uint tid);                                                           \
+  template [[host_name(#NAME "_dense_vec4_" #DTYPEO "_" #DTYPEI)]]             \
+  kernel void ::c10::metal::binary_dense_vec4<DTYPEI, NAME##_functor, OMT>(    \
+          device ::c10::metal::result_of<NAME##_functor, DTYPEI, DTYPEI> *     \
+              out_,                                                            \
+          constant DTYPEI * input_,                                            \
+          constant DTYPEI * other_,                                            \
+          constant uint & numel,                                               \
+          uint index);                                                         \
   template [[host_name(#NAME "_dense_cast_" #DTYPEI)]] kernel void ::c10::     \
       metal::binary_dense_cast<DTYPEI, NAME##_functor, OMT>(                   \
           device ::c10::metal::result_of<NAME##_functor, DTYPEI, DTYPEI> *     \
@@ -776,6 +851,17 @@ kernel void binary_alpha_dense_scalar_lhs_cast(
           constant DTYPEI * other_,                                            \
           constant DTYPEA & alpha,                                             \
           uint tid);                                                           \
+  template [[host_name(#NAME "_dense_vec4_" #DTYPEO "_" #DTYPEI                \
+                             "_" #DTYPEA)]] kernel void ::c10::metal::         \
+      binary_alpha_dense_vec4<DTYPEI, DTYPEA, NAME##_functor>(                 \
+          device ::c10::metal::                                                \
+                  result_of<NAME##_functor, DTYPEI, DTYPEI, DTYPEA> *          \
+              out_,                                                            \
+          constant DTYPEI * input_,                                            \
+          constant DTYPEI * other_,                                            \
+          constant DTYPEA & alpha,                                             \
+          constant uint & numel,                                               \
+          uint index);                                                         \
   template                                                                     \
       [[host_name(#NAME "_dense_cast_" #DTYPEI "_" #DTYPEA)]] kernel void ::   \
           c10::metal::binary_alpha_dense_cast<DTYPEI, DTYPEA, NAME##_functor>( \

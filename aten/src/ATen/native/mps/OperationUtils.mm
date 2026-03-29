@@ -993,9 +993,12 @@ void MetalShaderLibrary::exec_unary_kernel(TensorIteratorBase& iter,
   }
   using namespace mps;
   const auto alpha_type = scalar_arg_type.has_value() ? scalar_arg_type.value() : iter.common_dtype();
+  bool useVec4 = iter.is_contiguous() && !alpha.has_value() &&
+                 inputTensor.element_size() <= 2 && outputTensor.element_size() <= 2;
+  auto mode = useVec4 ? "dense_vec4" : (iter.is_contiguous() ? "dense" : "strided");
   auto kernel_name = fmt::format("{}_{}_{}_{}{}",
                                  name,
-                                 iter.is_contiguous() ? "dense" : "strided",
+                                 mode,
                                  scalarToMetalTypeString(outputTensor),
                                  scalarToMetalTypeString(inputTensor),
                                  alpha.has_value() ? fmt::format("_{}", scalarToMetalTypeString(alpha_type)) : "");
@@ -1010,17 +1013,22 @@ void MetalShaderLibrary::exec_unary_kernel(TensorIteratorBase& iter,
 
       [computeEncoder setComputePipelineState:cplState];
       bind_iter_tensors(computeEncoder, iter);
-      if (!iter.is_contiguous()) {
-        mtl_setArgs<2>(computeEncoder,
-                       outputTensor.sizes(),
-                       inputTensor.strides(),
-                       outputTensor.strides(),
-                       inputTensor.ndimension());
+      if (useVec4) {
+        [computeEncoder setBytes:&length length:sizeof(length) atIndex:2];
+        mtl_dispatch1DJob(computeEncoder, cplState, static_cast<NSUInteger>((length + 3) / 4));
+      } else {
+        if (!iter.is_contiguous()) {
+          mtl_setArgs<2>(computeEncoder,
+                         outputTensor.sizes(),
+                         inputTensor.strides(),
+                         outputTensor.strides(),
+                         inputTensor.ndimension());
+        }
+        if (alpha) {
+          mtl_setBytes(computeEncoder, getMPSScalar(*alpha, alpha_type), iter.is_contiguous() ? 2 : 6);
+        }
+        mtl_dispatch1DJob(computeEncoder, cplState, length);
       }
-      if (alpha) {
-        mtl_setBytes(computeEncoder, getMPSScalar(*alpha, alpha_type), iter.is_contiguous() ? 2 : 6);
-      }
-      mtl_dispatch1DJob(computeEncoder, cplState, length);
 
       getMPSProfiler().endProfileKernel(cplState);
     });

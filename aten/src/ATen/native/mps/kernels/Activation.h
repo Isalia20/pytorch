@@ -1,6 +1,18 @@
 #pragma once
 
 template <typename T>
+struct ThresholdParams {
+  T threshold;
+  T value;
+};
+
+template <typename T>
+struct SoftplusParams {
+  T beta;
+  T threshold;
+};
+
+template <typename T>
 struct ELUParams {
   T alpha;
   T scale;
