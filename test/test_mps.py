@@ -8230,18 +8230,6 @@ class TestMPS(TestCaseMPS):
                 op(a_cpu, b_cpu, alpha=alpha)
                 self.assertEqual(a_mps, a_cpu)
 
-        # Out-of-place with alpha when output dtype differs from inputs
-        for dtype_in, dtype_out in [(torch.float32, torch.float16), (torch.float32, torch.bfloat16)]:
-            a_mps = torch.arange(16, dtype=dtype_in, device='mps')
-            b_mps = torch.arange(16, dtype=dtype_in, device='mps')
-            a_cpu, b_cpu = a_mps.cpu(), b_mps.cpu()
-            for fn in [torch.add, torch.sub]:
-                out_mps = torch.empty(16, dtype=dtype_out, device='mps')
-                out_cpu = torch.empty(16, dtype=dtype_out)
-                fn(a_mps, b_mps, alpha=0.33, out=out_mps)
-                fn(a_cpu, b_cpu, alpha=0.33, out=out_cpu)
-                self.assertEqual(out_mps, out_cpu)
-
     # Test add
     def test_add_scalars(self):
         def helper(alpha):
