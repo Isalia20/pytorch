@@ -44,6 +44,51 @@ REGISTER_BINARY_ALPHA_OP(shrink_backward, float, float, float);
 REGISTER_BINARY_ALPHA_OP(shrink_backward, half, half, half);
 REGISTER_BINARY_ALPHA_OP(shrink_backward, bfloat, bfloat, bfloat);
 
+struct relu_functor {
+  template <typename T>
+  inline T operator()(const T x) {
+    return x > T(0) ? x : T(0);
+  }
+};
+
+REGISTER_UNARY_OP(relu, float, float);
+REGISTER_UNARY_OP(relu, half, half);
+REGISTER_UNARY_OP(relu, bfloat, bfloat);
+
+template <typename T>
+kernel void relu_vec4(
+    device T* output [[buffer(0)]],
+    constant T* input [[buffer(1)]],
+    constant uint& numel [[buffer(2)]],
+    uint index [[thread_position_in_grid]]) {
+  uint base = index * 4;
+  if (base + 4 <= numel) {
+    vec<T, 4> val = *(constant vec<T, 4>*)(input + base);
+    T zero = T(0);
+    *(device vec<T, 4>*)(output + base) = {
+        val.x > zero ? val.x : zero,
+        val.y > zero ? val.y : zero,
+        val.z > zero ? val.z : zero,
+        val.w > zero ? val.w : zero};
+  } else {
+    for (uint i = base; i < numel; i++) {
+      T x = input[i];
+      output[i] = x > T(0) ? x : T(0);
+    }
+  }
+}
+
+#define REGISTER_RELU_VEC4(DTYPE)                                           \
+  template [[host_name("relu_vec4_" #DTYPE)]] kernel void relu_vec4<DTYPE>( \
+      device DTYPE * output [[buffer(0)]],                                  \
+      constant DTYPE * input [[buffer(1)]],                                 \
+      constant uint & numel [[buffer(2)]],                                  \
+      uint index [[thread_position_in_grid]]);
+
+REGISTER_RELU_VEC4(float);
+REGISTER_RELU_VEC4(half);
+REGISTER_RELU_VEC4(bfloat);
+
 struct hardsigmoid_functor {
   template <typename T>
   inline T operator()(const T x) {

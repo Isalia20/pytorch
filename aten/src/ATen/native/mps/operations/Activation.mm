@@ -1,5 +1,7 @@
 //  Copyright © 2022 Apple Inc.
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
+#include <ATen/TensorIterator.h>
+#include <ATen/mps/MPSProfiler.h>
 #include <ATen/native/Activation.h>
 #include <ATen/native/mps/OperationUtils.h>
 
@@ -35,84 +37,53 @@ using namespace at::mps;
 
 namespace at::native {
 
+#ifndef PYTORCH_JIT_COMPILE_SHADERS
+static auto& lib = mps::MetalShaderLibrary::getBundledLibrary();
+#else
+#include <ATen/native/mps/ActivationKernel_metallib.h>
+#endif
+
+static void relu_mps_contiguous(const Tensor& output, const Tensor& input) {
+  auto key = "relu_vec4_" + mps::scalarToMetalTypeString(input);
+  auto pso = lib.getPipelineStateForFunc(key);
+  auto mpsStream = getCurrentMPSStream();
+  auto numel = static_cast<uint32_t>(input.numel());
+
+  dispatch_sync(mpsStream->queue(), ^() {
+    @autoreleasepool {
+      auto computeEncoder = mpsStream->commandEncoder();
+      [computeEncoder setComputePipelineState:pso];
+      mps::mtl_setBuffer(computeEncoder, output, 0);
+      mps::mtl_setBuffer(computeEncoder, input, 1);
+      [computeEncoder setBytes:&numel length:sizeof(numel) atIndex:2];
+      mps::mtl_dispatch1DJob(computeEncoder, pso, (numel + 3) / 4);
+    }
+  });
+}
+
 Tensor relu_mps(const Tensor& self) {
-  using namespace mps;
-  using CachedGraph = MPSUnaryCachedGraph;
-
-  bool executeGatherOp =
-      !(self.is_contiguous(MemoryFormat::Contiguous) || self.is_contiguous(MemoryFormat::ChannelsLast) ||
-        self.is_contiguous(MemoryFormat::ChannelsLast3d));
-  Tensor output = at::empty_like(self, executeGatherOp ? MemoryFormat::Contiguous : MemoryFormat::Preserve);
-
-  if (output.numel() == 0) {
+  auto output = at::empty_like(self);
+  if (output.numel() == 0)
+    return output;
+  if (self.is_non_overlapping_and_dense()) {
+    relu_mps_contiguous(output, self);
     return output;
   }
-
-  MPSStream* stream = getCurrentMPSStream();
-  @autoreleasepool {
-    std::string key = "relu" + getTensorsStringKey({self});
-    auto cachedGraph = LookUpOrCreateCachedGraph<CachedGraph>(key, [&](auto mpsGraph, auto newCachedGraph) {
-      MPSGraphTensor* inputTensor = mpsGraphRankedPlaceHolder(mpsGraph, self);
-      // passing selector of reLUWithTensor on the mpsGraph object
-      MPSGraphTensor* outputTensor = [mpsGraph reLUWithTensor:inputTensor name:nil];
-
-      newCachedGraph->inputTensor_ = inputTensor;
-      newCachedGraph->outputTensor_ = outputTensor;
-    });
-
-    Placeholder selfPlaceholder = Placeholder(cachedGraph->inputTensor_, self, nil, executeGatherOp);
-    Placeholder outputPlaceholder = Placeholder(cachedGraph->outputTensor_, output, nil, false);
-
-    // Create dictionary of inputs and outputs
-    auto feeds = dictionaryFromPlaceholders(selfPlaceholder);
-    runMPSGraph(stream, cachedGraph->graph(), feeds, outputPlaceholder);
-  }
-
+  auto iter = at::TensorIteratorConfig().add_output(output).add_input(self).build();
+  lib.exec_unary_kernel(iter, "relu");
   return output;
 }
 
 Tensor& relu_mps_(Tensor& self) {
-  using namespace mps;
-  using CachedGraph = MPSUnaryCachedGraph;
-
-  if (self.numel() == 0) {
+  if (self.numel() == 0)
+    return self;
+  if (self.is_non_overlapping_and_dense()) {
+    relu_mps_contiguous(self, self);
     return self;
   }
-  // Inplace relu
-  Tensor& output = self;
-  bool executeGatherOp =
-      !(self.is_contiguous(MemoryFormat::Contiguous) || self.is_contiguous(MemoryFormat::ChannelsLast) ||
-        self.is_contiguous(MemoryFormat::ChannelsLast3d));
-  Tensor out;
-  if (executeGatherOp) {
-    out = at::empty_like(self, MemoryFormat::Contiguous);
-  }
-
-  MPSStream* stream = getCurrentMPSStream();
-
-  @autoreleasepool {
-    std::string key = "relu_" + getTensorsStringKey({self});
-    auto cachedGraph = LookUpOrCreateCachedGraph<CachedGraph>(key, [&](auto mpsGraph, auto newCachedGraph) {
-      MPSGraphTensor* inputTensor = mpsGraphRankedPlaceHolder(mpsGraph, self);
-      // passing selector of reLUWithTensor on the mpsGraph object
-      MPSGraphTensor* outputTensor = [mpsGraph reLUWithTensor:inputTensor name:nil];
-
-      newCachedGraph->inputTensor_ = inputTensor;
-      newCachedGraph->outputTensor_ = outputTensor;
-    });
-
-    Placeholder selfPlaceholder = Placeholder(cachedGraph->inputTensor_, self, nil, executeGatherOp);
-    Placeholder outputPlaceholder = Placeholder(cachedGraph->outputTensor_, executeGatherOp ? out : output, nil, false);
-
-    // Create dictionary of inputs and outputs
-    auto feeds = dictionaryFromPlaceholders(selfPlaceholder);
-    runMPSGraph(stream, cachedGraph->graph(), feeds, outputPlaceholder);
-    if (executeGatherOp) {
-      output.copy_(out);
-    }
-  }
-
-  return output;
+  auto iter = at::TensorIteratorConfig().add_output(self).add_input(self).set_check_mem_overlap(false).build();
+  lib.exec_unary_kernel(iter, "relu");
+  return self;
 }
 
 TORCH_IMPL_FUNC(log_softmax_mps_out)
