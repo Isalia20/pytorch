@@ -4,6 +4,12 @@
 #include <ATen/mps/MPSProfiler.h>
 #include <ATen/native/Activation.h>
 #include <ATen/native/mps/OperationUtils.h>
+
+#ifndef AT_PER_OPERATOR_HEADERS
+#include <ATen/NativeFunctions.h>
+#else
+#include <ATen/ops/relu_native.h>
+#endif
 #include <ATen/native/mps/kernels/Activation.h>
 #include <fmt/format.h>
 
@@ -14,6 +20,49 @@ static auto& lib = mps::MetalShaderLibrary::getBundledLibrary();
 #else
 #include <ATen/native/mps/ActivationKernel_metallib.h>
 #endif
+
+static void relu_mps_contiguous(const Tensor& output, const Tensor& input) {
+  auto key = "relu_vec4_" + mps::scalarToMetalTypeString(input);
+  auto pso = lib.getPipelineStateForFunc(key);
+  auto mpsStream = at::mps::getCurrentMPSStream();
+  auto numel = static_cast<uint32_t>(input.numel());
+
+  dispatch_sync(mpsStream->queue(), ^() {
+    @autoreleasepool {
+      auto computeEncoder = mpsStream->commandEncoder();
+      [computeEncoder setComputePipelineState:pso];
+      mps::mtl_setBuffer(computeEncoder, output, 0);
+      mps::mtl_setBuffer(computeEncoder, input, 1);
+      [computeEncoder setBytes:&numel length:sizeof(numel) atIndex:2];
+      mps::mtl_dispatch1DJob(computeEncoder, pso, (numel + 3) / 4);
+    }
+  });
+}
+
+Tensor relu_mps(const Tensor& self) {
+  auto output = at::empty_like(self);
+  if (output.numel() == 0)
+    return output;
+  if (self.is_non_overlapping_and_dense()) {
+    relu_mps_contiguous(output, self);
+    return output;
+  }
+  auto iter = at::TensorIteratorConfig().add_output(output).add_input(self).build();
+  lib.exec_unary_kernel(iter, "relu");
+  return output;
+}
+
+Tensor& relu_mps_(Tensor& self) {
+  if (self.numel() == 0)
+    return self;
+  if (self.is_non_overlapping_and_dense()) {
+    relu_mps_contiguous(self, self);
+    return self;
+  }
+  auto iter = at::TensorIteratorConfig().add_output(self).add_input(self).set_check_mem_overlap(false).build();
+  lib.exec_unary_kernel(iter, "relu");
+  return self;
+}
 
 static void hardshrink_kernel(TensorIteratorBase& iter, const Scalar& lambda = 0.5) {
   lib.exec_unary_kernel(iter, "hardshrink", lambda);
