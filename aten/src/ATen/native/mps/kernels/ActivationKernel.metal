@@ -70,7 +70,7 @@ kernel void relu_vec4(
   uint base = index * 4;
   if (base + 4 <= numel) {
     vec<T, 4> val = *(constant vec<T, 4>*)(input + base);
-    T zero = T(0);
+    constexpr T zero = T(0);
     *(device vec<T, 4>*)(output + base) = {
         val.x > zero ? val.x : zero,
         val.y > zero ? val.y : zero,

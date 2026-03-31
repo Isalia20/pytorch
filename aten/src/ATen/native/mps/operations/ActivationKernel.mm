@@ -22,7 +22,7 @@ static auto& lib = mps::MetalShaderLibrary::getBundledLibrary();
 #endif
 
 static void relu_mps_contiguous(const Tensor& output, const Tensor& input) {
-  auto key = "relu_vec4_" + mps::scalarToMetalTypeString(input);
+  auto key = fmt::format("relu_vec4_{}", mps::scalarToMetalTypeString(input));
   auto pso = lib.getPipelineStateForFunc(key);
   auto mpsStream = at::mps::getCurrentMPSStream();
   auto numel = static_cast<uint32_t>(input.numel());
