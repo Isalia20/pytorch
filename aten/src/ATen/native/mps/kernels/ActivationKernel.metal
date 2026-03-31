@@ -54,6 +54,11 @@ struct relu_functor {
 REGISTER_UNARY_OP(relu, float, float);
 REGISTER_UNARY_OP(relu, half, half);
 REGISTER_UNARY_OP(relu, bfloat, bfloat);
+REGISTER_UNARY_OP(relu, long, long);
+REGISTER_UNARY_OP(relu, int, int);
+REGISTER_UNARY_OP(relu, short, short);
+REGISTER_UNARY_OP(relu, char, char);
+REGISTER_UNARY_OP(relu, uchar, uchar);
 
 template <typename T>
 kernel void relu_vec4(
