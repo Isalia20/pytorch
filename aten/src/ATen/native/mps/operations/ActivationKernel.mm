@@ -45,7 +45,6 @@ static bool relu_use_vec4(const Tensor& t) {
 
 Tensor relu_mps(const Tensor& self) {
   TORCH_CHECK(!self.is_complex(), "relu is not supported for complex types");
-  TORCH_CHECK(self.scalar_type() != kBool, "relu is not supported for bool");
   auto output = at::empty_like(self);
   if (output.numel() == 0)
     return output;
@@ -60,7 +59,6 @@ Tensor relu_mps(const Tensor& self) {
 
 Tensor& relu_mps_(Tensor& self) {
   TORCH_CHECK(!self.is_complex(), "relu is not supported for complex types");
-  TORCH_CHECK(self.scalar_type() != kBool, "relu is not supported for bool");
   if (self.numel() == 0)
     return self;
   if (relu_use_vec4(self)) {

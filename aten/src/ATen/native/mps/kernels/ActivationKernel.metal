@@ -59,6 +59,7 @@ REGISTER_UNARY_OP(relu, int, int);
 REGISTER_UNARY_OP(relu, short, short);
 REGISTER_UNARY_OP(relu, char, char);
 REGISTER_UNARY_OP(relu, uchar, uchar);
+REGISTER_UNARY_OP(relu, bool, bool);
 
 template <typename T>
 kernel void relu_vec4(
