@@ -22,8 +22,6 @@
 #include <ATen/ops/mish_native.h>
 #include <ATen/ops/relu_native.h>
 #include <ATen/ops/sigmoid_backward_native.h>
-#include <ATen/ops/silu_backward_native.h>
-#include <ATen/ops/silu_native.h>
 #include <ATen/ops/softplus_backward_native.h>
 #include <ATen/ops/softplus_native.h>
 #include <ATen/ops/tanh_backward_native.h>

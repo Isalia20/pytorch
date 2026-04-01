@@ -9,8 +9,6 @@
 #include <ATen/NativeFunctions.h>
 #else
 #include <ATen/ops/relu_native.h>
-#include <ATen/ops/silu_backward_native.h>
-#include <ATen/ops/silu_native.h>
 #endif
 #include <ATen/native/mps/kernels/Activation.h>
 #include <fmt/format.h>
@@ -94,18 +92,12 @@ static void elu_backward_kernel(TensorIteratorBase& iter,
   });
 }
 
-TORCH_IMPL_FUNC(silu_out_mps)(const Tensor& self, const Tensor& result) {
-  if (this->numel() == 0)
-    return;
-  lib.exec_unary_kernel(
-      *this, "silu", /*alpha=*/std::nullopt, /*scalar_arg_type=*/std::nullopt, /*supports_vec4=*/true);
+static void silu_kernel(TensorIteratorBase& iter) {
+  lib.exec_unary_kernel(iter, "silu", /*alpha=*/std::nullopt, /*scalar_arg_type=*/std::nullopt, /*supports_vec4=*/true);
 }
 
-TORCH_IMPL_FUNC(silu_backward_out_mps)
-(const Tensor& grad_output, const Tensor& self, const Tensor& grad_input) {
-  if (this->numel() == 0)
-    return;
-  lib.exec_binary_kernel(*this, "silu_backward");
+static void silu_backward_kernel(TensorIteratorBase& iter) {
+  lib.exec_binary_kernel(iter, "silu_backward");
 }
 
 static void leaky_relu_kernel(TensorIteratorBase& iter, const Scalar& negative_slope) {
@@ -127,5 +119,7 @@ REGISTER_DISPATCH(elu_stub, elu_kernel);
 REGISTER_DISPATCH(elu_backward_stub, elu_backward_kernel);
 REGISTER_DISPATCH(leaky_relu_stub, leaky_relu_kernel);
 REGISTER_DISPATCH(leaky_relu_backward_stub, leaky_relu_backward_kernel);
+REGISTER_DISPATCH(silu_stub, silu_kernel);
+REGISTER_DISPATCH(silu_backward_stub, silu_backward_kernel);
 
 } // namespace at::native
