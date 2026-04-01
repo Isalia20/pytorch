@@ -993,8 +993,8 @@ void MetalShaderLibrary::exec_unary_kernel(TensorIteratorBase& iter,
     return;
   }
   using namespace mps;
-  bool use_vec4 = supports_vec4 && iter.is_contiguous() && !alpha.has_value()
-      && at::isFloatingType(iter.common_dtype());
+  bool use_vec4 =
+      supports_vec4 && iter.is_contiguous() && !alpha.has_value() && at::isFloatingType(iter.common_dtype());
   const auto alpha_type = scalar_arg_type.has_value() ? scalar_arg_type.value() : iter.common_dtype();
   auto kernel_name = fmt::format("{}_{}_{}_{}{}",
                                  name,
