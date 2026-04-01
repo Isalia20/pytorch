@@ -9,6 +9,8 @@
 #include <ATen/NativeFunctions.h>
 #else
 #include <ATen/ops/relu_native.h>
+#include <ATen/ops/silu_backward_native.h>
+#include <ATen/ops/silu_native.h>
 #endif
 #include <ATen/native/mps/kernels/Activation.h>
 #include <fmt/format.h>
@@ -90,6 +92,20 @@ static void elu_backward_kernel(TensorIteratorBase& iter,
         params,
         fmt::format("ELUBackwardParams_{}", mps::scalarToMetalTypeString(iter.common_dtype())));
   });
+}
+
+TORCH_IMPL_FUNC(silu_out_mps)(const Tensor& self, const Tensor& result) {
+  if (this->numel() == 0)
+    return;
+  lib.exec_unary_kernel(
+      *this, "silu", /*alpha=*/std::nullopt, /*scalar_arg_type=*/std::nullopt, /*supports_vec4=*/true);
+}
+
+TORCH_IMPL_FUNC(silu_backward_out_mps)
+(const Tensor& grad_output, const Tensor& self, const Tensor& grad_input) {
+  if (this->numel() == 0)
+    return;
+  lib.exec_binary_kernel(*this, "silu_backward");
 }
 
 static void leaky_relu_kernel(TensorIteratorBase& iter, const Scalar& negative_slope) {
