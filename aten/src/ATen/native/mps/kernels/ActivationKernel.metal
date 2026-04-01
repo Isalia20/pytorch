@@ -61,39 +61,9 @@ REGISTER_UNARY_OP(relu, char, char);
 REGISTER_UNARY_OP(relu, uchar, uchar);
 REGISTER_UNARY_OP(relu, bool, bool);
 
-template <typename T>
-kernel void relu_vec4(
-    device T* output [[buffer(0)]],
-    constant T* input [[buffer(1)]],
-    constant uint& numel [[buffer(2)]],
-    uint index [[thread_position_in_grid]]) {
-  uint base = index * 4;
-  if (base + 4 <= numel) {
-    vec<T, 4> val = *(constant vec<T, 4>*)(input + base);
-    constexpr T zero = T(0);
-    *(device vec<T, 4>*)(output + base) = {
-        val.x > zero ? val.x : zero,
-        val.y > zero ? val.y : zero,
-        val.z > zero ? val.z : zero,
-        val.w > zero ? val.w : zero};
-  } else {
-    for (uint i = base; i < numel; i++) {
-      T x = input[i];
-      output[i] = x > T(0) ? x : T(0);
-    }
-  }
-}
-
-#define REGISTER_RELU_VEC4(DTYPE)                                           \
-  template [[host_name("relu_vec4_" #DTYPE)]] kernel void relu_vec4<DTYPE>( \
-      device DTYPE * output [[buffer(0)]],                                  \
-      constant DTYPE * input [[buffer(1)]],                                 \
-      constant uint & numel [[buffer(2)]],                                  \
-      uint index [[thread_position_in_grid]]);
-
-REGISTER_RELU_VEC4(float);
-REGISTER_RELU_VEC4(half);
-REGISTER_RELU_VEC4(bfloat);
+REGISTER_UNARY_VEC4_OP(relu, float, float);
+REGISTER_UNARY_VEC4_OP(relu, half, half);
+REGISTER_UNARY_VEC4_OP(relu, bfloat, bfloat);
 
 struct hardsigmoid_functor {
   template <typename T>

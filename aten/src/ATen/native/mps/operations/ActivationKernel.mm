@@ -21,39 +21,13 @@ static auto& lib = mps::MetalShaderLibrary::getBundledLibrary();
 #include <ATen/native/mps/ActivationKernel_metallib.h>
 #endif
 
-static void relu_mps_contiguous(const Tensor& output, const Tensor& input) {
-  auto key = fmt::format("relu_vec4_{}", mps::scalarToMetalTypeString(input));
-  auto pso = lib.getPipelineStateForFunc(key);
-  auto mpsStream = at::mps::getCurrentMPSStream();
-  auto numel = static_cast<uint32_t>(input.numel());
-
-  dispatch_sync(mpsStream->queue(), ^() {
-    @autoreleasepool {
-      auto computeEncoder = mpsStream->commandEncoder();
-      [computeEncoder setComputePipelineState:pso];
-      mps::mtl_setBuffer(computeEncoder, output, 0);
-      mps::mtl_setBuffer(computeEncoder, input, 1);
-      [computeEncoder setBytes:&numel length:sizeof(numel) atIndex:2];
-      mps::mtl_dispatch1DJob(computeEncoder, pso, (numel + 3) / 4);
-    }
-  });
-}
-
-static bool relu_use_vec4(const Tensor& t) {
-  return at::isFloatingType(t.scalar_type()) && t.is_non_overlapping_and_dense();
-}
-
 Tensor relu_mps(const Tensor& self) {
   TORCH_CHECK(!self.is_complex(), "relu is not supported for complex types");
   auto output = at::empty_like(self);
   if (output.numel() == 0)
     return output;
-  if (relu_use_vec4(self)) {
-    relu_mps_contiguous(output, self);
-    return output;
-  }
   auto iter = at::TensorIteratorConfig().add_output(output).add_input(self).build();
-  lib.exec_unary_kernel(iter, "relu");
+  lib.exec_unary_kernel(iter, "relu", /*alpha=*/std::nullopt, /*scalar_arg_type=*/std::nullopt, /*supports_vec4=*/true);
   return output;
 }
 
@@ -61,12 +35,8 @@ Tensor& relu_mps_(Tensor& self) {
   TORCH_CHECK(!self.is_complex(), "relu is not supported for complex types");
   if (self.numel() == 0)
     return self;
-  if (relu_use_vec4(self)) {
-    relu_mps_contiguous(self, self);
-    return self;
-  }
   auto iter = at::TensorIteratorConfig().add_output(self).add_input(self).set_check_mem_overlap(false).build();
-  lib.exec_unary_kernel(iter, "relu");
+  lib.exec_unary_kernel(iter, "relu", /*alpha=*/std::nullopt, /*scalar_arg_type=*/std::nullopt, /*supports_vec4=*/true);
   return self;
 }
 
