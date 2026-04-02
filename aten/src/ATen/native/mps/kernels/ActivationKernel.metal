@@ -213,6 +213,11 @@ struct silu_functor {
 REGISTER_UNARY_OP(silu, float, float);
 REGISTER_UNARY_OP(silu, half, half);
 REGISTER_UNARY_OP(silu, bfloat, bfloat);
+REGISTER_UNARY_OP(silu, int, int);
+REGISTER_UNARY_OP(silu, short, short);
+REGISTER_UNARY_OP(silu, char, char);
+REGISTER_UNARY_OP(silu, uchar, uchar);
+REGISTER_UNARY_OP(silu, bool, bool);
 
 REGISTER_UNARY_VEC4_OP(silu, float, float);
 REGISTER_UNARY_VEC4_OP(silu, half, half);
