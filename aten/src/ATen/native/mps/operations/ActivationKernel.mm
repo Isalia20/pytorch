@@ -9,8 +9,8 @@
 #include <ATen/NativeFunctions.h>
 #else
 #include <ATen/ops/add.h>
-#include <ATen/ops/copy_native.h>
 #include <ATen/ops/mul.h>
+#include <ATen/ops/mul_native.h>
 #include <ATen/ops/relu_native.h>
 #include <ATen/ops/rsub.h>
 #include <ATen/ops/sigmoid.h>
@@ -102,8 +102,7 @@ static void silu_kernel(TensorIteratorBase& iter) {
   if (isComplexType(iter.common_dtype())) {
     auto out = iter.output(0);
     auto self = iter.input(0);
-    at::sigmoid_out(out, self);
-    out.mul_(self);
+    at::mul_out(out, self, at::sigmoid(self));
     return;
   }
   lib.exec_unary_kernel(iter, "silu", /*alpha=*/std::nullopt, /*scalar_arg_type=*/std::nullopt, /*supports_vec4=*/true);
