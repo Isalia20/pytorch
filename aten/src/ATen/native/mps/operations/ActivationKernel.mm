@@ -8,7 +8,13 @@
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/NativeFunctions.h>
 #else
+#include <ATen/ops/add.h>
+#include <ATen/ops/copy_native.h>
+#include <ATen/ops/mul.h>
 #include <ATen/ops/relu_native.h>
+#include <ATen/ops/rsub.h>
+#include <ATen/ops/sigmoid.h>
+#include <ATen/ops/sigmoid_native.h>
 #endif
 #include <ATen/native/mps/kernels/Activation.h>
 #include <fmt/format.h>
@@ -93,10 +99,27 @@ static void elu_backward_kernel(TensorIteratorBase& iter,
 }
 
 static void silu_kernel(TensorIteratorBase& iter) {
+  if (isComplexType(iter.common_dtype())) {
+    auto out = iter.output(0);
+    auto self = iter.input(0);
+    at::sigmoid_out(out, self);
+    out.mul_(self);
+    return;
+  }
   lib.exec_unary_kernel(iter, "silu", /*alpha=*/std::nullopt, /*scalar_arg_type=*/std::nullopt, /*supports_vec4=*/true);
 }
 
 static void silu_backward_kernel(TensorIteratorBase& iter) {
+  if (isComplexType(iter.common_dtype())) {
+    auto grad_input = iter.output(0);
+    auto grad_output = iter.input(0);
+    auto self = iter.input(1);
+    auto sig = at::sigmoid(self);
+    auto one_minus_sig = at::rsub(sig, 1);
+    auto inner = at::add(at::mul(self, one_minus_sig), 1);
+    grad_input.copy_(at::mul(grad_output, at::mul(sig, inner)));
+    return;
+  }
   lib.exec_binary_kernel(iter, "silu_backward");
 }
 
