@@ -71,13 +71,13 @@ def _compute_foreach_groups(
     Returns a flat list with -1 as group delimiter, or None if only one group exists.
     For example, groups [[0, 2], [1]] would be encoded as [0, 2, -1, 1].
     """
-    from torch.fx.experimental.symbolic_shapes import size_hint
+    from torch.fx.experimental.symbolic_shapes import guarding_hint_or_throw
 
     groups: defaultdict[tuple[torch.dtype, torch.dtype, tuple[int, ...]], list[int]] = (
         defaultdict(list)
     )
     for i, (ag_in, out_dtype) in enumerate(zip(ag_ins, out_dtypes)):
-        shape = tuple(size_hint(s) for s in ag_in.shape)
+        shape = tuple(guarding_hint_or_throw(s) for s in ag_in.shape)
         key = (ag_in.dtype, out_dtype, shape)
         groups[key].append(i)
 
@@ -283,6 +283,54 @@ def get_full_bucket_key(
 
 def is_wait_tensor_from_all_gather_into_tensor(node: torch.fx.Node) -> bool:
     return is_wait_tensor(node) and is_all_gather_into_tensor(node.args[0])  # type: ignore[arg-type]
+
+
+def is_fsdp_all_gather(
+    node: torch.fx.Node,
+    all_node_ancestors: dict[torch.fx.Node, OrderedSet[torch.fx.Node]],
+) -> bool:
+    """
+    Check if the node is a FSDP-related all_gather by its recursive ancestors.
+    On the path from the all-gather to its originate placeholder, there should not be any compute node
+    So there should be ONLY ONE placeholder in its recursive ancestors.
+    """
+    if not is_all_gather_into_tensor(node):
+        return False
+
+    seen_placeholders = 0
+    for ancestor in all_node_ancestors[node]:
+        if ancestor.op == "placeholder":
+            seen_placeholders += 1
+
+    return seen_placeholders == 1
+
+
+def is_fsdp_reduce_scatter(node: torch.fx.Node) -> bool:
+    """
+    Check if a reduce_scatter node is FSDP-related by verifying its output flows
+    directly to graph outputs through only unary ops (e.g., to_copy, wait).
+    """
+    if not is_reduce_scatter_tensor(node):
+        return False
+
+    visited: OrderedSet[torch.fx.Node] = OrderedSet()
+    stack = [node]
+
+    while stack:
+        curr = stack.pop()
+        if curr in visited:
+            continue
+        visited.add(curr)
+
+        for user in curr.users:
+            if user.op == "output":
+                continue
+            # Non-unary op means computation with external data
+            if len(user.all_input_nodes) != 1:
+                return False
+            stack.append(user)
+
+    return True
 
 
 def collect_node_descendants(
@@ -777,9 +825,11 @@ def all_gather_merge_fn_to_trace(
     device = ag_ins[0].device
     new_ag_out = torch.empty(ag_input_numel * group_size, dtype=dtype, device=device)
     new_ag_in = new_ag_out.narrow(0, ag_input_numel * rank, ag_input_numel)
-    foreach_copy_dsts = torch.split(new_ag_in, ins_split_sizes)
     ag_ins_flattened = [ag_in.reshape(-1) for ag_in in ag_ins]
-    torch._foreach_copy_(foreach_copy_dsts, ag_ins_flattened)
+    # Inductor fuses copy_(cat(...)) into 1 Triton kernel with no allocation for cat.
+    # _foreach_copy_(..., ag_ins_flattened) emits separate kernel per item,
+    # resulting in large number of small triton kernels to launch.
+    new_ag_in.copy_(torch.cat(ag_ins_flattened))
     wait_tensor = torch.ops.c10d_functional.wait_tensor(
         torch.ops._c10d_functional.all_gather_into_tensor_out.default(
             new_ag_in, group_size, group_name, out=new_ag_out
