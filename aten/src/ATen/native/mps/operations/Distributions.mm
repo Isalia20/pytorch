@@ -426,7 +426,8 @@ static Tensor& distribution_kernel_mps_impl(Tensor& self,
                                             double param2,
                                             const std::string& kernel_name,
                                             int64_t randoms_per_element,
-                                            std::optional<Generator> gen) {
+                                            std::optional<Generator> gen,
+                                            int64_t elements_per_thread = 1) {
   if (self.numel() == 0) {
     return self;
   }
@@ -459,7 +460,13 @@ static Tensor& distribution_kernel_mps_impl(Tensor& self,
                     output,
                     std::array<float, 2>{static_cast<float>(param1), static_cast<float>(param2)},
                     std::array<long, 2>{seed, base_offset});
-        mtl_dispatch1DJob(computeEncoder, pso, output.numel());
+        if (elements_per_thread > 1) {
+          auto numel = static_cast<uint32_t>(output.numel());
+          mtl_setBytes(computeEncoder, numel, 3);
+          mtl_dispatch1DJob(computeEncoder, pso, (numel + elements_per_thread - 1) / elements_per_thread);
+        } else {
+          mtl_dispatch1DJob(computeEncoder, pso, output.numel());
+        }
       }
     });
   }
@@ -473,7 +480,7 @@ static Tensor& distribution_kernel_mps_impl(Tensor& self,
 
 Tensor& exponential_mps_(Tensor& self, double lambda, std::optional<Generator> gen) {
   TORCH_CHECK(lambda > 0.0, "exponential_ expects lambda > 0.0, but found lambda=", lambda);
-  return distribution_kernel_mps_impl(self, lambda, 0.0, "exponential", 1, gen);
+  return distribution_kernel_mps_impl(self, lambda, 0.0, "exponential", 1, gen, /*elements_per_thread=*/4);
 }
 
 Tensor& cauchy_mps_(Tensor& self, double median, double sigma, std::optional<Generator> gen) {
