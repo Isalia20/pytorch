@@ -59,6 +59,21 @@ if(NOT CAN_COMPILE_METAL_FOUND)
         message(WARNING "Machine can not compile metal shaders, fails with ${XCRUN_OUTPUT}")
         set(CAN_COMPILE_METAL NO CACHE BOOL "Host can compile metal shaders")
     endif()
+    set(CAN_COMPILE_METAL_40 NO CACHE BOOL "Host can compile Metal 4.0 shaders")
+    if(CAN_COMPILE_METAL)
+        execute_process(COMMAND xcrun metal -std=metal4.0 bfloat_inc.metal
+                        WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+                        OUTPUT_VARIABLE XCRUN_OUTPUT
+                        ERROR_VARIABLE XCRUN_OUTPUT
+                        RESULT_VARIABLE XCRUN_RC)
+        if(${XCRUN_RC} EQUAL 0)
+            message(STATUS "Metal toolchain supports Metal 4.0")
+            set(CAN_COMPILE_METAL_40 YES CACHE BOOL "Host can compile Metal 4.0 shaders")
+        else()
+            message(STATUS "Metal toolchain does not support Metal 4.0")
+            set(CAN_COMPILE_METAL_40 NO CACHE BOOL "Host can compile Metal 4.0 shaders")
+        endif()
+    endif()
     set(CAN_COMPILE_METAL_FOUND YES CACHE INTERNAL "Run check for shader compiler")
 endif()
 

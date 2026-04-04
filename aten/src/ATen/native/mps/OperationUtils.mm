@@ -933,17 +933,29 @@ MetalKernelFunction* MetalShaderLibrary::getCachedKernelFunctionPtr(const std::s
   return raw_ptr;
 }
 
-class BundledShaderLibary : public MetalShaderLibrary {
+class BundledShaderLibrary : public MetalShaderLibrary {
  public:
-  BundledShaderLibary() : MetalShaderLibrary("") {}
+  BundledShaderLibrary() : MetalShaderLibrary("") {}
 
  protected:
   id<MTLLibrary> getLibrary() override {
     if (C10_UNLIKELY(!library)) {
       auto device = MPSDevice::getInstance()->device();
       NSError* error = nil;
-      library = [device newLibraryWithData:getSectionData("metal_basic") error:&error];
-      TORCH_CHECK(library, "Failed to create metal library, error: ", [[error description] UTF8String]);
+      // Prefer Metal 4.0 library on macOS 26+
+      if (is_macos_13_or_newer(MacOSVersion::MACOS_VER_26_0_PLUS)) {
+        auto data = getSectionData("metal_40");
+        if (data) {
+          library = [device newLibraryWithData:data error:&error];
+          TORCH_CHECK(library, "Failed to create Metal 4.0 library, error: ", [[error description] UTF8String]);
+        }
+      }
+      if (!library) {
+        auto data = getSectionData("metal_basic");
+        TORCH_CHECK(data, "Can't find metal library section metal_basic");
+        library = [device newLibraryWithData:data error:&error];
+        TORCH_CHECK(library, "Failed to create metal library, error: ", [[error description] UTF8String]);
+      }
     }
     return library;
   }
@@ -965,7 +977,7 @@ class BundledShaderLibary : public MetalShaderLibrary {
     unsigned long mtl_lib_size = 0;
     const auto* mtl_lib_data = getsectiondata(mach_header, "__TEXT", name.c_str(), &mtl_lib_size);
     if (mtl_lib_data == nullptr) {
-      throw std::runtime_error("Can't find metal library section " + name);
+      return nullptr;
     }
     return dispatch_data_create(mtl_lib_data,
                                 mtl_lib_size,
@@ -1325,7 +1337,7 @@ void MetalShaderLibrary::exec_ternary_kernel(TensorIteratorBase& iter, const std
 }
 
 MetalShaderLibrary& MetalShaderLibrary::getBundledLibrary() {
-  static BundledShaderLibary l;
+  static BundledShaderLibrary l;
   return l;
 }
 

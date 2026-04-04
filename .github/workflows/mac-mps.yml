@@ -20,9 +20,8 @@ jobs:
     with:
       sync-tag: macos-py3-arm64-build
       build-environment: macos-py3-arm64
-      runner-type: macos-m1-stable
+      runner-type: macos-m2-26
       build-generates-artifacts: true
-      # To match the one pre-installed in the m1 runners
       python-version: 3.12.7
       test-matrix: |
         { include: [
