@@ -45,6 +45,13 @@ set(BFLOAT_METAL_CODE "
     ptr[idx] += 1;
   }
 ")
+set(LAMBDA_METAL_CODE "
+  kernel void test(device float* ptr,
+                   uint idx [[thread_position_in_grid]]) {
+    auto fn = [](float x) { return x + 1.0; };
+    ptr[idx] = fn(ptr[idx]);
+  }
+")
 if(NOT CAN_COMPILE_METAL_FOUND)
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/bfloat_inc.metal" "${BFLOAT_METAL_CODE}")
     execute_process(COMMAND xcrun metal -std=metal3.1 bfloat_inc.metal
@@ -61,7 +68,8 @@ if(NOT CAN_COMPILE_METAL_FOUND)
     endif()
     set(CAN_COMPILE_METAL_40 NO CACHE BOOL "Host can compile Metal 4.0 shaders")
     if(CAN_COMPILE_METAL)
-        execute_process(COMMAND xcrun metal -std=metal4.0 bfloat_inc.metal
+        file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/lambda_test.metal" "${LAMBDA_METAL_CODE}")
+        execute_process(COMMAND xcrun metal -std=metal4.0 -c lambda_test.metal -o /dev/null
                         WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
                         OUTPUT_VARIABLE XCRUN_OUTPUT
                         ERROR_VARIABLE XCRUN_OUTPUT
