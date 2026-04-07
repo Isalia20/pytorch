@@ -133,12 +133,12 @@ RENAME_WHEEL=false
 VERIFY_WHEELNAME=true
 case $desired_python in
     3.14t)
-        echo "Using 3.14 deps"
-        NUMPY_PINNED_VERSION="==2.1.0"
+        echo "Using 3.14t deps"
+        NUMPY_PINNED_VERSION="==2.4.4"
         ;;
     3.14)
-        echo "Using 3.14t deps"
-        NUMPY_PINNED_VERSION="==2.1.0"
+        echo "Using 3.14 deps"
+        NUMPY_PINNED_VERSION="==2.4.4"
         ;;
     3.13t)
         echo "Using 3.13t deps"
