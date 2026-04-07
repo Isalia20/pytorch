@@ -42,7 +42,6 @@ COPY ./common/install_conda.sh install_conda.sh
 COPY ./common/common_utils.sh common_utils.sh
 COPY ./common/install_magma_conda.sh install_magma_conda.sh
 RUN bash ./install_conda.sh && rm install_conda.sh install_magma_conda.sh common_utils.sh /opt/conda/requirements-ci.txt /opt/conda/requirements-docs.txt
-RUN if [ -n "${UNINSTALL_DILL}" ]; then pip uninstall -y dill; fi
 
 # Install gcc
 ARG GCC_VERSION
@@ -69,12 +68,6 @@ ENV NCCL_LIB_DIR="/usr/local/cuda/lib64/"
 
 
 ARG CUDA_VERSION
-
-# (optional) Install non-default Ninja version
-ARG NINJA_VERSION
-COPY ./common/install_ninja.sh install_ninja.sh
-RUN if [ -n "${NINJA_VERSION}" ]; then bash ./install_ninja.sh; fi
-RUN rm install_ninja.sh
 
 COPY ./common/install_openssl.sh install_openssl.sh
 RUN bash ./install_openssl.sh

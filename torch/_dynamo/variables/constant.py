@@ -35,6 +35,15 @@ class ConstantVariable(VariableTracker):
     nested collections.
     """
 
+    # PyLong_Type: https://github.com/python/cpython/blob/v3.13.0/Objects/longobject.c#L6585
+    # PyFloat_Type: https://github.com/python/cpython/blob/v3.13.0/Objects/floatobject.c#L1880
+    # PyBool_Type: https://github.com/python/cpython/blob/v3.13.0/Objects/boolobject.c#L171
+    # PyUnicode_Type: https://github.com/python/cpython/blob/v3.13.0/Objects/unicodeobject.c#L14931
+    # PyBytes_Type: https://github.com/python/cpython/blob/v3.13.0/Objects/bytesobject.c#L3017
+    # PyComplex_Type: https://github.com/python/cpython/blob/v3.13.0/Objects/complexobject.c#L1099
+    # _PyNone_Type: https://github.com/python/cpython/blob/v3.13.0/Objects/object.c#L2022
+    _cpython_type = (int, float, str, bytes, bool, type(None), complex, type(...))
+
     @overload
     @staticmethod
     def create(value: None) -> Never: ...
@@ -169,6 +178,21 @@ its type to `common_constant_types`.
         except TypeError as e:
             raise NotImplementedError from e
 
+    def len_impl(self, tx: "InstructionTranslator") -> "VariableTracker":
+        """Generic len for any constant value (sequence or mapping)."""
+        try:
+            return ConstantVariable.create(len(self.value))
+        except TypeError as e:
+            raise_observed_exception(type(e), tx, args=list(e.args))
+
+    def sq_length(self, tx: "InstructionTranslator") -> "VariableTracker":
+        """Sequence length - delegates to len_impl for constants."""
+        return self.len_impl(tx)
+
+    def mp_length(self, tx: "InstructionTranslator") -> "VariableTracker":
+        """Mapping length - delegates to len_impl for constants."""
+        return self.len_impl(tx)
+
     def const_getattr(self, tx: "InstructionTranslator", name: str) -> VariableTracker:
         if not hasattr(self.value, name):
             raise_observed_exception(AttributeError, tx, args=[name])
@@ -271,12 +295,7 @@ its type to `common_constant_types`.
             except Exception as e:
                 raise_observed_exception(type(e), tx)
 
-        if name == "__len__" and not (args or kwargs):
-            try:
-                return ConstantVariable.create(len(self.value))
-            except TypeError as e:
-                raise_observed_exception(type(e), tx, args=list(e.args))
-        elif name == "__round__" and len(args) == 1 and args[0].is_python_constant():
+        if name == "__round__" and len(args) == 1 and args[0].is_python_constant():
             try:
                 return ConstantVariable.create(
                     round(self.value, args[0].as_python_constant())
@@ -398,6 +417,9 @@ class FakeIdVariable(VariableTracker):
     (hashing and equality).  It intentionally blocks reconstruction so that a
     graph break does not silently bake a stale id into the resumed bytecode.
     """
+
+    # PyLong_Type: https://github.com/python/cpython/blob/v3.13.0/Objects/longobject.c#L6585
+    _cpython_type = int
 
     def __init__(self, value: int, **kwargs: Any) -> None:
         super().__init__(**kwargs)

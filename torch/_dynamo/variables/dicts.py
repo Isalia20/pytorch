@@ -117,6 +117,9 @@ def is_hashable(x: VariableTracker) -> bool:
 
 
 class ConstDictVariable(VariableTracker):
+    # PyDict_Type: https://github.com/python/cpython/blob/v3.13.0/Objects/dictobject.c#L4825
+    _cpython_type = dict
+
     CONTAINS_GUARD = GuardBuilder.DICT_CONTAINS
     NOT_CONTAINS_GUARD = GuardBuilder.DICT_NOT_CONTAINS
 
@@ -676,16 +679,6 @@ class ConstDictVariable(VariableTracker):
             return self.clone(
                 items=self.items.copy(), mutation_type=ValueMutationNew(), source=None
             )
-        elif name == "__len__":
-            if args or kwargs:
-                raise_args_mismatch(
-                    tx,
-                    name,
-                    "0 args and 0 kwargs",
-                    f"{len(args)} args and {len(kwargs)} kwargs",
-                )
-            self.install_dict_keys_match_guard()
-            return VariableTracker.build(tx, len(self.items))
         elif name == "__setitem__" and self.is_mutable():
             arg_hashable = args and is_hashable(args[0])
             if not arg_hashable:
@@ -938,7 +931,6 @@ class ConstDictVariable(VariableTracker):
                     user_cls = self.user_cls
                     to_cpy = self
                 else:
-                    assert isinstance(other, ConstDictVariable)
                     user_cls = other.user_cls
                     to_cpy = other
 
@@ -982,6 +974,11 @@ class ConstDictVariable(VariableTracker):
         self.install_dict_keys_match_guard()
         return [x.vt for x in self.items]
 
+    def mp_length(self, tx: "InstructionTranslator") -> VariableTracker:
+        """Mapping length for dict objects."""
+        self.install_dict_keys_match_guard()
+        return VariableTracker.build(tx, len(self.items))
+
     def call_obj_hasattr(
         self, tx: "InstructionTranslator", name: str
     ) -> ConstantVariable:
@@ -1024,6 +1021,9 @@ class ConstDictVariable(VariableTracker):
 
 
 class MappingProxyVariable(VariableTracker):
+    # PyDictProxy_Type: https://github.com/python/cpython/blob/v3.13.0/Objects/descrobject.c#L1995
+    _cpython_type = types.MappingProxyType
+
     # proxies to the original dict_vt
     def __init__(self, dv_dict: ConstDictVariable, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -1092,6 +1092,9 @@ class MappingProxyVariable(VariableTracker):
             )
         return self.dv_dict.call_method(tx, name, args, kwargs)
 
+    def mp_length(self, tx: "InstructionTranslator") -> VariableTracker:
+        return self.dv_dict.mp_length(tx)
+
     def call_obj_hasattr(
         self, tx: "InstructionTranslator", name: str
     ) -> ConstantVariable:
@@ -1112,6 +1115,8 @@ class NNModuleHooksDictVariable(ConstDictVariable):
 
 
 class DefaultDictVariable(ConstDictVariable):
+    _cpython_type = collections.defaultdict
+
     def __init__(
         self,
         items: dict[VariableTracker, VariableTracker],
@@ -1239,6 +1244,9 @@ class DefaultDictVariable(ConstDictVariable):
 # implementation, which is almost assuredly wrong
 class SetVariable(ConstDictVariable):
     """We model a sets as dictionary with None values"""
+
+    # PySet_Type: https://github.com/python/cpython/blob/v3.13.0/Objects/setobject.c#L2436
+    _cpython_type = set
 
     CONTAINS_GUARD = GuardBuilder.SET_CONTAINS
     NOT_CONTAINS_GUARD = GuardBuilder.SET_NOT_CONTAINS
@@ -1609,6 +1617,9 @@ class SetVariable(ConstDictVariable):
         # Already EQUALS_MATCH guarded
         pass
 
+    def sq_length(self, tx: "InstructionTranslator") -> VariableTracker:
+        return VariableTracker.build(tx, len(self.set_items))
+
 
 class OrderedSetClassVariable(VariableTracker):
     def __init__(self, **kwargs: Any) -> None:
@@ -1710,6 +1721,9 @@ class OrderedSetVariable(SetVariable):
 
 
 class FrozensetVariable(SetVariable):
+    # PyFrozenSet_Type: https://github.com/python/cpython/blob/v3.13.0/Objects/setobject.c#L2526
+    _cpython_type = frozenset
+
     def debug_repr(self) -> str:
         if not self.items:
             return "frozenset()"
@@ -1892,9 +1906,7 @@ class DictViewVariable(VariableTracker):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
-        if name == "__len__":
-            return self.dv_dict.call_method(tx, name, args, kwargs)
-        elif name == "__iter__":
+        if name == "__iter__":
             from .lists import ListIteratorVariable
 
             return ListIteratorVariable(
@@ -1904,8 +1916,15 @@ class DictViewVariable(VariableTracker):
             return VariableTracker.build(tx, self.debug_repr())
         return super().call_method(tx, name, args, kwargs)
 
+    def sq_length(self, tx: "InstructionTranslator") -> VariableTracker:
+        """Sequence length for dict view objects."""
+        return VariableTracker.build(tx, len(self.view_items))
+
 
 class DictKeysVariable(DictViewVariable):
+    # PyDictKeys_Type: https://github.com/python/cpython/blob/v3.13.0/Objects/dictobject.c#L6365
+    _cpython_type = dict_keys
+
     kv = "keys"
 
     @property
@@ -1974,6 +1993,9 @@ class DictKeysVariable(DictViewVariable):
 
 
 class DictValuesVariable(DictViewVariable):
+    # PyDictValues_Type: https://github.com/python/cpython/blob/v3.13.0/Objects/dictobject.c#L6567
+    _cpython_type = dict_values
+
     # DictValuesVariable is an iterable but cannot be compared.
     kv = "values"
 
@@ -1996,6 +2018,9 @@ class DictValuesVariable(DictViewVariable):
 
 
 class DictItemsVariable(DictViewVariable):
+    # PyDictItems_Type: https://github.com/python/cpython/blob/v3.13.0/Objects/dictobject.c#L6477
+    _cpython_type = dict_items
+
     kv = "items"
 
     @property
