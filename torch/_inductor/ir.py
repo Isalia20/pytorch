@@ -419,7 +419,7 @@ def is_triton(x: IRNode | torch.device | None | str) -> bool:
     # Special case cpu and cuda as using the method below
     # to determine if the scheduler is a triton scheduler subclass
     # requires instantiating a scheduler for them
-    if device in ["cpu", "cuda"]:
+    if device in ["cpu", "cuda", "xpu"]:
         if getattr(config, f"{device}_backend") == "triton":
             return True
         return False
@@ -3639,6 +3639,11 @@ class DtypeView(BaseView):
 
 
 class SliceView(View):
+    """View that represents a slice along a single dimension.
+
+    Corresponds to tensor[..., start:end:step, ...].
+    """
+
     @classmethod
     def normalize_start_end(
         cls, x: IRNode, dim: int, start: int, end: int
@@ -3651,6 +3656,14 @@ class SliceView(View):
         dim_size = x.get_size()[dim]
 
         if any(free_unbacked_symbols(x) for x in (start, end, dim_size)):
+            min_func = sympy.Min
+            max_func = sympy.Max
+        elif any(
+            # Only needed when backed_size_oblivious is on.
+            x.has(sympy.Min, sympy.Max)
+            for x in (start, end, dim_size)
+            if isinstance(x, Expr)
+        ):
             min_func = sympy.Min
             max_func = sympy.Max
         else:
@@ -7713,7 +7726,7 @@ class UserDefinedTritonKernel(ExternKernel):
         # pyrefly: ignore [missing-attribute]
         self.kernel_src = kernel.src
         self.kernel_ast = ast.parse(self.kernel_src)
-        self.kernel_stores = identify_triton_stores(self.kernel_ast)
+        self.kernel_stores = identify_triton_stores(self.kernel_src)
         self.kernel_args = kernel_args
         # names in `arg_accesses.read_writes` are names of formal arguments in the kernel's prototype
         self.arg_accesses = identify_accessed_tensors(

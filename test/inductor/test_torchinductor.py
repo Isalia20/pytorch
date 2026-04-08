@@ -106,7 +106,6 @@ from torch.testing._internal.common_utils import (
     NAVI_ARCH,
     parametrize,
     serialTest,
-    skipIfMPS,
     skipIfRocm,
     skipIfRocmArch,
     skipIfWindows,
@@ -4931,7 +4930,7 @@ class CommonTemplate:
         with config.patch({"triton.use_block_ptr": use_block_ptr}):
             self.common(fn, (torch.randn(1, 3, *[10] * dim),))
 
-    @skipIfMPS
+    @xfail_if_mps  # aten::full with zero-sized dim triggers AcceleratorError on MPS
     def test_max_unpool_empty_output(self):
         class Unpool1d(nn.Module):
             def __init__(self):
@@ -6557,7 +6556,7 @@ class CommonTemplate:
         TEST_WITH_ROCM and not torch.cuda.has_magma,
         "ROCm hipsolver backend does not currently support eig",
     )
-    @skipIfMPS
+    @xfail_if_mps_unimplemented  # aten::linalg_eig not implemented for MPS
     def test_linalg_eig_stride_consistency(self):
         def fn(x):
             eigenvals, eigenvecs = torch.linalg.eig(x)
@@ -6812,7 +6811,6 @@ class CommonTemplate:
             )
             self.assertEqual(fn(*inputs), opt_fn(*inputs))
 
-    @xfail_if_mps  # 'NullHandler' object has no attribute 'wrapper_code'
     def test_masked_scatter(self):
         def fn(value, mask, source):
             return torch.masked_scatter(value, mask, source)
@@ -9368,7 +9366,6 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         actual_out = compiled_fn(view)
         self.assertEqual(reference_out.stride(), actual_out.stride())
 
-    @skipIfMPS
     def test_nonzero_static_stride(self):
         from torch._subclasses import FakeTensorMode
 
@@ -9426,7 +9423,6 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             ],
         )
 
-    @skipIfMPS  # MPS does not support float64
     def test_select_scatter_dtype_consistency(self):
         def fn(x, a):
             return (torch.select_scatter(x, a, 1, 0),)
@@ -9435,6 +9431,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             torch.int64,
             torch.float64,
         ]:
+            if not self.is_dtype_supported(dtype):
+                continue
             self.common(
                 fn,
                 [
@@ -9547,7 +9545,6 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         else:
             assertGeneratedKernelCountEqual(self, 1)
 
-    @skipIfMPS
     def test_slice_scatter_dtype_consistency(self):
         # Test dtype consistency of slice_scatter
         def fn(x, y):
@@ -9557,6 +9554,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             torch.int64,
             torch.float64,
         ]:
+            if not self.is_dtype_supported(dtype):
+                continue
             self.common(
                 fn,
                 [
@@ -15872,7 +15871,6 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             torch.compile(foo, fullgraph=True)(torch.ones(3, 3))
             self.assertTrue(len(log2), 1)
 
-    @skipIfMPS  # Accuracy issue on MPS
     def test_weight_norm_conv2d(self):
         """
         Verify fix for https://github.com/pytorch/pytorch/issues/165749
@@ -15892,7 +15890,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         self.assertTrue(same((ref, ref_grad), (act, act_grad), tol=1e-3))
 
-    @skipIfMPS
+    @xfail_if_mps  # MPS codegen does not emit ReductionHint.OUTER
     def test_inner_reduction_detection(self):
         if self.device == "cpu":
             self.skipTest("Skip for CPU device")
