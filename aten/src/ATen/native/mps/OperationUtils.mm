@@ -942,20 +942,13 @@ class BundledShaderLibrary : public MetalShaderLibrary {
     if (C10_UNLIKELY(!library)) {
       auto device = MPSDevice::getInstance()->device();
       NSError* error = nil;
-#if CAN_BUILD_METAL_4
-      if (is_macos_13_or_newer(MacOSVersion::MACOS_VER_26_0_PLUS)) {
-        auto data = getSectionData("metal_40");
-        TORCH_CHECK(data, "Can't find metal library section metal_40");
-        library = [device newLibraryWithData:data error:&error];
-        TORCH_CHECK(library, "Failed to create Metal 4.0 library, error: ", [[error description] UTF8String]);
-      } else
+#ifdef CAN_BUILD_METAL_4
+      const auto section_name = is_macos_13_or_newer(MacOSVersion::MACOS_VER_26_0_PLUS) ? "metal_40" : "metal_basic";
+#else
+      const auto section_name = "metal_basic";
 #endif
-      {
-        auto data = getSectionData("metal_basic");
-        TORCH_CHECK(data, "Can't find metal library section metal_basic");
-        library = [device newLibraryWithData:data error:&error];
-        TORCH_CHECK(library, "Failed to create metal library, error: ", [[error description] UTF8String]);
-      }
+      library = [device newLibraryWithData:getSectionData(section_name) error:&error];
+      TORCH_CHECK(library, "Failed to create metal library, error: ", [[error description] UTF8String]);
     }
     return library;
   }
@@ -977,7 +970,7 @@ class BundledShaderLibrary : public MetalShaderLibrary {
     unsigned long mtl_lib_size = 0;
     const auto* mtl_lib_data = getsectiondata(mach_header, "__TEXT", name.c_str(), &mtl_lib_size);
     if (mtl_lib_data == nullptr) {
-      return nullptr;
+      throw std::runtime_error("Can't find metal library section " + name);
     }
     return dispatch_data_create(mtl_lib_data,
                                 mtl_lib_size,
