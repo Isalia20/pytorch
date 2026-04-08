@@ -942,15 +942,15 @@ class BundledShaderLibrary : public MetalShaderLibrary {
     if (C10_UNLIKELY(!library)) {
       auto device = MPSDevice::getInstance()->device();
       NSError* error = nil;
-      // Prefer Metal 4.0 library on macOS 26+
+#if CAN_BUILD_METAL_4
       if (is_macos_13_or_newer(MacOSVersion::MACOS_VER_26_0_PLUS)) {
         auto data = getSectionData("metal_40");
-        if (data) {
-          library = [device newLibraryWithData:data error:&error];
-          TORCH_CHECK(library, "Failed to create Metal 4.0 library, error: ", [[error description] UTF8String]);
-        }
-      }
-      if (!library) {
+        TORCH_CHECK(data, "Can't find metal library section metal_40");
+        library = [device newLibraryWithData:data error:&error];
+        TORCH_CHECK(library, "Failed to create Metal 4.0 library, error: ", [[error description] UTF8String]);
+      } else
+#endif
+      {
         auto data = getSectionData("metal_basic");
         TORCH_CHECK(data, "Can't find metal library section metal_basic");
         library = [device newLibraryWithData:data error:&error];
