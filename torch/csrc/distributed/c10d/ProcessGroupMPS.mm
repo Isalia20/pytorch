@@ -3,6 +3,7 @@
 #include <torch/csrc/distributed/c10d/ProcessGroupMPS.hpp>
 #include <torch/csrc/distributed/c10d/JACCLTransport.h>
 
+#include <iostream>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
@@ -294,27 +295,38 @@ ProcessGroupMPS::ProcessGroupMPS(
       // explicit JACCL_DEVICE override skips the probe.
       int numDevices = 0;
       auto devices = jaccl::ibv().getDeviceList(&numDevices);
+      std::cerr << "[jaccl-probe] numDevices=" << numDevices << std::endl;
       std::string firstDevice;
       const char* deviceOverride = std::getenv("JACCL_DEVICE");
       for (int i = 0; i < numDevices; i++) {
         std::string name = jaccl::ibv().getDeviceName(devices[i]);
+        std::cerr << "[jaccl-probe] " << i << " name=" << name << std::endl;
         if (deviceOverride && name != deviceOverride) {
+          std::cerr << "[jaccl-probe]   skipped (override=" << deviceOverride << ")" << std::endl;
           continue;
         }
         auto ctx = jaccl::ibv().openDevice(devices[i]);
+        std::cerr << "[jaccl-probe]   openDevice -> " << (void*)ctx << std::endl;
         if (!ctx) {
           continue;
         }
         auto pd = jaccl::ibv().allocPd(ctx);
+        std::cerr << "[jaccl-probe]   allocPd    -> " << (void*)pd << std::endl;
         if (pd) {
+          std::cerr << "[jaccl-probe]   deallocPd..." << std::endl;
           jaccl::ibv().deallocPd(pd);
+          std::cerr << "[jaccl-probe]   closeDevice..." << std::endl;
           jaccl::ibv().closeDevice(ctx);
           firstDevice = name;
+          std::cerr << "[jaccl-probe]   PICKED " << name << std::endl;
           break;
         }
+        std::cerr << "[jaccl-probe]   closeDevice (fail path)..." << std::endl;
         jaccl::ibv().closeDevice(ctx);
       }
+      std::cerr << "[jaccl-probe] freeDeviceList..." << std::endl;
       jaccl::ibv().freeDeviceList(devices);
+      std::cerr << "[jaccl-probe] done, firstDevice='" << firstDevice << "'" << std::endl;
       if (!firstDevice.empty()) {
 
         // Build device name list: use first device for all peers, empty for self
