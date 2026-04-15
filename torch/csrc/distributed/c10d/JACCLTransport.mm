@@ -54,7 +54,9 @@ Address parseAddress(const std::string& ipPort) {
 
   struct addrinfo hints, *res;
   std::memset(&hints, 0, sizeof(hints));
-  hints.ai_family = AF_UNSPEC;
+  // TCPSocket and the rest of this file use AF_INET — keep resolution consistent
+  // so bind() doesn't get a sockaddr_in6 from mDNS on macOS.
+  hints.ai_family = AF_INET;
   hints.ai_socktype = SOCK_STREAM;
 
   int status = getaddrinfo(ip.c_str(), port.c_str(), &hints, &res);
