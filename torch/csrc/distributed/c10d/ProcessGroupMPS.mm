@@ -288,12 +288,34 @@ ProcessGroupMPS::ProcessGroupMPS(
 #if HAVE_JACCL
   if (jaccl::isAvailable()) {
     try {
-      // Auto-detect RDMA devices
+      // Auto-detect RDMA devices. On macOS each Thunderbolt port exposes its
+      // own rdma_en* device; only the port with a connected peer allows
+      // ibv_alloc_pd. Probe each device and pick the first usable one. An
+      // explicit JACCL_DEVICE override skips the probe.
       int numDevices = 0;
       auto devices = jaccl::ibv().getDeviceList(&numDevices);
-      if (numDevices > 0) {
-        std::string firstDevice = jaccl::ibv().getDeviceName(devices[0]);
-        jaccl::ibv().freeDeviceList(devices);
+      std::string firstDevice;
+      const char* deviceOverride = std::getenv("JACCL_DEVICE");
+      for (int i = 0; i < numDevices; i++) {
+        std::string name = jaccl::ibv().getDeviceName(devices[i]);
+        if (deviceOverride && name != deviceOverride) {
+          continue;
+        }
+        auto ctx = jaccl::ibv().openDevice(devices[i]);
+        if (!ctx) {
+          continue;
+        }
+        auto pd = jaccl::ibv().allocPd(ctx);
+        if (pd) {
+          jaccl::ibv().deallocPd(pd);
+          jaccl::ibv().closeDevice(ctx);
+          firstDevice = name;
+          break;
+        }
+        jaccl::ibv().closeDevice(ctx);
+      }
+      jaccl::ibv().freeDeviceList(devices);
+      if (!firstDevice.empty()) {
 
         // Build device name list: use first device for all peers, empty for self
         std::vector<std::string> deviceNames(size);
@@ -324,8 +346,6 @@ ProcessGroupMPS::ProcessGroupMPS(
             rank, size, coordAddr.c_str(), deviceNames);
         useJACCL_ = true;
         TORCH_WARN("ProcessGroupMPS: using JACCL RDMA transport");
-      } else {
-        jaccl::ibv().freeDeviceList(devices);
       }
     } catch (const std::exception& e) {
       TORCH_WARN(
