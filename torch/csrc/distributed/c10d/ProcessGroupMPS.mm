@@ -354,8 +354,10 @@ ProcessGroupMPS::ProcessGroupMPS(
           coordAddr = std::string(data.begin(), data.end());
         }
 
+        std::cerr << "[jaccl-probe] constructing JACCLTransport coord=" << coordAddr << std::endl;
         jacclTransport_ = std::make_unique<jaccl::JACCLTransport>(
             rank, size, coordAddr.c_str(), deviceNames);
+        std::cerr << "[jaccl-probe] JACCLTransport ctor returned" << std::endl;
         useJACCL_ = true;
         TORCH_WARN("ProcessGroupMPS: using JACCL RDMA transport");
       }

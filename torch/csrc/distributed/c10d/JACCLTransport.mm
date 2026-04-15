@@ -7,6 +7,7 @@
 #include <torch/csrc/distributed/c10d/Types.hpp>
 
 #include <dlfcn.h>
+#include <iostream>
 #include <netdb.h>
 #include <unistd.h>
 
@@ -647,6 +648,8 @@ JACCLTransport::JACCLTransport(
       size_(size),
       sideChannel_(rank, size, coordinatorAddr),
       connections_(createConnections(deviceNames)) {
+  std::cerr << "[jaccl-ctor] rank=" << rank_ << " size=" << size_
+            << " sideChannel+connections done" << std::endl;
   TORCH_CHECK(
       size_ <= MESH_MAX_PEERS,
       JACCL_TAG, " Mesh supports up to ", MESH_MAX_PEERS, " peers");
@@ -655,10 +658,12 @@ JACCLTransport::JACCLTransport(
   for (auto& conn : connections_) {
     if (conn.ctx == nullptr)
       continue;
+    std::cerr << "[jaccl-ctor] allocPd/CQ/QP on ctx=" << (void*)conn.ctx << std::endl;
     conn.allocateProtectionDomain();
     conn.createCompletionQueue(MAX_SEND_WR + MAX_RECV_WR);
     conn.createQueuePair();
   }
+  std::cerr << "[jaccl-ctor] PD/CQ/QP done for all peers" << std::endl;
 
   // Allocate buffers
   for (int k = 0; k < BUFFER_SIZES; k++) {
@@ -694,6 +699,7 @@ JACCLTransport::JACCLTransport(
   for (int peer = 0; peer < size_; peer++) {
     if (peer == rank_)
       continue;
+    std::cerr << "[jaccl-ctor] queuePairInit peer=" << peer << std::endl;
     connections_[peer].queuePairInit();
   }
 
@@ -702,21 +708,27 @@ JACCLTransport::JACCLTransport(
   for (auto& conn : connections_) {
     info.emplace_back(conn.info());
   }
+  std::cerr << "[jaccl-ctor] sideChannel allGather info..." << std::endl;
   auto allInfos = sideChannel_.allGather(info);
+  std::cerr << "[jaccl-ctor] allGather returned" << std::endl;
 
   // Transition to RTS
   for (int peer = 0; peer < size_; peer++) {
     if (peer == rank_)
       continue;
+    std::cerr << "[jaccl-ctor] RTR/RTS peer=" << peer << std::endl;
     auto peerInfo = allInfos[peer][rank_];
     connections_[peer].queuePairRtr(peerInfo);
     connections_[peer].queuePairRts();
   }
 
   // Barrier to ensure everyone is ready
+  std::cerr << "[jaccl-ctor] barrier allGather..." << std::endl;
   sideChannel_.allGather<int>(0);
+  std::cerr << "[jaccl-ctor] barrier done, constructing MeshImpl" << std::endl;
 
   mesh_ = MeshImpl(rank_, size_, connections_, buffers_);
+  std::cerr << "[jaccl-ctor] done" << std::endl;
 }
 
 JACCLTransport::~JACCLTransport() = default;
