@@ -301,13 +301,17 @@ ProcessGroupMPS::ProcessGroupMPS(
           deviceNames[i] = (i == rank) ? "" : firstDevice;
         }
 
-        // Exchange coordinator address via store
+        // Exchange coordinator address via store. Use MASTER_ADDR as the host
+        // (rank 0's hostname may not resolve from peers, or may resolve to a
+        // different interface than the one MASTER_ADDR points at). Derive the
+        // port from MASTER_PORT so both ranks agree without DNS.
         std::string coordAddr;
         if (rank == 0) {
-          char hostname[256];
-          gethostname(hostname, sizeof(hostname));
-          int port = 29500 + (getpid() % 10000);
-          coordAddr = std::string(hostname) + ":" + std::to_string(port);
+          const char* masterAddr = std::getenv("MASTER_ADDR");
+          const char* masterPortEnv = std::getenv("MASTER_PORT");
+          int basePort = masterPortEnv ? std::atoi(masterPortEnv) : 29500;
+          std::string host = masterAddr ? masterAddr : "127.0.0.1";
+          coordAddr = host + ":" + std::to_string(basePort + 1);
           store_->set(
               "jaccl_coord",
               std::vector<uint8_t>(coordAddr.begin(), coordAddr.end()));
