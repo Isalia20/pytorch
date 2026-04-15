@@ -6,6 +6,7 @@
 
 #include <torch/csrc/distributed/c10d/Types.hpp>
 
+#include <array>
 #include <dlfcn.h>
 #include <iostream>
 #include <netdb.h>
@@ -703,10 +704,13 @@ JACCLTransport::JACCLTransport(
     connections_[peer].queuePairInit();
   }
 
-  // Exchange connection info via side channel
-  std::vector<Destination> info;
-  for (auto& conn : connections_) {
-    info.emplace_back(conn.info());
+  // Exchange connection info via side channel. Use std::array (trivially
+  // copyable) rather than std::vector — SideChannel::allGather<T> does a raw
+  // memcpy of sizeof(T) bytes per rank, which corrupts a std::vector's
+  // pointer/size/capacity control block.
+  std::array<Destination, MESH_MAX_PEERS> info{};
+  for (int i = 0; i < size_; i++) {
+    info[i] = connections_[i].info();
   }
   std::cerr << "[jaccl-ctor] sideChannel allGather info..." << std::endl;
   auto allInfos = sideChannel_.allGather(info);
