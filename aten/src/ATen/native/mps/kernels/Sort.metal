@@ -257,7 +257,26 @@ inline void block_merge_sort(
     }
   }
 
-  for (int mt = 64; mt <= BN; mt *= 2) {
+  // First cross-SIMD round (mt=64) skips the leading barrier: SIMD bitonic
+  // (or thread_sort + mt<=32 rounds) leaves sorted items in registers only,
+  // and each thread's tv[base..base+TN) slots were last read by itself at
+  // line 235 — no other thread's write or read touches those slots.
+  if (BN >= 64) {
+    constexpr int mt_first = 64;
+    for (int i = 0; i < TN; ++i) { tv[base+i] = lv[i]; ti[base+i] = li[i]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    int grp = lid / mt_first, lane = lid % mt_first;
+    int sz = TN * mt_first, st = sz * grp;
+    int hsz = sz / 2;
+    int diag = TN * lane;
+    int p = merge_partition(tv + st, tv + st + hsz, hsz, hsz, diag, desc);
+    merge_step<T, IdxT, TN>(
+        tv + st + p, tv + st + hsz + diag - p,
+        ti + st + p, ti + st + hsz + diag - p,
+        hsz - p, hsz - diag + p, lv, li, desc);
+  }
+  for (int mt = 128; mt <= BN; mt *= 2) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int i = 0; i < TN; ++i) { tv[base+i] = lv[i]; ti[base+i] = li[i]; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -314,13 +333,16 @@ kernel void sort_block(
 }
 
 // ====================== Multi-block kernels ======================
-// All intermediate buffers use uint32 indices.
+// Intermediate buffers use either uint32 or uint16 indices depending on
+// sort_size: sort_size ≤ 65536 fits in ushort, halving the per-row index
+// bandwidth (~25% total BW reduction for merge path) and cutting per-TG
+// tgmem from 16KB → 12KB (f32) which fits more TGs per core on some GPUs.
 
-template <typename T, short BN, short TN>
+template <typename T, typename IdxT, short BN, short TN>
 kernel void mb_sort_block(
     const device T* inp [[buffer(0)]],
     device T* dv [[buffer(1)]],
-    device uint* di [[buffer(2)]],
+    device IdxT* di [[buffer(2)]],
     constant int& size [[buffer(3)]],
     constant long& stride_sort [[buffer(4)]],
     constant long& stride_seg [[buffer(5)]],
@@ -331,14 +353,14 @@ kernel void mb_sort_block(
   T init = sort_init<T>(desc);
   long seg = tid.y * stride_seg;
   int blk = tid.x * NPB;
-  threadgroup T tgv[NPB]; threadgroup uint tgi[NPB];
+  threadgroup T tgv[NPB]; threadgroup IdxT tgi[NPB];
   for (int i = lid.x; i < NPB; i += BN) {
     int g = blk + i;
     tgv[i] = g < size ? inp[seg + g * stride_sort] : init;
-    tgi[i] = g;
+    tgi[i] = IdxT(g);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  block_merge_sort<T, uint, BN, TN>(tgv, tgi, size, lid.x, desc);
+  block_merge_sort<T, IdxT, BN, TN>(tgv, tgi, size, lid.x, desc);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   int row = tid.y * size;
   for (int i = lid.x; i < NPB; i += BN) {
@@ -352,12 +374,13 @@ kernel void mb_sort_block(
 // `mb_partition` dispatch; now we just redo the two binary searches locally
 // (O(log(NPB*merge_tiles)) global reads, well inside L1). Saves one
 // dispatch per merge round.
-// Templated on OutIdxT so the last merge round can write int64 indices
-// directly into the caller's output tensor (skipping a uint32→int64 copy).
-template <typename T, typename OutIdxT, short BN, short TN>
+// Templated on InIdxT (ushort for small sort_size, uint otherwise) and
+// OutIdxT (InIdxT for intermediate rounds, long for the final round writing
+// directly into the caller's int64 output tensor).
+template <typename T, typename InIdxT, typename OutIdxT, short BN, short TN>
 kernel void mb_merge(
     const device T* vi [[buffer(0)]],
-    const device uint* ii [[buffer(1)]],
+    const device InIdxT* ii [[buffer(1)]],
     device T* vo [[buffer(2)]],
     device OutIdxT* io [[buffer(3)]],
     constant int& size [[buffer(4)]],
@@ -411,24 +434,24 @@ kernel void mb_merge(
   int Bed = min(size, 2*sst + ssz/2 + smd + NPB - Aed);
   int Asz = Aed - Ast, Bsz = Bed - Bst;
 
-  thread T lv[TN]; thread uint li[TN];
+  // Direct global → tgv coalesced load. Skips the register-intermediate
+  // load/write loop and its paired barrier (tgv has not been touched before
+  // this point; bcast[] lives in a separately-allocated tgmem region).
+  threadgroup T tgv[NPB]; threadgroup InIdxT tgi[NPB];
   for (int i = 0; i < TN; ++i) {
     int x = BN * i + lid.x;
     if (x < Asz + Bsz) {
-      lv[i] = (x < Asz) ? vi[Ast+x] : vi[Bst+x-Asz];
-      li[i] = (x < Asz) ? ii[Ast+x] : ii[Bst+x-Asz];
-    } else { lv[i] = init; li[i] = 0; }
+      tgv[x] = (x < Asz) ? vi[Ast+x] : vi[Bst+x-Asz];
+      tgi[x] = (x < Asz) ? ii[Ast+x] : ii[Bst+x-Asz];
+    } else { tgv[x] = init; tgi[x] = InIdxT(0); }
   }
-
-  threadgroup T tgv[NPB]; threadgroup uint tgi[NPB];
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (int i = 0; i < TN; ++i) { int x = BN*i+lid.x; tgv[x] = lv[i]; tgi[x] = li[i]; }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   int md = min(Asz+Bsz, TN*int(lid.x));
   int ap = merge_partition(tgv, tgv+Asz, Asz, Bsz, md, desc);
-  merge_step<T, uint, TN>(tgv+ap, tgv+Asz+md-ap, tgi+ap, tgi+Asz+md-ap,
-                           Asz-ap, Bsz-md+ap, lv, li, desc);
+  thread T lv[TN]; thread InIdxT li[TN];
+  merge_step<T, InIdxT, TN>(tgv+ap, tgv+Asz+md-ap, tgi+ap, tgi+Asz+md-ap,
+                             Asz-ap, Bsz-md+ap, lv, li, desc);
 
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (int i = 0; i < TN; ++i) { tgv[lid.x*TN+i] = lv[i]; tgi[lid.x*TN+i] = li[i]; }
@@ -572,8 +595,13 @@ kernel void radix_count(
 }
 
 // Parallel exclusive scan over [n_entries] per row, using SCAN_BN threads.
-// n_entries <= SCAN_BN * SCAN_CHUNK.
-constant constexpr int SCAN_BN = 256;
+// SCAN_BN=1024 = hardware max per TG: keeps each row's scan as a single TG
+// (one scan dispatch launches 1 TG per row) while maxing parallel work per
+// thread. For single-row configs with large n_entries (e.g. f32 [1,524288]
+// has n_entries=65536), this cuts the serial per-thread chunk 4× vs SCAN_BN=256.
+// MAX_SIMD_GROUPS = 32 exactly, matching SIMD_W so the cross-SIMD prefix can
+// be done with a single simd_prefix_exclusive_sum on simd 0.
+constant constexpr int SCAN_BN = 1024;
 
 [[host_name("radix_scan")]]
 kernel void radix_scan(
@@ -634,11 +662,11 @@ kernel void radix_scan(
 // threadgroup memory (saving one dispatch per pass). Only usable when
 // n_blocks ≤ kMaxFusedBlocks since we load the full n_entries into tgmem.
 constexpr constant int kMaxFusedBlocks = 4;
-template <typename T, typename OutIdxT, short RBN, short EPT, short RBITS,
-          bool FUSED_SCAN = false>
+template <typename T, typename InIdxT, typename OutIdxT, short RBN, short EPT,
+          short RBITS, bool FUSED_SCAN = false>
 kernel void radix_scatter(
     const device T* keys_in [[buffer(0)]],
-    const device uint* vals_in [[buffer(1)]],
+    const device InIdxT* vals_in [[buffer(1)]],
     device T* keys_out [[buffer(2)]],
     device OutIdxT* vals_out [[buffer(3)]],
     const device uint* offsets [[buffer(4)]],  // raw counts if FUSED_SCAN, else prefix-summed
@@ -664,12 +692,12 @@ kernel void radix_scatter(
   int items_this_block = min(NPB, sort_size - block_start);
 
   threadgroup T stage_keys[NPB];
-  threadgroup uint stage_idxs[NPB];
+  threadgroup InIdxT stage_idxs[NPB];
   threadgroup uint simd_sum_buf[MAX_SIMD_GROUPS];
   threadgroup uint tg_total_zeros;
   threadgroup uint block_offsets[RSIZE];
   threadgroup uint digit_start[RSIZE];
-  threadgroup atomic_uint local_hist[RSIZE];
+  // (local_hist removed: boundary detection replaces atomic rebuild)
   threadgroup uint fused_buf[FUSED_BUF_SIZE];
 
   // 1) Strided (coalesced) load into stage.
@@ -677,15 +705,18 @@ kernel void radix_scatter(
     int pos = i * RBN + int(lid);
     if (pos < items_this_block) {
       stage_keys[pos] = keys_in[row * sort_size + block_start + pos];
-      stage_idxs[pos] = first_pass ? uint(block_start + pos)
+      stage_idxs[pos] = first_pass ? InIdxT(block_start + pos)
                                    : vals_in[row * sort_size + block_start + pos];
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   // 2) Read into registers in contiguous-per-thread layout for stable local sort.
+  // No trailing barrier: the first threadgroup write in the binary split loop
+  // is to simd_sum_buf (line ~740), not stage. Its paired barrier (line ~744)
+  // also flushes these stage reads before any thread scatters to stage later.
   T local_keys[EPT];
-  uint local_idxs[EPT];
+  InIdxT local_idxs[EPT];
   uint my_active_start = min(uint(lid) * uint(EPT), uint(items_this_block));
   uint my_active_end = min((uint(lid) + 1) * uint(EPT), uint(items_this_block));
   uint my_active_count = my_active_end - my_active_start;
@@ -695,10 +726,9 @@ kernel void radix_scatter(
       local_idxs[i] = stage_idxs[my_active_start + i];
     } else {
       local_keys[i] = sort_init<T>(desc);
-      local_idxs[i] = 0;
+      local_idxs[i] = InIdxT(0);
     }
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
 
   // 3) RBITS binary split passes to fully sort the block by the RBITS-bit digit.
   for (int bit = 0; bit < RBITS; ++bit) {
@@ -759,63 +789,23 @@ kernel void radix_scatter(
     // needed here.
   }
 
-  // 4) Build per-digit start offsets inside the block. Read digits directly
-  // from stage_keys (post-shuffle) to skip the final reload into registers.
-  for (uint d = lid; d < uint(RSIZE); d += RBN)
-    atomic_store_explicit(&local_hist[d], 0u, memory_order_relaxed);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  if (RBITS <= 4) {
-    uint my_hist[RSIZE];
-    _Pragma("clang loop unroll(full)") for (uint d = 0; d < uint(RSIZE); ++d) my_hist[d] = 0;
-    _Pragma("clang loop unroll(full)") for (int i = 0; i < EPT; ++i) {
-      uint pos = my_active_start + uint(i);
-      if (uint(i) < my_active_count) {
-        uint d = (to_radix_key(stage_keys[pos], desc) >> shift) & RMASK;
-        my_hist[d]++;
+  // 4) Build per-digit start offsets via boundary detection. Stage is sorted
+  // by digit after the binary splits; digit_start[d] is the position where
+  // digit d first appears. For digits not present, digit_start[d] stays stale
+  // (never read). This replaces a ~NPB-atomic histogram build + scan with one
+  // tg read + compare per element.
+  _Pragma("clang loop unroll(full)") for (int i = 0; i < EPT; ++i) {
+    uint pos = my_active_start + uint(i);
+    if (uint(i) < my_active_count) {
+      uint d_here = (to_radix_key(stage_keys[pos], desc) >> shift) & RMASK;
+      uint d_prev;
+      if (pos == 0u) {
+        d_prev = 0xFFFFFFFFu;  // sentinel: no predecessor
+      } else {
+        d_prev = (to_radix_key(stage_keys[pos - 1u], desc) >> shift) & RMASK;
       }
-    }
-    _Pragma("clang loop unroll(full)") for (uint d = 0; d < uint(RSIZE); ++d) {
-      uint s = simd_sum(my_hist[d]);
-      if (lane == 0 && s > 0)
-        atomic_fetch_add_explicit(&local_hist[d], s, memory_order_relaxed);
-    }
-  } else {
-    // 8-bit: direct atomic add per item (avoids 256-slot per-thread array).
-    _Pragma("clang loop unroll(full)") for (int i = 0; i < EPT; ++i) {
-      uint pos = my_active_start + uint(i);
-      if (uint(i) < my_active_count) {
-        uint d = (to_radix_key(stage_keys[pos], desc) >> shift) & RMASK;
-        atomic_fetch_add_explicit(&local_hist[d], 1u, memory_order_relaxed);
-      }
-    }
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  // Exclusive prefix sum over RSIZE entries. For 16 bins one thread does it
-  // serially; for 256 bins use a parallel scan across one simdgroup.
-  if (RBITS <= 4) {
-    if (lid == 0) {
-      uint sum = 0;
-      _Pragma("clang loop unroll(full)") for (uint d = 0; d < uint(RSIZE); ++d) {
-        digit_start[d] = sum;
-        sum += atomic_load_explicit(&local_hist[d], memory_order_relaxed);
-      }
-    }
-  } else {
-    // Parallel scan of 256 entries using one simdgroup × chunk per thread.
-    constexpr int SCAN_CHUNK = RSIZE / SIMD_W;  // 8 for RSIZE=256
-    if (simd_id == 0) {
-      uint partial = 0;
-      for (uint i = 0; i < uint(SCAN_CHUNK); ++i) {
-        partial += atomic_load_explicit(&local_hist[lane * SCAN_CHUNK + i], memory_order_relaxed);
-      }
-      uint base = simd_prefix_exclusive_sum(partial);
-      uint running = base;
-      for (uint i = 0; i < uint(SCAN_CHUNK); ++i) {
-        uint v = atomic_load_explicit(&local_hist[lane * SCAN_CHUNK + i], memory_order_relaxed);
-        digit_start[lane * SCAN_CHUNK + i] = running;
-        running += v;
+      if (d_here != d_prev) {
+        digit_start[d_here] = pos;
       }
     }
   }
@@ -881,24 +871,40 @@ kernel void radix_scatter(
 
 // ====================== Instantiation ======================
 
-#define INSTANTIATE_SORT(T, BN, TN)                                    \
-  template [[host_name("sort_block_" #T "_bn" #BN)]]                  \
-  kernel void sort_block<T, BN, TN>(                                   \
-      const device T*, device T*, device long*, constant int&,         \
-      constant long&, constant long&, constant bool&, uint3, uint3);   \
-  template [[host_name("mb_sort_block_" #T "_bn" #BN)]]               \
-  kernel void mb_sort_block<T, BN, TN>(                                \
-      const device T*, device T*, device uint*, constant int&,         \
-      constant long&, constant long&, constant bool&, uint3, uint3);   \
-  template [[host_name("mb_merge_" #T "_bn" #BN)]]                    \
-  kernel void mb_merge<T, uint, BN, TN>(                               \
-      const device T*, const device uint*,                             \
-      device T*, device uint*, constant int&, constant int&,           \
-      constant int&, constant bool&, uint3, uint3);                    \
-  template [[host_name("mb_merge_final_" #T "_bn" #BN)]]              \
-  kernel void mb_merge<T, long, BN, TN>(                               \
-      const device T*, const device uint*,                             \
-      device T*, device long*, constant int&, constant int&,           \
+#define INSTANTIATE_SORT(T, BN, TN)                                           \
+  template [[host_name("sort_block_" #T "_bn" #BN)]]                          \
+  kernel void sort_block<T, BN, TN>(                                          \
+      const device T*, device T*, device long*, constant int&,                \
+      constant long&, constant long&, constant bool&, uint3, uint3);          \
+  template [[host_name("mb_sort_block_" #T "_bn" #BN)]]                       \
+  kernel void mb_sort_block<T, uint, BN, TN>(                                 \
+      const device T*, device T*, device uint*, constant int&,                \
+      constant long&, constant long&, constant bool&, uint3, uint3);          \
+  template [[host_name("mb_merge_" #T "_bn" #BN)]]                            \
+  kernel void mb_merge<T, uint, uint, BN, TN>(                                \
+      const device T*, const device uint*,                                    \
+      device T*, device uint*, constant int&, constant int&,                  \
+      constant int&, constant bool&, uint3, uint3);                           \
+  template [[host_name("mb_merge_final_" #T "_bn" #BN)]]                      \
+  kernel void mb_merge<T, uint, long, BN, TN>(                                \
+      const device T*, const device uint*,                                    \
+      device T*, device long*, constant int&, constant int&,                  \
+      constant int&, constant bool&, uint3, uint3);                           \
+  /* uint16 index variants: used when sort_size <= 65536 (intermediate        \
+     indices fit in ushort, halving index bandwidth). */                      \
+  template [[host_name("mb_sort_block_" #T "_bn" #BN "_u16")]]                \
+  kernel void mb_sort_block<T, ushort, BN, TN>(                               \
+      const device T*, device T*, device ushort*, constant int&,              \
+      constant long&, constant long&, constant bool&, uint3, uint3);          \
+  template [[host_name("mb_merge_" #T "_bn" #BN "_u16")]]                     \
+  kernel void mb_merge<T, ushort, ushort, BN, TN>(                            \
+      const device T*, const device ushort*,                                  \
+      device T*, device ushort*, constant int&, constant int&,                \
+      constant int&, constant bool&, uint3, uint3);                           \
+  template [[host_name("mb_merge_final_" #T "_bn" #BN "_u16")]]               \
+  kernel void mb_merge<T, ushort, long, BN, TN>(                              \
+      const device T*, const device ushort*,                                  \
+      device T*, device long*, constant int&, constant int&,                  \
       constant int&, constant bool&, uint3, uint3);
 
 #define INSTANTIATE_ALL_BN(T) \
@@ -931,30 +937,53 @@ INSTANTIATE_ALL_BN_1024(bool);
 // radix (2 passes for 16-bit). For 16-bit types we pick 8-bit to halve global
 // memory traffic. 32-bit 8-bit radix needs 4 passes and block-local sort via
 // 8 binary passes per radix pass — higher per-block compute, so we keep 4-bit.
-#define INSTANTIATE_RADIX(T, RBN, EPT, RBITS)                                  \
-  template [[host_name("radix_count_" #T "_" #RBITS "bit")]]                   \
-  kernel void radix_count<T, RBN, EPT, RBITS>(                                 \
-      const device T*, device uint*, constant int&, constant int&,             \
-      constant int&, constant bool&, uint3, uint3);                            \
-  template [[host_name("radix_scatter_" #T "_" #RBITS "bit")]]                 \
-  kernel void radix_scatter<T, uint, RBN, EPT, RBITS, false>(                  \
-      const device T*, const device uint*, device T*, device uint*,            \
-      const device uint*, constant int&, constant int&, constant int&,         \
-      constant bool&, constant bool&, uint3, uint3);                           \
-  template [[host_name("radix_scatter_final_" #T "_" #RBITS "bit")]]           \
-  kernel void radix_scatter<T, long, RBN, EPT, RBITS, false>(                  \
-      const device T*, const device uint*, device T*, device long*,            \
-      const device uint*, constant int&, constant int&, constant int&,         \
-      constant bool&, constant bool&, uint3, uint3);                           \
-  template [[host_name("radix_scatter_fused_" #T "_" #RBITS "bit")]]           \
-  kernel void radix_scatter<T, uint, RBN, EPT, RBITS, true>(                   \
-      const device T*, const device uint*, device T*, device uint*,            \
-      const device uint*, constant int&, constant int&, constant int&,         \
-      constant bool&, constant bool&, uint3, uint3);                           \
-  template [[host_name("radix_scatter_fused_final_" #T "_" #RBITS "bit")]]     \
-  kernel void radix_scatter<T, long, RBN, EPT, RBITS, true>(                   \
-      const device T*, const device uint*, device T*, device long*,            \
-      const device uint*, constant int&, constant int&, constant int&,         \
+#define INSTANTIATE_RADIX(T, RBN, EPT, RBITS)                                      \
+  template [[host_name("radix_count_" #T "_" #RBITS "bit")]]                       \
+  kernel void radix_count<T, RBN, EPT, RBITS>(                                     \
+      const device T*, device uint*, constant int&, constant int&,                 \
+      constant int&, constant bool&, uint3, uint3);                                \
+  template [[host_name("radix_scatter_" #T "_" #RBITS "bit")]]                     \
+  kernel void radix_scatter<T, uint, uint, RBN, EPT, RBITS, false>(                \
+      const device T*, const device uint*, device T*, device uint*,                \
+      const device uint*, constant int&, constant int&, constant int&,             \
+      constant bool&, constant bool&, uint3, uint3);                               \
+  template [[host_name("radix_scatter_final_" #T "_" #RBITS "bit")]]               \
+  kernel void radix_scatter<T, uint, long, RBN, EPT, RBITS, false>(                \
+      const device T*, const device uint*, device T*, device long*,                \
+      const device uint*, constant int&, constant int&, constant int&,             \
+      constant bool&, constant bool&, uint3, uint3);                               \
+  template [[host_name("radix_scatter_fused_" #T "_" #RBITS "bit")]]               \
+  kernel void radix_scatter<T, uint, uint, RBN, EPT, RBITS, true>(                 \
+      const device T*, const device uint*, device T*, device uint*,                \
+      const device uint*, constant int&, constant int&, constant int&,             \
+      constant bool&, constant bool&, uint3, uint3);                               \
+  template [[host_name("radix_scatter_fused_final_" #T "_" #RBITS "bit")]]         \
+  kernel void radix_scatter<T, uint, long, RBN, EPT, RBITS, true>(                 \
+      const device T*, const device uint*, device T*, device long*,                \
+      const device uint*, constant int&, constant int&, constant int&,             \
+      constant bool&, constant bool&, uint3, uint3);                               \
+  /* u16 variants: used when sort_size ≤ 65536 — intermediate indices fit in     \
+     ushort, halving the index buffer bandwidth. Only scatter needs u16; the     \
+     count kernel reads only keys, and the final pass outputs int64. */           \
+  template [[host_name("radix_scatter_" #T "_" #RBITS "bit_u16")]]                 \
+  kernel void radix_scatter<T, ushort, ushort, RBN, EPT, RBITS, false>(            \
+      const device T*, const device ushort*, device T*, device ushort*,            \
+      const device uint*, constant int&, constant int&, constant int&,             \
+      constant bool&, constant bool&, uint3, uint3);                               \
+  template [[host_name("radix_scatter_final_" #T "_" #RBITS "bit_u16")]]           \
+  kernel void radix_scatter<T, ushort, long, RBN, EPT, RBITS, false>(              \
+      const device T*, const device ushort*, device T*, device long*,              \
+      const device uint*, constant int&, constant int&, constant int&,             \
+      constant bool&, constant bool&, uint3, uint3);                               \
+  template [[host_name("radix_scatter_fused_" #T "_" #RBITS "bit_u16")]]           \
+  kernel void radix_scatter<T, ushort, ushort, RBN, EPT, RBITS, true>(             \
+      const device T*, const device ushort*, device T*, device ushort*,            \
+      const device uint*, constant int&, constant int&, constant int&,             \
+      constant bool&, constant bool&, uint3, uint3);                               \
+  template [[host_name("radix_scatter_fused_final_" #T "_" #RBITS "bit_u16")]]     \
+  kernel void radix_scatter<T, ushort, long, RBN, EPT, RBITS, true>(               \
+      const device T*, const device ushort*, device T*, device long*,              \
+      const device uint*, constant int&, constant int&, constant int&,             \
       constant bool&, constant bool&, uint3, uint3);
 
 INSTANTIATE_RADIX(char, 512, 8, 4);
@@ -965,3 +994,58 @@ INSTANTIATE_RADIX(bfloat, 1024, 4, 8);
 INSTANTIATE_RADIX(short, 1024, 4, 8);
 INSTANTIATE_RADIX(float, 512, 4, 8);
 INSTANTIATE_RADIX(int, 512, 4, 8);
+
+// Alternative smaller-TG instantiation for 2-byte types with BN-suffixed names.
+// NPB=512*4=2048 (half of default) — halves tgmem so more concurrent TGs per
+// GPU core. Used when n_rows >= 32 (enough TGs for occupancy gains).
+#define INSTANTIATE_RADIX_BN512(T)                                                \
+  template [[host_name("radix_count_" #T "_8bit_bn512")]]                         \
+  kernel void radix_count<T, 512, 4, 8>(                                          \
+      const device T*, device uint*, constant int&, constant int&,                \
+      constant int&, constant bool&, uint3, uint3);                               \
+  template [[host_name("radix_scatter_" #T "_8bit_bn512")]]                       \
+  kernel void radix_scatter<T, uint, uint, 512, 4, 8, false>(                     \
+      const device T*, const device uint*, device T*, device uint*,               \
+      const device uint*, constant int&, constant int&, constant int&,            \
+      constant bool&, constant bool&, uint3, uint3);                              \
+  template [[host_name("radix_scatter_final_" #T "_8bit_bn512")]]                 \
+  kernel void radix_scatter<T, uint, long, 512, 4, 8, false>(                     \
+      const device T*, const device uint*, device T*, device long*,               \
+      const device uint*, constant int&, constant int&, constant int&,            \
+      constant bool&, constant bool&, uint3, uint3);                              \
+  template [[host_name("radix_scatter_fused_" #T "_8bit_bn512")]]                 \
+  kernel void radix_scatter<T, uint, uint, 512, 4, 8, true>(                      \
+      const device T*, const device uint*, device T*, device uint*,               \
+      const device uint*, constant int&, constant int&, constant int&,            \
+      constant bool&, constant bool&, uint3, uint3);                              \
+  template [[host_name("radix_scatter_fused_final_" #T "_8bit_bn512")]]           \
+  kernel void radix_scatter<T, uint, long, 512, 4, 8, true>(                      \
+      const device T*, const device uint*, device T*, device long*,               \
+      const device uint*, constant int&, constant int&, constant int&,            \
+      constant bool&, constant bool&, uint3, uint3);                              \
+  /* u16 variants for bn512. */                                                   \
+  template [[host_name("radix_scatter_" #T "_8bit_bn512_u16")]]                   \
+  kernel void radix_scatter<T, ushort, ushort, 512, 4, 8, false>(                 \
+      const device T*, const device ushort*, device T*, device ushort*,           \
+      const device uint*, constant int&, constant int&, constant int&,            \
+      constant bool&, constant bool&, uint3, uint3);                              \
+  template [[host_name("radix_scatter_final_" #T "_8bit_bn512_u16")]]             \
+  kernel void radix_scatter<T, ushort, long, 512, 4, 8, false>(                   \
+      const device T*, const device ushort*, device T*, device long*,             \
+      const device uint*, constant int&, constant int&, constant int&,            \
+      constant bool&, constant bool&, uint3, uint3);                              \
+  template [[host_name("radix_scatter_fused_" #T "_8bit_bn512_u16")]]             \
+  kernel void radix_scatter<T, ushort, ushort, 512, 4, 8, true>(                  \
+      const device T*, const device ushort*, device T*, device ushort*,           \
+      const device uint*, constant int&, constant int&, constant int&,            \
+      constant bool&, constant bool&, uint3, uint3);                              \
+  template [[host_name("radix_scatter_fused_final_" #T "_8bit_bn512_u16")]]       \
+  kernel void radix_scatter<T, ushort, long, 512, 4, 8, true>(                    \
+      const device T*, const device ushort*, device T*, device long*,             \
+      const device uint*, constant int&, constant int&, constant int&,            \
+      constant bool&, constant bool&, uint3, uint3);
+
+INSTANTIATE_RADIX_BN512(half);
+INSTANTIATE_RADIX_BN512(bfloat);
+INSTANTIATE_RADIX_BN512(short);
+

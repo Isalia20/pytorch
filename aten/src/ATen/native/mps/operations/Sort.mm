@@ -130,6 +130,10 @@ static void sort_multi_block(const Tensor& input,
 
   auto opts_val = values.options();
   auto opts_u32 = at::TensorOptions().dtype(at::kInt).device(values.device());
+  // Use int16 storage reinterpreted as ushort in the kernel: halves the
+  // intermediate index memory traffic. Only valid when global indices fit in
+  // 16 bits (sort_size ≤ 65536). The kernel never treats these as signed.
+  auto opts_u16 = at::TensorOptions().dtype(at::kShort).device(values.device());
 
   bool need_permute = (dim != input.ndimension() - 1);
   Tensor work_in = input;
@@ -148,24 +152,33 @@ static void sort_multi_block(const Tensor& input,
     n_blocks = at::ceil_div(sort_size, npb);
   }
 
+  // u16 index variant is only safe when the kernel can emit int64 indices on
+  // the last merge round (direct_final_write). If we need a permute-back
+  // copy, we'd have to interpret the u16 values as unsigned; since PyTorch's
+  // kShort→kLong copy sign-extends, that would corrupt indices ≥ 32768. So
+  // restrict u16 to the non-permute path.
+  const bool direct_final_write = !need_permute;
+  const bool use_u16 = direct_final_write && sort_size <= 65536;
+  auto opts_idx = use_u16 ? opts_u16 : opts_u32;
+
   Tensor dev_vals_0 = at::empty({n_rows, sort_size}, opts_val);
-  Tensor dev_idxs_0 = at::empty({n_rows, sort_size}, opts_u32);
+  Tensor dev_idxs_0 = at::empty({n_rows, sort_size}, opts_idx);
   Tensor dev_vals_1, dev_idxs_1;
   if (n_blocks > 1) {
     dev_vals_1 = at::empty({n_rows, sort_size}, opts_val);
-    dev_idxs_1 = at::empty({n_rows, sort_size}, opts_u32);
+    dev_idxs_1 = at::empty({n_rows, sort_size}, opts_idx);
   }
 
   MPSStream* mpsStream = getCurrentMPSStream();
   const std::string type_str = scalarToMetalTypeString(values);
   const std::string bn_str = "_bn" + std::to_string(bn);
-  const std::string block_kernel = "mb_sort_block_" + type_str + bn_str;
-  const std::string merge_kernel = "mb_merge_" + type_str + bn_str;
-  const std::string merge_final_kernel = "mb_merge_final_" + type_str + bn_str;
+  const std::string u16_suffix = use_u16 ? "_u16" : "";
+  const std::string block_kernel = "mb_sort_block_" + type_str + bn_str + u16_suffix;
+  const std::string merge_kernel = "mb_merge_" + type_str + bn_str + u16_suffix;
+  const std::string merge_final_kernel = "mb_merge_final_" + type_str + bn_str + u16_suffix;
 
   int total_rounds = 0;
   for (int m = 2; (m / 2) < n_blocks; m *= 2) ++total_rounds;
-  const bool direct_final_write = !need_permute;
 
   // Batch block sort + all merge rounds into one GCD dispatch_sync. The encoder
   // is shared across dispatches via MPSStream, so this only affects CPU-side
@@ -284,10 +297,18 @@ static void sort_radix(const Tensor& input,
   else if (elem_size == 4) n_passes = 4;  // 8-bit × 4 passes
   else TORCH_CHECK(false, "Radix sort not supported for element size ", elem_size);
 
-  // 2-byte types use RBN=1024,EPT=4 (same NPB=4096 but 2x threads/TG for more
-  // parallelism in scatter's binary-split ladder). 1-byte / 4-byte stay at
-  // RBN=512 where the different EPT keeps NPB in the same 4KB window.
-  const int RADIX_BN = (elem_size == 2) ? 1024 : 512;
+  // 2-byte types: default RBN=1024,EPT=4 (NPB=4096). For many-rows configs
+  // (n_rows >= 32), drop to RBN=512,EPT=4 (NPB=2048) — halves per-TG tgmem so
+  // ~2x TGs fit per core, yielding ~6% improvement on [256, 16384] f16.
+  // 1-byte / 4-byte stay at RBN=512.
+  // Env var PYTORCH_MPS_SORT_SMALL_TG=0 disables the auto heuristic.
+  static const bool small_tg_env_disable = []() {
+    const char* e = std::getenv("PYTORCH_MPS_SORT_SMALL_TG");
+    return e && std::string(e) == "0";
+  }();
+  const bool small_tg = !small_tg_env_disable && elem_size == 2 && n_rows >= 32;
+  const int RADIX_BN = small_tg ? 512
+                                : ((elem_size == 2) ? 1024 : 512);
   const int radix_ept = (elem_size >= 4) ? 4 : ((elem_size == 2) ? 4 : 8);
   const int RADIX_NPB = RADIX_BN * radix_ept;
   int n_blocks = at::ceil_div(sort_size, RADIX_NPB);
@@ -295,20 +316,31 @@ static void sort_radix(const Tensor& input,
 
   auto opts_val = values.options();
   auto opts_u32 = at::TensorOptions().dtype(at::kInt).device(values.device());
+  // u16 index variant is only safe when the final pass can write int64
+  // directly (direct_final_write), since host-side kShort→kLong copy would
+  // sign-extend and corrupt indices ≥ 32768. Restrict to non-permute path.
+  const bool direct_final_write = !need_permute;
+  const bool use_u16 = direct_final_write && sort_size <= 65536;
+  auto opts_idx = use_u16
+      ? at::TensorOptions().dtype(at::kShort).device(values.device())
+      : opts_u32;
 
   Tensor keys_0 = work_in.reshape({n_rows, sort_size}).contiguous();
   Tensor keys_1 = at::empty({n_rows, sort_size}, opts_val);
-  Tensor idxs_0 = at::empty({n_rows, sort_size}, opts_u32);
-  Tensor idxs_1 = at::empty({n_rows, sort_size}, opts_u32);
+  Tensor idxs_0 = at::empty({n_rows, sort_size}, opts_idx);
+  Tensor idxs_1 = at::empty({n_rows, sort_size}, opts_idx);
   Tensor histograms = at::empty({n_rows, n_entries}, opts_u32);
 
   const std::string type_str = scalarToMetalTypeString(values);
   const std::string rbits_suffix = "_" + std::to_string(radix_bits) + "bit";
-  const std::string count_kernel = "radix_count_" + type_str + rbits_suffix;
+  const std::string bn_suffix = small_tg ? "_bn512" : "";
+  const std::string u16_suffix = use_u16 ? "_u16" : "";
+  const std::string count_kernel = "radix_count_" + type_str + rbits_suffix + bn_suffix;
 
   // Fuse scan into scatter when n_blocks is small (fits in scatter's tgmem
   // scratch). Saves one dispatch per pass. Skip for large n_blocks where the
   // per-TG redundant scan work would exceed the dispatch saved.
+  // kMaxFusedBlocks must match the .metal constant (4).
   constexpr int kMaxFusedBlocks = 4;
   constexpr int kFusedWorkCap = 128; // n_blocks² × n_rows
   const bool use_fused_scan =
@@ -316,11 +348,9 @@ static void sort_radix(const Tensor& input,
       (n_blocks * n_blocks * n_rows <= kFusedWorkCap);
   const std::string scatter_suffix = use_fused_scan ? "fused_" : "";
   const std::string scatter_kernel =
-      "radix_scatter_" + scatter_suffix + type_str + rbits_suffix;
+      "radix_scatter_" + scatter_suffix + type_str + rbits_suffix + bn_suffix + u16_suffix;
   const std::string scatter_final_kernel =
-      "radix_scatter_" + scatter_suffix + "final_" + type_str + rbits_suffix;
-
-  const bool direct_final_write = !need_permute;
+      "radix_scatter_" + scatter_suffix + "final_" + type_str + rbits_suffix + bn_suffix + u16_suffix;
   MPSStream* mpsStream = getCurrentMPSStream();
 
   // All radix passes coalesce into a single GCD dispatch_sync to avoid
@@ -359,8 +389,9 @@ static void sort_radix(const Tensor& input,
         if (!use_fused_scan) {
           [enc setComputePipelineState:scan_pso];
           mtl_setArgs(enc, histograms, n_entries);
+          // SCAN_BN in Sort.metal is 1024 — keep in sync.
           [enc dispatchThreadgroups:MTLSizeMake(1, n_rows, 1)
-               threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+               threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
         }
 
         [enc setComputePipelineState:use_direct ? scatter_final_pso : scatter_pso];
@@ -406,6 +437,17 @@ static void sort_radix(const Tensor& input,
 // with a few more dispatches the full-kernel cost is usually lower on MPS.
 static bool should_use_radix(int sort_size, size_t elem_size, int n_rows) {
   if (elem_size > 4) return false;
+  // Env-var overrides for A/B testing.
+  static const int force_path = []() {
+    const char* e = std::getenv("PYTORCH_MPS_SORT_FORCE");
+    if (!e) return 0;
+    std::string s(e);
+    if (s == "merge") return -1;
+    if (s == "radix") return 1;
+    return 0;
+  }();
+  if (force_path == -1) return false;
+  if (force_path == 1) return true;
   int n_blocks_merge = at::ceil_div(sort_size, 4096);
   int merge_rounds = 0;
   for (int m = 2; (m / 2) < n_blocks_merge; m *= 2) merge_rounds++;
