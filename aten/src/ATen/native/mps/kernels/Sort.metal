@@ -111,7 +111,120 @@ inline int merge_partition_global(
   return hi;
 }
 
+// ====================== SIMD bitonic sort ======================
+// Sort 32*TN items across a 32-lane SIMD using in-register shuffles,
+// no threadgroup memory. Each sub-phase is a constexpr offset so the
+// compiler specializes the within-thread (offset < TN) vs cross-lane
+// (offset ≥ TN) branch at compile time.
+
+template <typename T>
+inline T sort_shuffle_xor(T v, ushort delta) {
+  if constexpr (is_same_v<T, bool>) {
+    return bool(simd_shuffle_xor(uint(v), delta));
+  } else if constexpr (sizeof(T) == 1) {
+    uchar u = as_type<uchar>(v);
+    return as_type<T>(uchar(simd_shuffle_xor(uint(u), delta)));
+  } else if constexpr (sizeof(T) == 2) {
+    ushort u = as_type<ushort>(v);
+    return as_type<T>(ushort(simd_shuffle_xor(uint(u), delta)));
+  } else if constexpr (sizeof(T) == 8) {
+    ulong u = as_type<ulong>(v);
+    uint lo = simd_shuffle_xor(uint(u), delta);
+    uint hi = simd_shuffle_xor(uint(u >> 32), delta);
+    return as_type<T>(ulong(lo) | (ulong(hi) << 32));
+  } else {
+    return simd_shuffle_xor(v, delta);
+  }
+}
+
+// A single bitonic compare-swap substage at a known compile-time OFFSET
+// within the global index (lane*TN + i). K is 1 << phase.
+template <typename T, typename IdxT, short TN, int K, int OFFSET>
+inline void bitonic_substage(
+    thread T (&v)[TN], thread IdxT (&idx)[TN], uint lane, bool desc) {
+  if constexpr (OFFSET < TN) {
+    // Within-thread swap; partner index in same thread's registers.
+    _Pragma("clang loop unroll(full)") for (short i = 0; i < TN; ++i) {
+      short pi = i ^ OFFSET;
+      if (pi > i) {
+        int global_p = int(lane) * TN + i;
+        bool ascending = (global_p & K) == 0;
+        T vi = v[i], vp = v[pi];
+        IdxT ii = idx[i], ip = idx[pi];
+        bool vi_first = sort_compare(vi, vp, desc);
+        bool do_swap = ascending ? !vi_first : vi_first;
+        v[i] = do_swap ? vp : vi;
+        v[pi] = do_swap ? vi : vp;
+        idx[i] = do_swap ? ip : ii;
+        idx[pi] = do_swap ? ii : ip;
+      }
+    }
+  } else {
+    // Cross-lane swap; partner in lane XOR (OFFSET/TN), same position i.
+    constexpr ushort LANE_OFFSET = OFFSET / TN;
+    bool i_am_low = (lane & uint(LANE_OFFSET)) == 0;
+    _Pragma("clang loop unroll(full)") for (short i = 0; i < TN; ++i) {
+      T vi = v[i];
+      IdxT ii = idx[i];
+      T vp = sort_shuffle_xor(vi, LANE_OFFSET);
+      IdxT ip = sort_shuffle_xor(ii, LANE_OFFSET);
+      int global_p = int(lane) * TN + i;
+      bool ascending = (global_p & K) == 0;
+      bool vi_first = sort_compare(vi, vp, desc);
+      bool should_take = vi_first != (ascending == i_am_low);
+      v[i] = should_take ? vp : vi;
+      idx[i] = should_take ? ip : ii;
+    }
+  }
+}
+
+// Hand-unrolled SIMD bitonic sort for TN=4 (32*TN = 128 items per SIMD).
+// Phases 1..7, each with phase substages. All offsets constexpr so the
+// compiler emits straight-line code.
+template <typename T, typename IdxT>
+inline void simd_bitonic_sort4(
+    thread T (&v)[4], thread IdxT (&idx)[4], uint lane, bool desc) {
+  // Phase 1 (K=2): step 0
+  bitonic_substage<T, IdxT, 4, 2, 1>(v, idx, lane, desc);
+  // Phase 2 (K=4): steps 1, 0
+  bitonic_substage<T, IdxT, 4, 4, 2>(v, idx, lane, desc);
+  bitonic_substage<T, IdxT, 4, 4, 1>(v, idx, lane, desc);
+  // Phase 3 (K=8): steps 2, 1, 0
+  bitonic_substage<T, IdxT, 4, 8, 4>(v, idx, lane, desc);
+  bitonic_substage<T, IdxT, 4, 8, 2>(v, idx, lane, desc);
+  bitonic_substage<T, IdxT, 4, 8, 1>(v, idx, lane, desc);
+  // Phase 4 (K=16): steps 3, 2, 1, 0
+  bitonic_substage<T, IdxT, 4, 16, 8>(v, idx, lane, desc);
+  bitonic_substage<T, IdxT, 4, 16, 4>(v, idx, lane, desc);
+  bitonic_substage<T, IdxT, 4, 16, 2>(v, idx, lane, desc);
+  bitonic_substage<T, IdxT, 4, 16, 1>(v, idx, lane, desc);
+  // Phase 5 (K=32): 4, 3, 2, 1, 0
+  bitonic_substage<T, IdxT, 4, 32, 16>(v, idx, lane, desc);
+  bitonic_substage<T, IdxT, 4, 32, 8>(v, idx, lane, desc);
+  bitonic_substage<T, IdxT, 4, 32, 4>(v, idx, lane, desc);
+  bitonic_substage<T, IdxT, 4, 32, 2>(v, idx, lane, desc);
+  bitonic_substage<T, IdxT, 4, 32, 1>(v, idx, lane, desc);
+  // Phase 6 (K=64): 5..0
+  bitonic_substage<T, IdxT, 4, 64, 32>(v, idx, lane, desc);
+  bitonic_substage<T, IdxT, 4, 64, 16>(v, idx, lane, desc);
+  bitonic_substage<T, IdxT, 4, 64, 8>(v, idx, lane, desc);
+  bitonic_substage<T, IdxT, 4, 64, 4>(v, idx, lane, desc);
+  bitonic_substage<T, IdxT, 4, 64, 2>(v, idx, lane, desc);
+  bitonic_substage<T, IdxT, 4, 64, 1>(v, idx, lane, desc);
+  // Phase 7 (K=128): 6..0
+  bitonic_substage<T, IdxT, 4, 128, 64>(v, idx, lane, desc);
+  bitonic_substage<T, IdxT, 4, 128, 32>(v, idx, lane, desc);
+  bitonic_substage<T, IdxT, 4, 128, 16>(v, idx, lane, desc);
+  bitonic_substage<T, IdxT, 4, 128, 8>(v, idx, lane, desc);
+  bitonic_substage<T, IdxT, 4, 128, 4>(v, idx, lane, desc);
+  bitonic_substage<T, IdxT, 4, 128, 2>(v, idx, lane, desc);
+  bitonic_substage<T, IdxT, 4, 128, 1>(v, idx, lane, desc);
+}
+
 // ====================== Block merge sort ======================
+// SIMD bitonic handles mt = 2..32 (5 rounds equivalent) with zero
+// threadgroup traffic. Cross-SIMD rounds (mt = 64..BN) keep the classic
+// threadgroup-mem partition+merge pattern.
 
 template <typename T, typename IdxT, short BN, short TN>
 inline void block_merge_sort(
@@ -120,9 +233,31 @@ inline void block_merge_sort(
   int base = lid * TN;
   thread T lv[TN]; thread IdxT li[TN];
   for (int i = 0; i < TN; ++i) { lv[i] = tv[base+i]; li[i] = ti[base+i]; }
-  if (base < size) thread_sort<T, IdxT, TN>(lv, li, desc);
 
-  for (int mt = 2; mt <= BN; mt *= 2) {
+  if constexpr (TN == 4 && BN >= 32) {
+    // Hand-unrolled SIMD bitonic sort: sorts 128 items within each SIMD.
+    simd_bitonic_sort4<T, IdxT>(lv, li, lid & 31u, desc);
+  } else {
+    // Fallback: classic thread_sort + threadgroup rounds up to mt=32.
+    if (base < size) thread_sort<T, IdxT, TN>(lv, li, desc);
+    for (int mt = 2; mt <= 32 && mt <= BN; mt *= 2) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int i = 0; i < TN; ++i) { tv[base+i] = lv[i]; ti[base+i] = li[i]; }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      int grp = lid / mt, lane = lid % mt;
+      int sz = TN * mt, st = sz * grp;
+      int hsz = sz / 2;
+      int diag = TN * lane;
+      int p = merge_partition(tv + st, tv + st + hsz, hsz, hsz, diag, desc);
+      merge_step<T, IdxT, TN>(
+          tv + st + p, tv + st + hsz + diag - p,
+          ti + st + p, ti + st + hsz + diag - p,
+          hsz - p, hsz - diag + p, lv, li, desc);
+    }
+  }
+
+  for (int mt = 64; mt <= BN; mt *= 2) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int i = 0; i < TN; ++i) { tv[base+i] = lv[i]; ti[base+i] = li[i]; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -143,15 +278,19 @@ inline void block_merge_sort(
 
 // ====================== Single-block sort ======================
 // Outputs int64 indices directly since there's no intermediate buffer.
+// Reads input with a (stride_sort, stride_seg) layout (so we can skip the
+// caller-side values.copy_(self) for contiguous or last-dim-strided inputs)
+// and writes output contiguously to out_vals/out_idx.
 
 template <typename T, short BN, short TN>
 kernel void sort_block(
-    device T* vals [[buffer(0)]],
-    device long* out_idx [[buffer(1)]],
-    constant int& size [[buffer(2)]],
-    constant long& stride_sort [[buffer(3)]],
-    constant long& stride_seg [[buffer(4)]],
-    constant bool& desc [[buffer(5)]],
+    const device T* inp [[buffer(0)]],
+    device T* out_vals [[buffer(1)]],
+    device long* out_idx [[buffer(2)]],
+    constant int& size [[buffer(3)]],
+    constant long& stride_sort [[buffer(4)]],
+    constant long& stride_seg [[buffer(5)]],
+    constant bool& desc [[buffer(6)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]]) {
   constexpr int NPB = BN * TN;
@@ -159,17 +298,18 @@ kernel void sort_block(
   threadgroup uint tgi[NPB];
 
   T init = sort_init<T>(desc);
-  long base = tid.y * stride_seg;
+  long base_in = tid.y * stride_seg;
+  long base_out = long(tid.y) * long(size);
   for (int i = lid.x; i < NPB; i += BN) {
-    tgv[i] = i < size ? vals[base + i * stride_sort] : init;
+    tgv[i] = i < size ? inp[base_in + i * stride_sort] : init;
     tgi[i] = i;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   block_merge_sort<T, uint, BN, TN>(tgv, tgi, size, lid.x, desc);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (int i = lid.x; i < size; i += BN) {
-    vals[base + i * stride_sort] = tgv[i];
-    out_idx[base + i * stride_sort] = long(tgi[i]);
+    out_vals[base_out + i] = tgv[i];
+    out_idx[base_out + i] = long(tgi[i]);
   }
 }
 
@@ -207,63 +347,68 @@ kernel void mb_sort_block(
   }
 }
 
-template <typename T, short BN, short TN>
-kernel void mb_partition(
-    device int* parts [[buffer(0)]],
-    const device T* dv [[buffer(1)]],
-    constant int& size [[buffer(2)]],
-    constant int& merge_tiles [[buffer(3)]],
-    constant int& n_blocks [[buffer(4)]],
-    constant bool& desc [[buffer(5)]],
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint3 lid [[thread_position_in_threadgroup]],
-    uint3 tgp [[threads_per_threadgroup]]) {
-  constexpr int NPB = BN * TN;
-  parts += tid.y * (n_blocks + 1);
-  const device T* rv = dv + tid.y * size;
-  for (int i = lid.x; i <= n_blocks; i += tgp.x) {
-    int mg = i / merge_tiles, ml = i % merge_tiles;
-    int ssz = NPB * merge_tiles, sst = ssz * mg;
-    int Ast = min(size, sst), Aed = min(size, sst + ssz/2);
-    int Bst = Aed, Bed = min(size, Bst + ssz/2);
-    int pat = min(Bed - Ast, NPB * ml);
-    parts[i] = Ast + merge_partition_global(
-        rv + Ast, rv + Bst, Aed - Ast, Bed - Bst, pat, desc);
-  }
-}
-
-// Templated on OutIdxT so the last merge round can write int64 indices directly
-// into the caller's output tensor (skipping a uint32→int64 copy).
+// Merge kernel with inline per-block partition.  Each block used to read
+// precomputed Ast/Aed from a partitions buffer written by a separate
+// `mb_partition` dispatch; now we just redo the two binary searches locally
+// (O(log(NPB*merge_tiles)) global reads, well inside L1). Saves one
+// dispatch per merge round.
+// Templated on OutIdxT so the last merge round can write int64 indices
+// directly into the caller's output tensor (skipping a uint32→int64 copy).
 template <typename T, typename OutIdxT, short BN, short TN>
 kernel void mb_merge(
-    const device int* parts [[buffer(0)]],
-    const device T* vi [[buffer(1)]],
-    const device uint* ii [[buffer(2)]],
-    device T* vo [[buffer(3)]],
-    device OutIdxT* io [[buffer(4)]],
-    constant int& size [[buffer(5)]],
-    constant int& merge_tiles [[buffer(6)]],
-    constant int& n_blocks [[buffer(7)]],
-    constant bool& desc [[buffer(8)]],
+    const device T* vi [[buffer(0)]],
+    const device uint* ii [[buffer(1)]],
+    device T* vo [[buffer(2)]],
+    device OutIdxT* io [[buffer(3)]],
+    constant int& size [[buffer(4)]],
+    constant int& merge_tiles [[buffer(5)]],
+    constant int& n_blocks [[buffer(6)]],
+    constant bool& desc [[buffer(7)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]]) {
   constexpr int NPB = BN * TN;
   T init = sort_init<T>(desc);
-  int rp = n_blocks + 1;
-  parts += tid.y * rp;
   vi += tid.y * size; ii += tid.y * size;
   vo += tid.y * size; io += tid.y * size;
 
   int bi = tid.x, mg = bi / merge_tiles;
   int sst = NPB * merge_tiles * mg, ssz = NPB * merge_tiles;
   int smd = NPB * bi - sst;
-  int Ast = parts[bi], Aed = parts[bi + 1];
+
+  // Inline partition: at smaller BN we have threadgroup-memory headroom,
+  // so thread 0 does the two binary searches and broadcasts. At BN=1024
+  // we're at the 32KB threadgroup limit from tgv/tgi (NPB=4096 × 8 bytes
+  // for 4-byte T), so we fall back to having every thread redo the
+  // binary search — same global addresses across lanes means L1 absorbs
+  // the reads and the SIMD-lockstep cost matches one thread's work.
+  constexpr int kMaxTG = 32768;
+  constexpr int kTgvTgiBytes = NPB * (int)sizeof(T) + NPB * (int)sizeof(uint);
+  constexpr bool kUseBroadcast = kTgvTgiBytes + 2 * (int)sizeof(int) <= kMaxTG;
+  int A0 = min(size, sst);
+  int A1 = min(size, sst + ssz/2);
+  int B0 = A1;
+  int B1 = min(size, A1 + ssz/2);
+  int ml = bi % merge_tiles;
+  int asz0 = A1 - A0, bsz0 = B1 - B0;
+  int diag_lo = min(asz0 + bsz0, NPB * ml);
+  int diag_hi = min(asz0 + bsz0, NPB * (ml + 1));
+  int Ast, Aed;
+  if (kUseBroadcast) {
+    threadgroup int bcast[2];
+    if (lid.x == 0) {
+      bcast[0] = A0 + merge_partition_global(vi + A0, vi + B0, asz0, bsz0, diag_lo, desc);
+      bcast[1] = A0 + merge_partition_global(vi + A0, vi + B0, asz0, bsz0, diag_hi, desc);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    Ast = bcast[0];
+    Aed = bcast[1];
+  } else {
+    Ast = A0 + merge_partition_global(vi + A0, vi + B0, asz0, bsz0, diag_lo, desc);
+    Aed = A0 + merge_partition_global(vi + A0, vi + B0, asz0, bsz0, diag_hi, desc);
+  }
+
   int Bst = min(size, 2*sst + ssz/2 + smd - Ast);
   int Bed = min(size, 2*sst + ssz/2 + smd + NPB - Aed);
-  if ((bi % merge_tiles) == merge_tiles - 1) {
-    Aed = min(size, sst + ssz/2);
-    Bed = min(size, sst + ssz);
-  }
   int Asz = Aed - Ast, Bsz = Bed - Bst;
 
   thread T lv[TN]; thread uint li[TN];
@@ -485,13 +630,18 @@ kernel void radix_scan(
 // consecutive global writes.
 // Templated on OutIdxT so the last pass can write int64 indices directly into
 // the public output tensor, skipping a uint32→int64 copy after the sort.
-template <typename T, typename OutIdxT, short RBN, short EPT, short RBITS>
+// FUSED_SCAN=true reads raw per-block counts and computes the scan in
+// threadgroup memory (saving one dispatch per pass). Only usable when
+// n_blocks ≤ kMaxFusedBlocks since we load the full n_entries into tgmem.
+constexpr constant int kMaxFusedBlocks = 4;
+template <typename T, typename OutIdxT, short RBN, short EPT, short RBITS,
+          bool FUSED_SCAN = false>
 kernel void radix_scatter(
     const device T* keys_in [[buffer(0)]],
     const device uint* vals_in [[buffer(1)]],
     device T* keys_out [[buffer(2)]],
     device OutIdxT* vals_out [[buffer(3)]],
-    const device uint* offsets [[buffer(4)]],
+    const device uint* offsets [[buffer(4)]],  // raw counts if FUSED_SCAN, else prefix-summed
     constant int& sort_size [[buffer(5)]],
     constant int& n_blocks [[buffer(6)]],
     constant int& shift [[buffer(7)]],
@@ -504,6 +654,7 @@ kernel void radix_scatter(
   constexpr int NPB = RBN * EPT;
   constexpr int SIMD_W = 32;
   constexpr int MAX_SIMD_GROUPS = RBN / SIMD_W;
+  constexpr int FUSED_BUF_SIZE = FUSED_SCAN ? RSIZE * kMaxFusedBlocks : 1;
   uint lid = lid3.x;
   uint simd_id = lid / SIMD_W;
   uint lane = lid & (SIMD_W - 1);
@@ -519,6 +670,7 @@ kernel void radix_scatter(
   threadgroup uint block_offsets[RSIZE];
   threadgroup uint digit_start[RSIZE];
   threadgroup atomic_uint local_hist[RSIZE];
+  threadgroup uint fused_buf[FUSED_BUF_SIZE];
 
   // 1) Strided (coalesced) load into stage.
   _Pragma("clang loop unroll(full)") for (int i = 0; i < EPT; ++i) {
@@ -667,8 +819,49 @@ kernel void radix_scatter(
       }
     }
   }
-  for (uint d = lid; d < uint(RSIZE); d += RBN)
-    block_offsets[d] = offsets[row * RSIZE * n_blocks + d * n_blocks + block_idx];
+  if (FUSED_SCAN) {
+    // Inline scan of raw per-block counts: load RSIZE*n_blocks entries,
+    // exclusive prefix sum cooperatively, then index out our block's digit
+    // offsets. Only valid when n_blocks ≤ kMaxFusedBlocks.
+    int n_entries = RSIZE * n_blocks;
+    for (int i = int(lid); i < n_entries; i += RBN) {
+      fused_buf[i] = offsets[row * n_entries + i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint chunk = (uint(n_entries) + RBN - 1) / RBN;
+    uint my_start = min(lid * chunk, uint(n_entries));
+    uint my_end = min(my_start + chunk, uint(n_entries));
+
+    uint local_sum = 0;
+    for (uint i = my_start; i < my_end; ++i) local_sum += fused_buf[i];
+
+    uint my_prefix = simd_prefix_exclusive_sum(local_sum);
+    uint simd_total = simd_sum(local_sum);
+    if (lane == 0) simd_sum_buf[simd_id] = simd_total;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_id == 0 && lane < uint(MAX_SIMD_GROUPS)) {
+      uint t = simd_sum_buf[lane];
+      simd_sum_buf[lane] = simd_prefix_exclusive_sum(t);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint my_base = simd_sum_buf[simd_id] + my_prefix;
+    uint running = my_base;
+    for (uint i = my_start; i < my_end; ++i) {
+      uint v = fused_buf[i];
+      fused_buf[i] = running;
+      running += v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint d = lid; d < uint(RSIZE); d += RBN)
+      block_offsets[d] = fused_buf[d * n_blocks + block_idx];
+  } else {
+    for (uint d = lid; d < uint(RSIZE); d += RBN)
+      block_offsets[d] = offsets[row * RSIZE * n_blocks + d * n_blocks + block_idx];
+  }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   // 5) Coalesced global write: strided read of stage (digit-sorted).
@@ -691,24 +884,20 @@ kernel void radix_scatter(
 #define INSTANTIATE_SORT(T, BN, TN)                                    \
   template [[host_name("sort_block_" #T "_bn" #BN)]]                  \
   kernel void sort_block<T, BN, TN>(                                   \
-      device T*, device long*, constant int&, constant long&,          \
-      constant long&, constant bool&, uint3, uint3);                   \
+      const device T*, device T*, device long*, constant int&,         \
+      constant long&, constant long&, constant bool&, uint3, uint3);   \
   template [[host_name("mb_sort_block_" #T "_bn" #BN)]]               \
   kernel void mb_sort_block<T, BN, TN>(                                \
       const device T*, device T*, device uint*, constant int&,         \
       constant long&, constant long&, constant bool&, uint3, uint3);   \
-  template [[host_name("mb_partition_" #T "_bn" #BN)]]                \
-  kernel void mb_partition<T, BN, TN>(                                 \
-      device int*, const device T*, constant int&, constant int&,      \
-      constant int&, constant bool&, uint3, uint3, uint3);             \
   template [[host_name("mb_merge_" #T "_bn" #BN)]]                    \
   kernel void mb_merge<T, uint, BN, TN>(                               \
-      const device int*, const device T*, const device uint*,          \
+      const device T*, const device uint*,                             \
       device T*, device uint*, constant int&, constant int&,           \
       constant int&, constant bool&, uint3, uint3);                    \
   template [[host_name("mb_merge_final_" #T "_bn" #BN)]]              \
   kernel void mb_merge<T, long, BN, TN>(                               \
-      const device int*, const device T*, const device uint*,          \
+      const device T*, const device uint*,                             \
       device T*, device long*, constant int&, constant int&,           \
       constant int&, constant bool&, uint3, uint3);
 
@@ -748,12 +937,22 @@ INSTANTIATE_ALL_BN_1024(bool);
       const device T*, device uint*, constant int&, constant int&,             \
       constant int&, constant bool&, uint3, uint3);                            \
   template [[host_name("radix_scatter_" #T "_" #RBITS "bit")]]                 \
-  kernel void radix_scatter<T, uint, RBN, EPT, RBITS>(                         \
+  kernel void radix_scatter<T, uint, RBN, EPT, RBITS, false>(                  \
       const device T*, const device uint*, device T*, device uint*,            \
       const device uint*, constant int&, constant int&, constant int&,         \
       constant bool&, constant bool&, uint3, uint3);                           \
   template [[host_name("radix_scatter_final_" #T "_" #RBITS "bit")]]           \
-  kernel void radix_scatter<T, long, RBN, EPT, RBITS>(                         \
+  kernel void radix_scatter<T, long, RBN, EPT, RBITS, false>(                  \
+      const device T*, const device uint*, device T*, device long*,            \
+      const device uint*, constant int&, constant int&, constant int&,         \
+      constant bool&, constant bool&, uint3, uint3);                           \
+  template [[host_name("radix_scatter_fused_" #T "_" #RBITS "bit")]]           \
+  kernel void radix_scatter<T, uint, RBN, EPT, RBITS, true>(                   \
+      const device T*, const device uint*, device T*, device uint*,            \
+      const device uint*, constant int&, constant int&, constant int&,         \
+      constant bool&, constant bool&, uint3, uint3);                           \
+  template [[host_name("radix_scatter_fused_final_" #T "_" #RBITS "bit")]]     \
+  kernel void radix_scatter<T, long, RBN, EPT, RBITS, true>(                   \
       const device T*, const device uint*, device T*, device long*,            \
       const device uint*, constant int&, constant int&, constant int&,         \
       constant bool&, constant bool&, uint3, uint3);
@@ -761,8 +960,8 @@ INSTANTIATE_ALL_BN_1024(bool);
 INSTANTIATE_RADIX(char, 512, 8, 4);
 INSTANTIATE_RADIX(uchar, 512, 8, 4);
 INSTANTIATE_RADIX(bool, 512, 8, 4);
-INSTANTIATE_RADIX(half, 512, 8, 8);
-INSTANTIATE_RADIX(bfloat, 512, 8, 8);
-INSTANTIATE_RADIX(short, 512, 8, 8);
+INSTANTIATE_RADIX(half, 1024, 4, 8);
+INSTANTIATE_RADIX(bfloat, 1024, 4, 8);
+INSTANTIATE_RADIX(short, 1024, 4, 8);
 INSTANTIATE_RADIX(float, 512, 4, 8);
 INSTANTIATE_RADIX(int, 512, 4, 8);

@@ -84,69 +84,29 @@ static int select_bn(int sort_size, size_t elem_size, int n_rows) {
   return bn;
 }
 
-// Single-block sort: the whole sort dimension fits in one threadgroup.
-static void sort_single_block(const Tensor& values,
+// Single-block sort (last-dim only). Reads `input` via (stride_sort, stride_seg),
+// writes sorted values + int64 indices contiguously into values/indices.
+static void sort_single_block(const Tensor& input,
+                              const Tensor& values,
                               const Tensor& indices,
-                              int64_t dim,
                               bool descending,
                               int sort_size,
+                              int64_t stride_sort,
+                              int64_t stride_seg,
                               int bn) {
-  int64_t inner_size = 1;
-  for (int64_t i = dim + 1; i < values.ndimension(); i++)
-    inner_size *= values.size(i);
-  int n_rows = static_cast<int>(values.numel() / sort_size);
-  int64_t stride_sorted = inner_size;
-
-  // For the segment stride: distance between row 0 and row 1 of the sort.
-  // For contiguous values sorted along a middle dim, this is the product of
-  // all dims from 0..dim (exclusive) times the inner block.  But the simplest
-  // formulation: stride_segment = values.stride(dim_before_sort_dim), i.e.
-  // we need to jump by one unit in the "next outer" dimension.
-  // Since values is contiguous and we iterate rows with tid.y, we set
-  // stride_segment = sort_size * inner_size when dim > 0.
-  // When dim == 0 and there are no outer dims, stride_segment is unused.
-  // Actually, for the general case: the n_rows rows correspond to all
-  // (outer_idx, inner_idx) pairs. We linearize them as:
-  //   row = outer_idx * inner_size + inner_idx
-  //   base = outer_idx * sort_size * inner_size + inner_idx
-  //        = (row / inner_size) * sort_size * inner_size + (row % inner_size)
-  // This can't be expressed as a single stride_segment. Let's fall back to
-  // a layout where we handle the addressing ourselves.
-  //
-  // Simplification: for contiguous tensors, stride_segment is the stride for
-  // the outer-most dimension that groups rows, but only works cleanly when
-  // dim is the last dimension (stride_sorted=1, stride_segment=sort_size).
-  // For general dims, we need inner_size.  The kernel computes:
-  //   base = tid.y * stride_segment
-  // So for last-dim sort: stride_segment = sort_size, stride_sorted = 1. ✓
-  // For mid-dim sort of shape [A, sort, B]:
-  //   row r → (outer=r/B, inner=r%B) → base = outer*sort*B + inner
-  //   = (r/B)*sort*B + r%B
-  //   This is NOT r * stride_segment for any single stride_segment.
-  //
-  // Solution: fall back to multi-block path for non-last-dim sorts with
-  // sort_size > 1, OR compute base in kernel from row index. Let's use the
-  // multi-block path for all sort dims (it handles contiguous intermediate
-  // buffers) and reserve single-block for last-dim only.
-
-  // This kernel only works when dim is the last dimension (stride_sorted = 1).
-  // For other dims, we go through multi_block which uses contiguous intermediates.
-  int64_t stride_segment = sort_size; // distance between consecutive rows
-
+  int n_rows = static_cast<int>(input.numel() / sort_size);
   const std::string kernel =
-      "sort_block_" + scalarToMetalTypeString(values) + "_bn" + std::to_string(bn);
+      "sort_block_" + scalarToMetalTypeString(input) + "_bn" + std::to_string(bn);
 
   MPSStream* mpsStream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
     @autoreleasepool {
       id<MTLComputeCommandEncoder> enc = mpsStream->commandEncoder();
       id<MTLComputePipelineState> pso = lib.getPipelineStateForFunc(kernel);
-      getMPSProfiler().beginProfileKernel(pso, kernel, {values});
-
+      getMPSProfiler().beginProfileKernel(pso, kernel, {input});
       [enc setComputePipelineState:pso];
-      mtl_setArgs(enc, values, indices,
-                  sort_size, stride_sorted, stride_segment, descending);
-
+      mtl_setArgs(enc, input, values, indices,
+                  sort_size, stride_sort, stride_seg, descending);
       [enc dispatchThreadgroups:MTLSizeMake(1, n_rows, 1)
            threadsPerThreadgroup:MTLSizeMake(bn, 1, 1)];
       getMPSProfiler().endProfileKernel(pso);
@@ -154,189 +114,136 @@ static void sort_single_block(const Tensor& values,
   });
 }
 
-// Multi-block sort: block sort → iterative partition+merge.
-static void sort_multi_block(const Tensor& values,
+// Multi-block sort: block sort → iterative merge (partition fused into merge).
+static void sort_multi_block(const Tensor& input,
+                             const Tensor& values,
                              const Tensor& indices,
                              int64_t dim,
                              bool descending,
                              int sort_size,
+                             int64_t in_stride_sort,
+                             int64_t in_stride_seg,
                              int bn) {
   int npb = bn * TN;
   int n_blocks = at::ceil_div(sort_size, npb);
-  int n_rows = static_cast<int>(values.numel() / sort_size);
+  int n_rows = static_cast<int>(input.numel() / sort_size);
 
-  int64_t stride_sorted = 1;
-  int64_t stride_segment = sort_size;
-  // We always work on contiguous intermediates, so stride = 1.
-
-  // Allocate intermediate buffers (contiguous, [n_rows, sort_size]).
-  // Use uint32 for indices internally to halve memory bandwidth;
-  // convert to int64 only on final output.
   auto opts_val = values.options();
   auto opts_u32 = at::TensorOptions().dtype(at::kInt).device(values.device());
 
+  bool need_permute = (dim != input.ndimension() - 1);
+  Tensor work_in = input;
+  int64_t stride_sort = in_stride_sort;
+  int64_t stride_seg = in_stride_seg;
+  if (need_permute) {
+    std::vector<int64_t> perm;
+    for (int64_t i = 0; i < input.ndimension(); i++)
+      if (i != dim) perm.push_back(i);
+    perm.push_back(dim);
+    work_in = input.permute(perm).contiguous();
+    sort_size = work_in.size(work_in.ndimension() - 1);
+    n_rows = static_cast<int>(work_in.numel() / sort_size);
+    stride_sort = 1;
+    stride_seg = sort_size;
+    n_blocks = at::ceil_div(sort_size, npb);
+  }
+
   Tensor dev_vals_0 = at::empty({n_rows, sort_size}, opts_val);
-  Tensor dev_vals_1 = at::empty({n_rows, sort_size}, opts_val);
   Tensor dev_idxs_0 = at::empty({n_rows, sort_size}, opts_u32);
-  Tensor dev_idxs_1 = at::empty({n_rows, sort_size}, opts_u32);
-  Tensor block_parts = at::empty({n_rows, n_blocks + 1}, opts_u32);
+  Tensor dev_vals_1, dev_idxs_1;
+  if (n_blocks > 1) {
+    dev_vals_1 = at::empty({n_rows, sort_size}, opts_val);
+    dev_idxs_1 = at::empty({n_rows, sort_size}, opts_u32);
+  }
 
   MPSStream* mpsStream = getCurrentMPSStream();
   const std::string type_str = scalarToMetalTypeString(values);
   const std::string bn_str = "_bn" + std::to_string(bn);
+  const std::string block_kernel = "mb_sort_block_" + type_str + bn_str;
+  const std::string merge_kernel = "mb_merge_" + type_str + bn_str;
+  const std::string merge_final_kernel = "mb_merge_final_" + type_str + bn_str;
 
-  // Compute strides for reading strided input
-  int64_t inner_size = 1;
-  for (int64_t i = dim + 1; i < values.ndimension(); i++)
-    inner_size *= values.size(i);
-  int64_t in_stride_sorted = inner_size;
-  // For the segment stride of the INPUT (values): distance between rows.
-  // row r → base = (r / inner_size) * sort_size * inner_size + (r % inner_size)
-  // This isn't a single stride. We handle it by passing inner_size and computing
-  // in the kernel.  BUT our kernel expects a simple stride_segment.
-  // Workaround: permute the input so the sort dim is last, making it contiguous.
-  // Since values is already a contiguous copy of self, we can reshape.
+  int total_rounds = 0;
+  for (int m = 2; (m / 2) < n_blocks; m *= 2) ++total_rounds;
+  const bool direct_final_write = !need_permute;
 
-  // Actually: let's just handle the general case. For the mb_sort_block kernel,
-  // we pass stride_sorted_axis and stride_segment. stride_segment should give us
-  // the row offset. For last dim, stride_sorted=1, stride_segment=sort_size.
-  // For other dims: not a simple stride.
-  //
-  // Fix: if dim != last dim, permute values so sort dim is last, sort, permute back.
-  bool need_permute = (dim != values.ndimension() - 1);
-  Tensor work_vals = values;
-  if (need_permute) {
-    std::vector<int64_t> perm;
-    for (int64_t i = 0; i < values.ndimension(); i++)
-      if (i != dim) perm.push_back(i);
-    perm.push_back(dim);
-    work_vals = values.permute(perm).contiguous();
-    // Now work_vals has sort dim last, shape [..., sort_size], contiguous
-    sort_size = work_vals.size(work_vals.ndimension() - 1);
-    n_rows = static_cast<int>(work_vals.numel() / sort_size);
-    in_stride_sorted = 1;
-
-    dev_vals_0 = at::empty({n_rows, sort_size}, opts_val);
-    dev_vals_1 = at::empty({n_rows, sort_size}, opts_val);
-    dev_idxs_0 = at::empty({n_rows, sort_size}, opts_u32);
-    dev_idxs_1 = at::empty({n_rows, sort_size}, opts_u32);
-    n_blocks = at::ceil_div(sort_size, npb);
-    block_parts = at::empty({n_rows, n_blocks + 1}, opts_u32);
-  }
-
-  // Phase 1: Block sort
-  {
-    const std::string kernel = "mb_sort_block_" + type_str + bn_str;
-    dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
-      @autoreleasepool {
-        id<MTLComputeCommandEncoder> enc = mpsStream->commandEncoder();
-        id<MTLComputePipelineState> pso = lib.getPipelineStateForFunc(kernel);
-        getMPSProfiler().beginProfileKernel(pso, kernel, {work_vals});
-
-        [enc setComputePipelineState:pso];
-        mtl_setArgs(enc, work_vals, dev_vals_0, dev_idxs_0,
-                    sort_size, in_stride_sorted,
-                    static_cast<int64_t>(sort_size), // stride_segment (contiguous)
-                    descending);
-
-        [enc dispatchThreadgroups:MTLSizeMake(n_blocks, n_rows, 1)
-             threadsPerThreadgroup:MTLSizeMake(bn, 1, 1)];
-        getMPSProfiler().endProfileKernel(pso);
+  // Batch block sort + all merge rounds into one GCD dispatch_sync. The encoder
+  // is shared across dispatches via MPSStream, so this only affects CPU-side
+  // queue overhead (one round-trip instead of 1 + n_merge_rounds).
+  bool ping = false;
+  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+    @autoreleasepool {
+      id<MTLComputeCommandEncoder> enc = mpsStream->commandEncoder();
+      id<MTLComputePipelineState> block_pso = lib.getPipelineStateForFunc(block_kernel);
+      id<MTLComputePipelineState> merge_pso = nil;
+      id<MTLComputePipelineState> merge_final_pso = nil;
+      if (n_blocks > 1) {
+        merge_pso = lib.getPipelineStateForFunc(merge_kernel);
+        if (direct_final_write)
+          merge_final_pso = lib.getPipelineStateForFunc(merge_final_kernel);
       }
-    });
-  }
 
-  // Phase 2: Iterative merge
-  if (n_blocks > 1) {
-    bool ping = false;
-    int n_thr_partition = std::min(n_blocks + 1, 1024);
+      [enc setComputePipelineState:block_pso];
+      mtl_setArgs(enc, work_in, dev_vals_0, dev_idxs_0,
+                  sort_size, stride_sort, stride_seg, descending);
+      [enc dispatchThreadgroups:MTLSizeMake(n_blocks, n_rows, 1)
+           threadsPerThreadgroup:MTLSizeMake(bn, 1, 1)];
 
-    const std::string part_kernel = "mb_partition_" + type_str + bn_str;
-    const std::string merge_kernel = "mb_merge_" + type_str + bn_str;
-    const std::string merge_final_kernel = "mb_merge_final_" + type_str + bn_str;
+      if (n_blocks > 1) {
+        bool p = false;
+        int cur_round = 0;
+        for (int merge_tiles = 2; (merge_tiles / 2) < n_blocks; merge_tiles *= 2, ++cur_round) {
+          const Tensor& v_in = p ? dev_vals_1 : dev_vals_0;
+          const Tensor& i_in = p ? dev_idxs_1 : dev_idxs_0;
+          const Tensor& v_out_buf = p ? dev_vals_0 : dev_vals_1;
+          const Tensor& i_out_buf = p ? dev_idxs_0 : dev_idxs_1;
+          const bool use_direct = direct_final_write && (cur_round == total_rounds - 1);
+          p = !p;
 
-    // Count merge rounds to know which is last.
-    int total_rounds = 0;
-    for (int m = 2; (m / 2) < n_blocks; m *= 2) ++total_rounds;
-    const bool direct_final_write = !need_permute;
-    int cur_round = 0;
-
-    for (int merge_tiles = 2; (merge_tiles / 2) < n_blocks; merge_tiles *= 2, ++cur_round) {
-      const Tensor& v_in = ping ? dev_vals_1 : dev_vals_0;
-      const Tensor& i_in = ping ? dev_idxs_1 : dev_idxs_0;
-      const Tensor& v_out_buf = ping ? dev_vals_0 : dev_vals_1;
-      const Tensor& i_out_buf = ping ? dev_idxs_0 : dev_idxs_1;
-      const bool use_direct = direct_final_write && (cur_round == total_rounds - 1);
-      ping = !ping;
-
-      // Partition
-      dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
-        @autoreleasepool {
-          id<MTLComputeCommandEncoder> enc = mpsStream->commandEncoder();
-          id<MTLComputePipelineState> pso = lib.getPipelineStateForFunc(part_kernel);
-          [enc setComputePipelineState:pso];
-          mtl_setArgs(enc, block_parts, v_in,
-                      sort_size, merge_tiles, n_blocks, descending);
-          [enc dispatchThreadgroups:MTLSizeMake(1, n_rows, 1)
-               threadsPerThreadgroup:MTLSizeMake(n_thr_partition, 1, 1)];
-        }
-      });
-
-      // Merge: last round goes straight to values/indices (int64 output)
-      // when we don't need to un-permute afterwards.
-      dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
-        @autoreleasepool {
-          id<MTLComputeCommandEncoder> enc = mpsStream->commandEncoder();
-          id<MTLComputePipelineState> pso = lib.getPipelineStateForFunc(
-              use_direct ? merge_final_kernel : merge_kernel);
-          [enc setComputePipelineState:pso];
+          [enc setComputePipelineState:use_direct ? merge_final_pso : merge_pso];
           if (use_direct) {
-            mtl_setArgs(enc, block_parts, v_in, i_in, values, indices,
+            mtl_setArgs(enc, v_in, i_in, values, indices,
                         sort_size, merge_tiles, n_blocks, descending);
           } else {
-            mtl_setArgs(enc, block_parts, v_in, i_in, v_out_buf, i_out_buf,
+            mtl_setArgs(enc, v_in, i_in, v_out_buf, i_out_buf,
                         sort_size, merge_tiles, n_blocks, descending);
           }
           [enc dispatchThreadgroups:MTLSizeMake(n_blocks, n_rows, 1)
                threadsPerThreadgroup:MTLSizeMake(bn, 1, 1)];
         }
-      });
+      }
     }
+  });
+  if (n_blocks > 1) ping = (total_rounds % 2 == 1);
 
-    if (direct_final_write) {
-      // Already written directly to values/indices in the last merge round.
-      return;
-    }
-    // Final result is in the last output buffer
-    // ping was flipped AFTER selecting v_out, so the last output is
-    // in dev_vals_1 when ping=true, dev_vals_0 when ping=false.
+  if (n_blocks > 1) {
+    if (direct_final_write) return;
+
     const Tensor& final_vals = ping ? dev_vals_1 : dev_vals_0;
     const Tensor& final_idxs = ping ? dev_idxs_1 : dev_idxs_0;
-
-    // Only reached in the need_permute case (direct_final_write is false).
-    auto final_v_view = final_vals.view(work_vals.sizes());
-    auto final_i_view = final_idxs.view(work_vals.sizes());
+    auto fv = final_vals.view(work_in.sizes());
+    auto fi = final_idxs.view(work_in.sizes());
     std::vector<int64_t> perm, inv_perm(values.ndimension());
     for (int64_t i = 0; i < values.ndimension(); i++)
       if (i != dim) perm.push_back(i);
     perm.push_back(dim);
     for (int64_t i = 0; i < values.ndimension(); i++)
       inv_perm[perm[i]] = i;
-    values.copy_(final_v_view.permute(inv_perm));
-    indices.copy_(final_i_view.permute(inv_perm));
+    values.copy_(fv.permute(inv_perm));
+    indices.copy_(fi.permute(inv_perm));
   } else {
-    // Single block, result already in dev_vals_0/dev_idxs_0
+    // n_blocks == 1: result is in dev_vals_0/dev_idxs_0
     if (need_permute) {
-      auto final_v_view = dev_vals_0.view(work_vals.sizes());
-      auto final_i_view = dev_idxs_0.view(work_vals.sizes());
+      auto fv = dev_vals_0.view(work_in.sizes());
+      auto fi = dev_idxs_0.view(work_in.sizes());
       std::vector<int64_t> perm, inv_perm(values.ndimension());
       for (int64_t i = 0; i < values.ndimension(); i++)
         if (i != dim) perm.push_back(i);
       perm.push_back(dim);
       for (int64_t i = 0; i < values.ndimension(); i++)
         inv_perm[perm[i]] = i;
-      values.copy_(final_v_view.permute(inv_perm));
-      indices.copy_(final_i_view.permute(inv_perm));
+      values.copy_(fv.permute(inv_perm));
+      indices.copy_(fi.permute(inv_perm));
     } else {
       values.copy_(dev_vals_0.view(values.sizes()));
       indices.copy_(dev_idxs_0.view(indices.sizes()));
@@ -345,23 +252,24 @@ static void sort_multi_block(const Tensor& values,
 }
 
 // Radix sort: 4-bit radix, O(n) per pass. Faster than merge sort for large arrays.
-static void sort_radix(const Tensor& values,
+static void sort_radix(const Tensor& input,
+                       const Tensor& values,
                        const Tensor& indices,
                        int64_t dim,
                        bool descending,
                        int sort_size) {
-  bool need_permute = (dim != values.ndimension() - 1);
-  Tensor work_vals = values;
+  bool need_permute = (dim != input.ndimension() - 1);
+  Tensor work_in = input;
   if (need_permute) {
     std::vector<int64_t> perm;
-    for (int64_t i = 0; i < values.ndimension(); i++)
+    for (int64_t i = 0; i < input.ndimension(); i++)
       if (i != dim) perm.push_back(i);
     perm.push_back(dim);
-    work_vals = values.permute(perm).contiguous();
-    sort_size = work_vals.size(work_vals.ndimension() - 1);
+    work_in = input.permute(perm).contiguous();
+    sort_size = work_in.size(work_in.ndimension() - 1);
   }
 
-  int n_rows = static_cast<int>(work_vals.numel() / sort_size);
+  int n_rows = static_cast<int>(work_in.numel() / sort_size);
   // 16-bit and 32-bit types use 8-bit radix (256 bins) — halves global memory
   // traffic vs 4-bit radix while keeping the same total block-local work
   // (RBITS binary sub-passes × n_passes = total bits either way). 8-bit types
@@ -376,16 +284,19 @@ static void sort_radix(const Tensor& values,
   else if (elem_size == 4) n_passes = 4;  // 8-bit × 4 passes
   else TORCH_CHECK(false, "Radix sort not supported for element size ", elem_size);
 
-  constexpr int RADIX_BN = 512;
-  const int radix_ept = (elem_size >= 4) ? 4 : 8;
+  // 2-byte types use RBN=1024,EPT=4 (same NPB=4096 but 2x threads/TG for more
+  // parallelism in scatter's binary-split ladder). 1-byte / 4-byte stay at
+  // RBN=512 where the different EPT keeps NPB in the same 4KB window.
+  const int RADIX_BN = (elem_size == 2) ? 1024 : 512;
+  const int radix_ept = (elem_size >= 4) ? 4 : ((elem_size == 2) ? 4 : 8);
   const int RADIX_NPB = RADIX_BN * radix_ept;
   int n_blocks = at::ceil_div(sort_size, RADIX_NPB);
   int n_entries = radix_size * n_blocks;
 
-  auto opts_val = work_vals.options();
+  auto opts_val = values.options();
   auto opts_u32 = at::TensorOptions().dtype(at::kInt).device(values.device());
 
-  Tensor keys_0 = work_vals.reshape({n_rows, sort_size}).contiguous();
+  Tensor keys_0 = work_in.reshape({n_rows, sort_size}).contiguous();
   Tensor keys_1 = at::empty({n_rows, sort_size}, opts_val);
   Tensor idxs_0 = at::empty({n_rows, sort_size}, opts_u32);
   Tensor idxs_1 = at::empty({n_rows, sort_size}, opts_u32);
@@ -394,60 +305,65 @@ static void sort_radix(const Tensor& values,
   const std::string type_str = scalarToMetalTypeString(values);
   const std::string rbits_suffix = "_" + std::to_string(radix_bits) + "bit";
   const std::string count_kernel = "radix_count_" + type_str + rbits_suffix;
-  const std::string scatter_kernel = "radix_scatter_" + type_str + rbits_suffix;
-  const std::string scatter_final_kernel = "radix_scatter_final_" + type_str + rbits_suffix;
 
-  // If we don't need a post-sort permute, the last scatter pass can write
-  // directly into the caller's `values`/`indices` buffers (with int64 indices)
-  // and we skip the final uint32→int64 + element-wise copy.
+  // Fuse scan into scatter when n_blocks is small (fits in scatter's tgmem
+  // scratch). Saves one dispatch per pass. Skip for large n_blocks where the
+  // per-TG redundant scan work would exceed the dispatch saved.
+  constexpr int kMaxFusedBlocks = 4;
+  constexpr int kFusedWorkCap = 128; // n_blocks² × n_rows
+  const bool use_fused_scan =
+      (n_blocks <= kMaxFusedBlocks) &&
+      (n_blocks * n_blocks * n_rows <= kFusedWorkCap);
+  const std::string scatter_suffix = use_fused_scan ? "fused_" : "";
+  const std::string scatter_kernel =
+      "radix_scatter_" + scatter_suffix + type_str + rbits_suffix;
+  const std::string scatter_final_kernel =
+      "radix_scatter_" + scatter_suffix + "final_" + type_str + rbits_suffix;
+
   const bool direct_final_write = !need_permute;
-
   MPSStream* mpsStream = getCurrentMPSStream();
-  bool ping = false; // false: src=0, true: src=1
 
-  for (int pass = 0; pass < n_passes; pass++) {
-    int shift = pass * radix_bits;
-    bool first_pass = (pass == 0);
-    bool last_pass = (pass == n_passes - 1);
-    bool use_direct = direct_final_write && last_pass;
+  // All radix passes coalesce into a single GCD dispatch_sync to avoid
+  // n_passes × 3 queue round-trips (each ~1µs). The encoder stays open between
+  // dispatches (MPSStream caches it), so GPU-side this is equivalent.
+  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+    @autoreleasepool {
+      id<MTLComputeCommandEncoder> enc = mpsStream->commandEncoder();
+      id<MTLComputePipelineState> count_pso = lib.getPipelineStateForFunc(count_kernel);
+      id<MTLComputePipelineState> scan_pso = nil;
+      if (!use_fused_scan) scan_pso = lib.getPipelineStateForFunc("radix_scan");
+      id<MTLComputePipelineState> scatter_pso =
+          lib.getPipelineStateForFunc(scatter_kernel);
+      id<MTLComputePipelineState> scatter_final_pso =
+          direct_final_write
+              ? lib.getPipelineStateForFunc(scatter_final_kernel)
+              : nil;
 
-    const Tensor& k_in = ping ? keys_1 : keys_0;
-    const Tensor& i_in = ping ? idxs_1 : idxs_0;
-    const Tensor& k_out_buf = ping ? keys_0 : keys_1;
-    const Tensor& i_out_buf = ping ? idxs_0 : idxs_1;
+      bool ping = false;
+      for (int pass = 0; pass < n_passes; pass++) {
+        int shift = pass * radix_bits;
+        bool first_pass = (pass == 0);
+        bool last_pass = (pass == n_passes - 1);
+        bool use_direct = direct_final_write && last_pass;
 
-    // Count
-    dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
-      @autoreleasepool {
-        id<MTLComputeCommandEncoder> enc = mpsStream->commandEncoder();
-        id<MTLComputePipelineState> pso = lib.getPipelineStateForFunc(count_kernel);
-        [enc setComputePipelineState:pso];
+        const Tensor& k_in = ping ? keys_1 : keys_0;
+        const Tensor& i_in = ping ? idxs_1 : idxs_0;
+        const Tensor& k_out_buf = ping ? keys_0 : keys_1;
+        const Tensor& i_out_buf = ping ? idxs_0 : idxs_1;
+
+        [enc setComputePipelineState:count_pso];
         mtl_setArgs(enc, k_in, histograms, sort_size, n_blocks, shift, descending);
         [enc dispatchThreadgroups:MTLSizeMake(n_blocks, n_rows, 1)
              threadsPerThreadgroup:MTLSizeMake(RADIX_BN, 1, 1)];
-      }
-    });
 
-    // Scan (parallel, SCAN_BN=256 threads per row)
-    dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
-      @autoreleasepool {
-        id<MTLComputeCommandEncoder> enc = mpsStream->commandEncoder();
-        id<MTLComputePipelineState> pso = lib.getPipelineStateForFunc("radix_scan");
-        [enc setComputePipelineState:pso];
-        mtl_setArgs(enc, histograms, n_entries);
-        [enc dispatchThreadgroups:MTLSizeMake(1, n_rows, 1)
-             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-      }
-    });
+        if (!use_fused_scan) {
+          [enc setComputePipelineState:scan_pso];
+          mtl_setArgs(enc, histograms, n_entries);
+          [enc dispatchThreadgroups:MTLSizeMake(1, n_rows, 1)
+               threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        }
 
-    // Scatter: route the last pass through the int64-output kernel when
-    // the destination is already the final output buffer.
-    dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
-      @autoreleasepool {
-        id<MTLComputeCommandEncoder> enc = mpsStream->commandEncoder();
-        id<MTLComputePipelineState> pso = lib.getPipelineStateForFunc(
-            use_direct ? scatter_final_kernel : scatter_kernel);
-        [enc setComputePipelineState:pso];
+        [enc setComputePipelineState:use_direct ? scatter_final_pso : scatter_pso];
         if (use_direct) {
           mtl_setArgs(enc, k_in, i_in, values, indices,
                       histograms, sort_size, n_blocks, shift, descending, first_pass);
@@ -457,11 +373,13 @@ static void sort_radix(const Tensor& values,
         }
         [enc dispatchThreadgroups:MTLSizeMake(n_blocks, n_rows, 1)
              threadsPerThreadgroup:MTLSizeMake(RADIX_BN, 1, 1)];
-      }
-    });
 
-    ping = !ping;
-  }
+        ping = !ping;
+      }
+    }
+  });
+
+  bool ping = (n_passes % 2 == 1);
 
   if (direct_final_write) {
     // Already written directly to values/indices.
@@ -471,8 +389,8 @@ static void sort_radix(const Tensor& values,
   const Tensor& final_keys = ping ? keys_1 : keys_0;
   const Tensor& final_idxs = ping ? idxs_1 : idxs_0;
 
-  auto fk_view = final_keys.view(work_vals.sizes());
-  auto fi_view = final_idxs.view(work_vals.sizes());
+  auto fk_view = final_keys.view(work_in.sizes());
+  auto fi_view = final_idxs.view(work_in.sizes());
   std::vector<int64_t> perm, inv_perm(values.ndimension());
   for (int64_t i = 0; i < values.ndimension(); i++)
     if (i != dim) perm.push_back(i);
@@ -487,16 +405,14 @@ static void sort_radix(const Tensor& values,
 // Radix has cheaper per-pass work (no log2(BN) internal merge rounds), so even
 // with a few more dispatches the full-kernel cost is usually lower on MPS.
 static bool should_use_radix(int sort_size, size_t elem_size, int n_rows) {
-  if (elem_size > 4) return false; // int64: too many radix passes
+  if (elem_size > 4) return false;
   int n_blocks_merge = at::ceil_div(sort_size, 4096);
   int merge_rounds = 0;
   for (int m = 2; (m / 2) < n_blocks_merge; m *= 2) merge_rounds++;
-  int merge_dispatches = 1 + 2 * merge_rounds;
-  // 1 byte → 4-bit×2 = 2 passes; 2 byte → 8-bit×2 = 2 passes;
-  // 4 byte → 8-bit×4 = 4 passes.
+  int merge_dispatches = 1 + merge_rounds;
   int n_radix_passes = (elem_size <= 1) ? 2 : (elem_size <= 2) ? 2 : 4;
   int radix_dispatches = n_radix_passes * 3;
-  return radix_dispatches <= merge_dispatches + 2;
+  return radix_dispatches <= 2 * merge_dispatches + 2;
 }
 
 void kthvalue_out_mps_impl(const Tensor& self, int64_t k, int64_t dim, Tensor& values, Tensor& indices) {
@@ -550,17 +466,20 @@ TORCH_IMPL_FUNC(sort_stable_out_mps)
   TORCH_CHECK(!c10::isComplexType(self.scalar_type()),
               "Sort is not supported for complex types on MPS");
 
-  // Prepare contiguous working buffers
-  Tensor work_vals, work_inds;
+  // Input must be contiguous for the kernels' simple stride formulation
+  // (noop when self is already contig).
+  Tensor input = self.contiguous();
+
+  // Write directly into values/indices when contiguous; otherwise use a
+  // contig scratch buffer and copy back.
+  Tensor out_vals, out_inds;
   bool need_copy_back = false;
   if (values.is_contiguous() && indices.is_contiguous()) {
-    values.copy_(self);
-    work_vals = values;
-    work_inds = indices;
+    out_vals = values;
+    out_inds = indices;
   } else {
-    work_vals = at::empty(self.sizes(), values.options());
-    work_vals.copy_(self);
-    work_inds = at::empty(self.sizes(), indices.options());
+    out_vals = at::empty(self.sizes(), values.options());
+    out_inds = at::empty(self.sizes(), indices.options());
     need_copy_back = true;
   }
 
@@ -569,18 +488,22 @@ TORCH_IMPL_FUNC(sort_stable_out_mps)
   int npb = bn * TN;
 
   bool is_last_dim = (dim == self.ndimension() - 1);
+  const int64_t stride_sort = 1;
+  const int64_t stride_seg = sort_size;
 
   if (should_use_radix(sort_size, self.element_size(), n_rows_for_bn)) {
-    sort_radix(work_vals, work_inds, dim, descending, sort_size);
+    sort_radix(input, out_vals, out_inds, dim, descending, sort_size);
   } else if (sort_size <= npb && is_last_dim) {
-    sort_single_block(work_vals, work_inds, dim, descending, sort_size, bn);
+    sort_single_block(input, out_vals, out_inds, descending, sort_size,
+                      stride_sort, stride_seg, bn);
   } else {
-    sort_multi_block(work_vals, work_inds, dim, descending, sort_size, bn);
+    sort_multi_block(input, out_vals, out_inds, dim, descending, sort_size,
+                     stride_sort, stride_seg, bn);
   }
 
   if (need_copy_back) {
-    values.copy_(work_vals);
-    indices.copy_(work_inds);
+    values.copy_(out_vals);
+    indices.copy_(out_inds);
   }
 }
 
