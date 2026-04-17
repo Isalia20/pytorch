@@ -160,6 +160,10 @@ struct Connection {
   ibv_cq* completionQueue;
   ibv_qp* queuePair;
   Destination src;
+  // Index into our port's GID table that holds a valid GID. Discovered in
+  // info() by scanning, because the index is not fixed across implementations
+  // (Apple Thunderbolt RDMA exposes the usable GID at 0, not 1).
+  uint8_t sgidIndex = 0;
 
   explicit Connection(ibv_context* ctx);
   Connection(Connection&& c);

@@ -264,6 +264,7 @@ Connection::Connection(Connection&& c) : Connection(nullptr) {
   std::swap(completionQueue, c.completionQueue);
   std::swap(queuePair, c.queuePair);
   std::swap(src, c.src);
+  std::swap(sgidIndex, c.sgidIndex);
 }
 
 Connection::~Connection() {
@@ -310,29 +311,31 @@ const Destination& Connection::info() {
     return src;
 
   ibv_port_attr portAttr;
-  int portStatus = ibv().queryPort(ctx, 1, &portAttr);
-  ibv_gid gid0{}, gid1{};
-  int gid0Status = ibv().queryGid(ctx, 1, 0, &gid0);
-  int gid1Status = ibv().queryGid(ctx, 1, 1, &gid1);
-  std::cerr << "[jaccl-info] port=1 query_port=" << portStatus
-            << " state=" << portAttr.state
-            << " max_mtu=" << portAttr.max_mtu
-            << " active_mtu=" << portAttr.active_mtu
-            << " lid=" << portAttr.lid
-            << " gid_tbl_len=" << portAttr.gid_tbl_len
-            << " link_layer=" << static_cast<int>(portAttr.link_layer)
-            << std::endl;
-  std::cerr << "[jaccl-info] gid[0] status=" << gid0Status
-            << " subnet=" << std::hex << gid0.global.subnet_prefix
-            << " iface=" << gid0.global.interface_id << std::dec << std::endl;
-  std::cerr << "[jaccl-info] gid[1] status=" << gid1Status
-            << " subnet=" << std::hex << gid1.global.subnet_prefix
-            << " iface=" << gid1.global.interface_id << std::dec << std::endl;
+  ibv().queryPort(ctx, 1, &portAttr);
+
+  // Scan the GID table for the first non-zero entry. Implementations differ
+  // on which index holds the usable GID — Linux RoCE commonly uses 1, Apple
+  // Thunderbolt RDMA uses 0 and leaves 1 zeroed. Hardcoding an index leads to
+  // a zero GID, which forces is_global=0 in RTR and the driver rejects it
+  // with EINVAL on non-IB links.
+  ibv_gid gid{};
+  int limit = portAttr.gid_tbl_len > 0 ? portAttr.gid_tbl_len : 8;
+  for (int i = 0; i < limit; i++) {
+    ibv_gid candidate{};
+    if (ibv().queryGid(ctx, 1, i, &candidate) != 0) {
+      continue;
+    }
+    if (candidate.global.interface_id != 0) {
+      gid = candidate;
+      sgidIndex = static_cast<uint8_t>(i);
+      break;
+    }
+  }
 
   src.localId = portAttr.lid;
   src.queuePairNumber = queuePair->qp_num;
   src.packetSequenceNumber = 7;
-  src.globalIdentifier = gid1;
+  src.globalIdentifier = gid;
   return src;
 }
 
@@ -369,7 +372,7 @@ void Connection::queuePairRtr(const Destination& dst) {
     attr.ah_attr.is_global = 1;
     attr.ah_attr.grh.hop_limit = 1;
     attr.ah_attr.grh.dgid = dst.globalIdentifier;
-    attr.ah_attr.grh.sgid_index = 1;
+    attr.ah_attr.grh.sgid_index = sgidIndex;
   }
 
   int mask = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
