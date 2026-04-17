@@ -377,6 +377,14 @@ void Connection::queuePairRtr(const Destination& dst) {
 
   int mask = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
       IBV_QP_RQ_PSN;
+  std::cerr << "[jaccl-rtr] dst lid=" << dst.localId
+            << " qp=" << dst.queuePairNumber
+            << " psn=" << dst.packetSequenceNumber
+            << " gid_subnet=" << std::hex << dst.globalIdentifier.global.subnet_prefix
+            << " gid_iface=" << dst.globalIdentifier.global.interface_id << std::dec
+            << " is_global=" << static_cast<int>(attr.ah_attr.is_global)
+            << " sgid_index=" << static_cast<int>(attr.ah_attr.grh.sgid_index)
+            << std::endl;
   int status = ibv().modifyQp(queuePair, &attr, mask);
   TORCH_CHECK(
       status == 0,
