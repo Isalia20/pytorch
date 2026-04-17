@@ -2,10 +2,14 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/MemoryOverlap.h>
 #include <ATen/WrapDimUtils.h>
+#include <ATen/ceil_div.h>
+#include <ATen/mps/MPSProfiler.h>
 #include <ATen/native/SortingUtils.h>
 #include <ATen/native/TensorShape.h>
 #include <ATen/native/TypeProperties.h>
 #include <ATen/native/mps/OperationUtils.h>
+#include <fmt/format.h>
+#include <bit>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -18,8 +22,106 @@
 namespace at::native {
 namespace {
 
+using namespace mps;
+
+#ifndef PYTORCH_JIT_COMPILE_SHADERS
+static auto& lib = MetalShaderLibrary::getBundledLibrary();
+#else
+#include <ATen/native/mps/Sort_metallib.h>
+#endif
+
+static constexpr int TN = 4; // elements per thread
+
+// =============================================================================
+// Sort dispatch for MPS. This PR lands the single-block sort path (one
+// threadgroup per row) for the common case where the sort dim is last and the
+// segment fits in threadgroup memory. Everything else falls back to the
+// existing MPSGraph-based sort. Multi-block merge and radix paths are planned
+// for follow-up PRs.
+//
+// Terminology (matches Sort.metal):
+//   TN            elements processed per thread (constant 4 here).
+//   TPTG          threads per threadgroup (one of 32, 64, 128, 256, 512, 1024).
+//   ELEMS_PER_TG  elements one threadgroup is responsible for = TPTG * TN.
+//   TG            threadgroup.
+//   sort_size     length of the sort dim (elements per row).
+//   row           one independent segment to sort. n_rows = numel / sort_size.
+// =============================================================================
+
+// Picks TPTG. Larger TPTG = fewer, bigger blocks (lower dispatch overhead);
+// smaller TPTG = more blocks in flight (better GPU utilization).
+static int select_tptg(int sort_size, size_t elem_size, int n_rows) {
+  int potential_tptg = at::ceil_div(sort_size, TN);
+
+  // Few-rows case: default TPTG=1024 leaves the GPU idle (e.g. n_rows=1,
+  // sort_size=10000 -> only 3 TGs). Pick a smaller TPTG to get more blocks
+  // per row (target ~32 TGs total), but keep blocks >= 512 elements so the
+  // per-block setup cost doesn't dominate. Only for sort_size > 4096 -
+  // smaller segments go through the single-block path in one dispatch.
+  if (n_rows <= 2 && sort_size > 4096) {
+    constexpr int target_total_tgs = 32;
+    int target_blocks_per_row = std::max(1, target_total_tgs / std::max(n_rows, 1));
+    int target_elems_per_tg = std::max(512, at::ceil_div(sort_size, target_blocks_per_row));
+    int target_tptg = target_elems_per_tg / TN;
+    potential_tptg = std::min(potential_tptg, target_tptg);
+  }
+
+  // Round up to the next power of 2 and clamp to the supported TPTG range.
+  int tptg = std::clamp<int>(std::bit_ceil(static_cast<unsigned>(std::max(potential_tptg, 1))), 32, 1024);
+
+  // 8-byte types: ELEMS_PER_TG * (8+4) only fits tgmem at TPTG <= 256.
+  if (elem_size > 4) {
+    tptg = std::min(tptg, 256);
+  }
+  return tptg;
+}
+
+// Single-block sort (last-dim only). Loads the segment into threadgroup
+// memory, sorts in place, and writes int64 indices directly.
+static void sort_single_block(const Tensor& input,
+                              const Tensor& values,
+                              const Tensor& indices,
+                              bool descending,
+                              int sort_size,
+                              int64_t stride_sort,
+                              int64_t stride_seg,
+                              int tptg) {
+  auto n_rows = static_cast<int>(input.numel() / sort_size);
+  const auto kernel = fmt::format("sort_block_{}_tptg{}", scalarToMetalTypeString(input), tptg);
+
+  MPSStream* mpsStream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+    @autoreleasepool {
+      auto enc = mpsStream->commandEncoder();
+      auto pso = lib.getPipelineStateForFunc(kernel);
+      getMPSProfiler().beginProfileKernel(pso, kernel, {input});
+      [enc setComputePipelineState:pso];
+      mtl_setArgs(enc, input, values, indices, sort_size, std::array<int64_t, 2>{stride_sort, stride_seg}, descending);
+      [enc dispatchThreadgroups:MTLSizeMake(1, n_rows, 1) threadsPerThreadgroup:MTLSizeMake(tptg, 1, 1)];
+      getMPSProfiler().endProfileKernel(pso);
+    }
+  });
+}
+
+// Types supported by the sort_block kernel (see Sort.metal instantiations).
+static bool metal_sort_supports_dtype(ScalarType st) {
+  switch (st) {
+    case ScalarType::Float:
+    case ScalarType::Half:
+    case ScalarType::BFloat16:
+    case ScalarType::Int:
+    case ScalarType::Long:
+    case ScalarType::Short:
+    case ScalarType::Char:
+    case ScalarType::Byte:
+    case ScalarType::Bool:
+      return true;
+    default:
+      return false;
+  }
+}
+
 void kthvalue_out_mps_impl(const Tensor& self, int64_t k, int64_t dim, Tensor& values, Tensor& indices) {
-  using namespace mps;
   if (self.dim() == 0 && self.numel() == 1) {
     values.copy_(self);
     indices.zero_();
@@ -100,20 +202,52 @@ TORCH_IMPL_FUNC(sort_stable_out_mps)
  bool descending,
  const Tensor& values,
  const Tensor& indices) {
-  using namespace mps;
-
   if (self.numel() == 0) {
     return;
   }
 
-  values.copy_(self);
-  // check if self is scalar
   dim = maybe_wrap_dim(dim, self.dim(), true);
   if (self.dim() == 0 && self.numel() == 1) {
+    values.copy_(self);
     indices.zero_();
     return;
   }
 
+  int sort_size = static_cast<int>(self.size(dim));
+  if (sort_size <= 1) {
+    values.copy_(self);
+    indices.zero_();
+    return;
+  }
+
+  // Path 1 - single-block sort: last dim, supported dtype, segment fits in
+  // one threadgroup. Everything else falls through to MPSGraph.
+  const bool is_last_dim = (dim == self.ndimension() - 1);
+  if (is_last_dim && metal_sort_supports_dtype(self.scalar_type())) {
+    const int n_rows = static_cast<int>(self.numel() / sort_size);
+    const int tptg = select_tptg(sort_size, self.element_size(), n_rows);
+    const int elems_per_tg = tptg * TN;
+    if (sort_size <= elems_per_tg) {
+      Tensor input = self.contiguous();
+      Tensor out_vals = values;
+      Tensor out_inds = indices;
+      const bool need_copy_back = !values.is_contiguous() || !indices.is_contiguous();
+      if (need_copy_back) {
+        out_vals = at::empty(self.sizes(), values.options());
+        out_inds = at::empty(self.sizes(), indices.options());
+      }
+      sort_single_block(
+          input, out_vals, out_inds, descending, sort_size, /*stride_sort=*/1, /*stride_seg=*/sort_size, tptg);
+      if (need_copy_back) {
+        values.copy_(out_vals);
+        indices.copy_(out_inds);
+      }
+      return;
+    }
+  }
+
+  // MPSGraph fallback for everything else.
+  values.copy_(self);
   MPSStream* stream = getCurrentMPSStream();
   struct CachedGraph : public MPSCachedGraph {
     CachedGraph(MPSGraph* graph) : MPSCachedGraph(graph) {}
