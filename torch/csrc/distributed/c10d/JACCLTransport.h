@@ -191,8 +191,14 @@ inline int pollConnections(
     ibv_wc* wc) {
   int completions = 0;
   for (auto& c : connections) {
-    if (c.ctx == nullptr || completions >= numCompletions)
-      break;
+    // Skip the self-slot (no RDMA context) rather than breaking — otherwise
+    // ranks whose self-index is not the last would never poll later peers.
+    if (c.ctx == nullptr) {
+      continue;
+    }
+    if (completions >= numCompletions) {
+      return completions;
+    }
     int n = ibv_poll_cq(
         c.completionQueue, numCompletions - completions, wc + completions);
     completions += n;
