@@ -331,9 +331,10 @@ void Connection::queuePairInit() {
 
   int mask =
       IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS;
+  int status = ibv().modifyQp(queuePair, &attr, mask);
   TORCH_CHECK(
-      ibv().modifyQp(queuePair, &attr, mask) == 0,
-      JACCL_TAG, " QP transition to INIT failed");
+      status == 0,
+      JACCL_TAG, " QP transition to INIT failed (errno=", status, ")");
 }
 
 void Connection::queuePairRtr(const Destination& dst) {
@@ -358,9 +359,10 @@ void Connection::queuePairRtr(const Destination& dst) {
 
   int mask = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
       IBV_QP_RQ_PSN;
+  int status = ibv().modifyQp(queuePair, &attr, mask);
   TORCH_CHECK(
-      ibv().modifyQp(queuePair, &attr, mask) == 0,
-      JACCL_TAG, " QP transition to RTR failed");
+      status == 0,
+      JACCL_TAG, " QP transition to RTR failed (errno=", status, ")");
 }
 
 void Connection::queuePairRts() {
@@ -369,9 +371,10 @@ void Connection::queuePairRts() {
   attr.sq_psn = src.packetSequenceNumber;
 
   int mask = IBV_QP_STATE | IBV_QP_SQ_PSN;
+  int status = ibv().modifyQp(queuePair, &attr, mask);
   TORCH_CHECK(
-      ibv().modifyQp(queuePair, &attr, mask) == 0,
-      JACCL_TAG, " QP transition to RTS failed");
+      status == 0,
+      JACCL_TAG, " QP transition to RTS failed (errno=", status, ")");
 }
 
 void Connection::postSend(const SharedBuffer& buff, uint64_t wrId) {
