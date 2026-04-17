@@ -310,14 +310,29 @@ const Destination& Connection::info() {
     return src;
 
   ibv_port_attr portAttr;
-  ibv().queryPort(ctx, 1, &portAttr);
-  ibv_gid gid;
-  ibv().queryGid(ctx, 1, 1, &gid);
+  int portStatus = ibv().queryPort(ctx, 1, &portAttr);
+  ibv_gid gid0{}, gid1{};
+  int gid0Status = ibv().queryGid(ctx, 1, 0, &gid0);
+  int gid1Status = ibv().queryGid(ctx, 1, 1, &gid1);
+  std::cerr << "[jaccl-info] port=1 query_port=" << portStatus
+            << " state=" << portAttr.state
+            << " max_mtu=" << portAttr.max_mtu
+            << " active_mtu=" << portAttr.active_mtu
+            << " lid=" << portAttr.lid
+            << " gid_tbl_len=" << portAttr.gid_tbl_len
+            << " link_layer=" << static_cast<int>(portAttr.link_layer)
+            << std::endl;
+  std::cerr << "[jaccl-info] gid[0] status=" << gid0Status
+            << " subnet=" << std::hex << gid0.global.subnet_prefix
+            << " iface=" << gid0.global.interface_id << std::dec << std::endl;
+  std::cerr << "[jaccl-info] gid[1] status=" << gid1Status
+            << " subnet=" << std::hex << gid1.global.subnet_prefix
+            << " iface=" << gid1.global.interface_id << std::dec << std::endl;
 
   src.localId = portAttr.lid;
   src.queuePairNumber = queuePair->qp_num;
   src.packetSequenceNumber = 7;
-  src.globalIdentifier = gid;
+  src.globalIdentifier = gid1;
   return src;
 }
 
