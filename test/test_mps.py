@@ -6115,7 +6115,7 @@ class TestMPS(TestCaseMPS):
             return torch.randint(-1000, 1000, shape, dtype=dtype)
 
         for cpu in [make((4, 4)), make((8, max_ss)), make((16, 32, 64)),
-                    make((8, 2048))[:, ::2]]:
+                    make((8, 2048))[:, ::2], make((1024, 8)).t()]:
             mps = cpu.to("mps")
             cv, _ = torch.sort(cpu, dim=-1, descending=descending)
             mv, mi = torch.sort(mps, dim=-1, descending=descending)
