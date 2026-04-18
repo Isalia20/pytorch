@@ -160,16 +160,22 @@ struct Connection {
   ibv_cq* completionQueue;
   ibv_qp* queuePair;
   Destination src;
-  // Index into our port's GID table that holds a valid GID. Discovered in
-  // info() by scanning, because the index is not fixed across implementations
-  // (Apple Thunderbolt RDMA exposes the usable GID at 0, not 1).
+  // Index into our port's GID table that holds the GID we advertise and use
+  // as source. Apple's rdma driver populates the table with one entry per IP
+  // the netdev actually owns plus one EUI-64 entry the OS does NOT bind —
+  // picking the wrong one makes IPv6 ND hang. Resolved in info() by matching
+  // GID entries against getifaddrs() output for the underlying interface.
   uint8_t sgidIndex = 0;
   // Cached port active_mtu from queryPort. Used as path_mtu for RTR — setting
   // path_mtu > active_mtu is illegal and gets the driver to reject the RTR
   // transition. 0 means "not queried yet".
   ibv_mtu activeMtu = static_cast<ibv_mtu>(0);
+  // Underlying network interface name (e.g. "en2"), derived from the RDMA
+  // device name by stripping the "rdma_" prefix. Needed in info() to look up
+  // which IPs the OS owns on this port so we pick a bound GID.
+  std::string ifaceName;
 
-  explicit Connection(ibv_context* ctx);
+  explicit Connection(ibv_context* ctx, std::string ifaceName = {});
   Connection(Connection&& c);
   ~Connection();
 

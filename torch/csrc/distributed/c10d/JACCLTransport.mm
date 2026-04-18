@@ -7,9 +7,12 @@
 #include <torch/csrc/distributed/c10d/Types.hpp>
 
 #include <array>
+#include <arpa/inet.h>
 #include <dlfcn.h>
+#include <ifaddrs.h>
 #include <iostream>
 #include <netdb.h>
+#include <netinet/in.h>
 #include <unistd.h>
 
 #include <cstdio>
@@ -18,6 +21,7 @@
 #include <iostream>
 #include <sstream>
 #include <thread>
+#include <unordered_set>
 
 #define LOAD_IBV_SYMBOL(symbol, variable)                          \
   {                                                                \
@@ -47,43 +51,8 @@ namespace c10d::jaccl {
 
 namespace {
 
-// Apple's rdma driver publishes a GID built from the port's MAC (EUI-64
-// link-local). macOS by default binds only RFC-7217 stable-privacy link-local
-// on the interface, so the peer's OS never answers IPv6 Neighbor Discovery
-// on the EUI-64 address — modifyQp(RTR) then hangs in ND and returns errno
-// 60. We bypass ND by seeding the kernel's neighbor cache with a static
-// entry derived from the exchanged GID (bytes [8..15] encode the MAC with
-// ff:fe in the middle and the U/L bit flipped on byte 0). Requires root;
-// when unprivileged we emit the exact `sudo ndp -s …` command so the user
-// can still unblock themselves manually.
-
-std::string formatMac(const ibv_gid& gid) {
-  std::array<uint8_t, 6> mac{};
-  mac[0] = gid.raw[8] ^ 0x02; // flip U/L bit back
-  mac[1] = gid.raw[9];
-  mac[2] = gid.raw[10];
-  // raw[11]=0xff, raw[12]=0xfe — the EUI-64 pad, dropped.
-  mac[3] = gid.raw[13];
-  mac[4] = gid.raw[14];
-  mac[5] = gid.raw[15];
-  char buf[32];
-  std::snprintf(
-      buf, sizeof(buf), "%x:%x:%x:%x:%x:%x",
-      mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-  return buf;
-}
-
-std::string formatLinkLocalV6(const ibv_gid& gid) {
-  char buf[64];
-  std::snprintf(
-      buf, sizeof(buf), "fe80::%x:%x:%x:%x",
-      (static_cast<unsigned>(gid.raw[8]) << 8) | gid.raw[9],
-      (static_cast<unsigned>(gid.raw[10]) << 8) | gid.raw[11],
-      (static_cast<unsigned>(gid.raw[12]) << 8) | gid.raw[13],
-      (static_cast<unsigned>(gid.raw[14]) << 8) | gid.raw[15]);
-  return buf;
-}
-
+// Strip the "rdma_" prefix from an RDMA device name to get the underlying
+// network interface name (e.g. "rdma_en2" -> "en2").
 std::string ifaceFromDeviceName(const std::string& deviceName) {
   constexpr const char* prefix = "rdma_";
   constexpr size_t prefixLen = 5;
@@ -93,31 +62,61 @@ std::string ifaceFromDeviceName(const std::string& deviceName) {
   return deviceName;
 }
 
-void installStaticNeighbor(
-    const std::string& ifaceName,
-    const ibv_gid& peerGid) {
-  if (peerGid.global.interface_id == 0) {
-    return;
+// Collect the IPv4 + IPv6 addresses bound to `ifaceName`, in a canonical
+// text form that matches what gidToString produces (no scope suffix, lower
+// case). Used to pick a GID whose address the OS actually owns — the kernel
+// only answers Neighbor Discovery for addresses it binds, so a GID chosen
+// from the same set avoids ND black-holes.
+std::unordered_set<std::string> boundAddressesForInterface(
+    const std::string& ifaceName) {
+  std::unordered_set<std::string> result;
+  struct ifaddrs* addrs = nullptr;
+  if (getifaddrs(&addrs) != 0) {
+    return result;
   }
-  auto peerAddr = formatLinkLocalV6(peerGid);
-  auto peerMac = formatMac(peerGid);
-  char cmd[256];
-  std::snprintf(
-      cmd, sizeof(cmd),
-      "/usr/sbin/ndp -s %s%%%s %s >/dev/null 2>&1",
-      peerAddr.c_str(), ifaceName.c_str(), peerMac.c_str());
-  int rc = std::system(cmd);
-  if (rc == 0) {
-    std::cerr << JACCL_TAG << " installed ND entry "
-              << peerAddr << "%" << ifaceName << " -> " << peerMac
-              << std::endl;
-  } else {
-    std::cerr << JACCL_TAG
-              << " could not install ND entry (rc=" << rc
-              << "). Run as root on this host before retrying:\n"
-              << "  sudo ndp -s " << peerAddr << "%" << ifaceName
-              << " " << peerMac << std::endl;
+  for (auto* ifa = addrs; ifa != nullptr; ifa = ifa->ifa_next) {
+    if (ifa->ifa_addr == nullptr || ifa->ifa_name == nullptr) continue;
+    if (ifaceName != ifa->ifa_name) continue;
+    char buf[INET6_ADDRSTRLEN] = {};
+    if (ifa->ifa_addr->sa_family == AF_INET) {
+      auto* sa = reinterpret_cast<sockaddr_in*>(ifa->ifa_addr);
+      if (inet_ntop(AF_INET, &sa->sin_addr, buf, sizeof(buf))) {
+        result.insert(buf);
+      }
+    } else if (ifa->ifa_addr->sa_family == AF_INET6) {
+      auto* sa = reinterpret_cast<sockaddr_in6*>(ifa->ifa_addr);
+      if (inet_ntop(AF_INET6, &sa->sin6_addr, buf, sizeof(buf))) {
+        result.insert(buf);
+      }
+    }
   }
+  freeifaddrs(addrs);
+  return result;
+}
+
+// Render a GID as a canonical IP string. RoCEv2 IPv4-mapped entries (first
+// 10 bytes zero, then 0xff 0xff, then 4 bytes of v4 addr) are rendered as
+// IPv4 so they match getifaddrs output.
+std::string gidToString(const ibv_gid& gid) {
+  bool isV4Mapped = true;
+  for (int i = 0; i < 10; i++) {
+    if (gid.raw[i] != 0) { isV4Mapped = false; break; }
+  }
+  if (isV4Mapped && gid.raw[10] == 0xff && gid.raw[11] == 0xff) {
+    char buf[INET_ADDRSTRLEN] = {};
+    inet_ntop(AF_INET, &gid.raw[12], buf, sizeof(buf));
+    return buf;
+  }
+  char buf[INET6_ADDRSTRLEN] = {};
+  inet_ntop(AF_INET6, &gid.raw[0], buf, sizeof(buf));
+  return buf;
+}
+
+bool isAllZero(const ibv_gid& gid) {
+  for (int i = 0; i < 16; i++) {
+    if (gid.raw[i] != 0) return false;
+  }
+  return true;
 }
 
 } // namespace
@@ -333,11 +332,12 @@ ibv_sge SharedBuffer::toScatterGatherEntry(ibv_pd* pd) const {
 
 // --- Connection ---
 
-Connection::Connection(ibv_context* ctx_)
+Connection::Connection(ibv_context* ctx_, std::string ifaceName_)
     : ctx(ctx_),
       protectionDomain(nullptr),
       completionQueue(nullptr),
-      queuePair(nullptr) {
+      queuePair(nullptr),
+      ifaceName(std::move(ifaceName_)) {
   src.localId = -1;
 }
 
@@ -349,6 +349,7 @@ Connection::Connection(Connection&& c) : Connection(nullptr) {
   std::swap(src, c.src);
   std::swap(sgidIndex, c.sgidIndex);
   std::swap(activeMtu, c.activeMtu);
+  std::swap(ifaceName, c.ifaceName);
 }
 
 Connection::~Connection() {
@@ -401,33 +402,59 @@ const Destination& Connection::info() {
   ibv().queryPort(ctx, 1, &portAttr);
   activeMtu = portAttr.active_mtu;
 
-  // Scan the GID table for the first non-zero entry. Implementations differ
-  // on which index holds the usable GID — Linux RoCE commonly uses 1, Apple
-  // Thunderbolt RDMA uses 0 and leaves 1 zeroed. Hardcoding an index leads to
-  // a zero GID, which forces is_global=0 in RTR and the driver rejects it
-  // with EINVAL on non-IB links.
+  // Pick a GID whose address the OS actually owns on `ifaceName`. Apple's
+  // rdma driver populates the GID table with one entry per IP bound to the
+  // netdev plus one MAC-derived EUI-64 link-local that the OS does NOT bind.
+  // Picking the EUI-64 entry makes the peer's kernel silently drop ND
+  // queries during modifyQp(RTR) (we'd hang ~60s and fail with ETIMEDOUT).
+  // Matching against getifaddrs() output instead guarantees we advertise an
+  // address the peer's OS answers for, so ND succeeds natively — no static
+  // neighbor entry / no sudo / no setup needed.
+  auto bound = boundAddressesForInterface(ifaceName);
   ibv_gid gid{};
+  int pickedIndex = -1;
   int limit = portAttr.gid_tbl_len > 0 ? portAttr.gid_tbl_len : 8;
   for (int i = 0; i < limit; i++) {
     ibv_gid candidate{};
-    if (ibv().queryGid(ctx, 1, i, &candidate) != 0) {
-      continue;
-    }
-    if (candidate.global.interface_id != 0) {
+    if (ibv().queryGid(ctx, 1, i, &candidate) != 0) continue;
+    if (isAllZero(candidate)) continue;
+    if (bound.count(gidToString(candidate))) {
       gid = candidate;
-      sgidIndex = static_cast<uint8_t>(i);
+      pickedIndex = i;
       break;
     }
   }
 
-  std::cerr << "[jaccl-port] state=" << portAttr.state
+  if (pickedIndex < 0) {
+    // Fallback: first non-zero GID, with a clear warning. This path is the
+    // old behaviour and will hit the ND hang on stock macOS, but it lets
+    // platforms with a single GID (or where the interface lookup failed)
+    // at least try.
+    for (int i = 0; i < limit; i++) {
+      ibv_gid candidate{};
+      if (ibv().queryGid(ctx, 1, i, &candidate) != 0) continue;
+      if (!isAllZero(candidate)) {
+        gid = candidate;
+        pickedIndex = i;
+        break;
+      }
+    }
+    std::cerr << JACCL_TAG
+              << " warning: no GID on " << ifaceName
+              << " matched a bound interface address; falling back to GID["
+              << pickedIndex
+              << "] which may trigger ND timeouts during RTR"
+              << std::endl;
+  }
+  sgidIndex = static_cast<uint8_t>(std::max(pickedIndex, 0));
+
+  std::cerr << "[jaccl-port] iface=" << ifaceName
+            << " state=" << portAttr.state
             << " active_mtu=" << portAttr.active_mtu
-            << " max_mtu=" << portAttr.max_mtu
             << " lid=" << portAttr.lid
             << " gid_tbl_len=" << portAttr.gid_tbl_len
-            << " link_layer=" << static_cast<int>(portAttr.link_layer)
             << " picked_sgid_index=" << static_cast<int>(sgidIndex)
-            << std::endl;
+            << " picked_addr=" << gidToString(gid) << std::endl;
 
   src.localId = portAttr.lid;
   src.queuePairNumber = queuePair->qp_num;
@@ -555,7 +582,7 @@ std::vector<Connection> createConnections(
       if (name == ibv().getDeviceName(devices[i])) {
         auto ctx = ibv().openDevice(devices[i]);
         TORCH_CHECK(ctx, JACCL_TAG, " Could not open device ", name);
-        connections.emplace_back(ctx);
+        connections.emplace_back(ctx, ifaceFromDeviceName(name));
         break;
       }
     }
@@ -859,10 +886,6 @@ JACCLTransport::JACCLTransport(
       continue;
     std::cerr << "[jaccl-ctor] RTR/RTS peer=" << peer << std::endl;
     auto peerInfo = allInfos[peer][rank_];
-    // Seed the ND cache for this peer's GID before RTR — see comment on
-    // installStaticNeighbor for why this is needed on macOS.
-    installStaticNeighbor(
-        ifaceFromDeviceName(deviceNames[peer]), peerInfo.globalIdentifier);
     connections_[peer].queuePairRtr(peerInfo);
     connections_[peer].queuePairRts();
   }
