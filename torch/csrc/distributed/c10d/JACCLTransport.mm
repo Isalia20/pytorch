@@ -12,6 +12,8 @@
 #include <netdb.h>
 #include <unistd.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <sstream>
@@ -40,6 +42,87 @@ void* pageAlignedAlloc(size_t numBytes) {
 }
 
 } // namespace
+
+namespace c10d::jaccl {
+
+namespace {
+
+// Apple's rdma driver publishes a GID built from the port's MAC (EUI-64
+// link-local). macOS by default binds only RFC-7217 stable-privacy link-local
+// on the interface, so the peer's OS never answers IPv6 Neighbor Discovery
+// on the EUI-64 address — modifyQp(RTR) then hangs in ND and returns errno
+// 60. We bypass ND by seeding the kernel's neighbor cache with a static
+// entry derived from the exchanged GID (bytes [8..15] encode the MAC with
+// ff:fe in the middle and the U/L bit flipped on byte 0). Requires root;
+// when unprivileged we emit the exact `sudo ndp -s …` command so the user
+// can still unblock themselves manually.
+
+std::string formatMac(const ibv_gid& gid) {
+  std::array<uint8_t, 6> mac{};
+  mac[0] = gid.raw[8] ^ 0x02; // flip U/L bit back
+  mac[1] = gid.raw[9];
+  mac[2] = gid.raw[10];
+  // raw[11]=0xff, raw[12]=0xfe — the EUI-64 pad, dropped.
+  mac[3] = gid.raw[13];
+  mac[4] = gid.raw[14];
+  mac[5] = gid.raw[15];
+  char buf[32];
+  std::snprintf(
+      buf, sizeof(buf), "%x:%x:%x:%x:%x:%x",
+      mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return buf;
+}
+
+std::string formatLinkLocalV6(const ibv_gid& gid) {
+  char buf[64];
+  std::snprintf(
+      buf, sizeof(buf), "fe80::%x:%x:%x:%x",
+      (static_cast<unsigned>(gid.raw[8]) << 8) | gid.raw[9],
+      (static_cast<unsigned>(gid.raw[10]) << 8) | gid.raw[11],
+      (static_cast<unsigned>(gid.raw[12]) << 8) | gid.raw[13],
+      (static_cast<unsigned>(gid.raw[14]) << 8) | gid.raw[15]);
+  return buf;
+}
+
+std::string ifaceFromDeviceName(const std::string& deviceName) {
+  constexpr const char* prefix = "rdma_";
+  constexpr size_t prefixLen = 5;
+  if (deviceName.compare(0, prefixLen, prefix) == 0) {
+    return deviceName.substr(prefixLen);
+  }
+  return deviceName;
+}
+
+void installStaticNeighbor(
+    const std::string& ifaceName,
+    const ibv_gid& peerGid) {
+  if (peerGid.global.interface_id == 0) {
+    return;
+  }
+  auto peerAddr = formatLinkLocalV6(peerGid);
+  auto peerMac = formatMac(peerGid);
+  char cmd[256];
+  std::snprintf(
+      cmd, sizeof(cmd),
+      "/usr/sbin/ndp -s %s%%%s %s >/dev/null 2>&1",
+      peerAddr.c_str(), ifaceName.c_str(), peerMac.c_str());
+  int rc = std::system(cmd);
+  if (rc == 0) {
+    std::cerr << JACCL_TAG << " installed ND entry "
+              << peerAddr << "%" << ifaceName << " -> " << peerMac
+              << std::endl;
+  } else {
+    std::cerr << JACCL_TAG
+              << " could not install ND entry (rc=" << rc
+              << "). Run as root on this host before retrying:\n"
+              << "  sudo ndp -s " << peerAddr << "%" << ifaceName
+              << " " << peerMac << std::endl;
+  }
+}
+
+} // namespace
+
+} // namespace c10d::jaccl
 
 namespace c10d::jaccl {
 
@@ -776,6 +859,10 @@ JACCLTransport::JACCLTransport(
       continue;
     std::cerr << "[jaccl-ctor] RTR/RTS peer=" << peer << std::endl;
     auto peerInfo = allInfos[peer][rank_];
+    // Seed the ND cache for this peer's GID before RTR — see comment on
+    // installStaticNeighbor for why this is needed on macOS.
+    installStaticNeighbor(
+        ifaceFromDeviceName(deviceNames[peer]), peerInfo.globalIdentifier);
     connections_[peer].queuePairRtr(peerInfo);
     connections_[peer].queuePairRts();
   }
