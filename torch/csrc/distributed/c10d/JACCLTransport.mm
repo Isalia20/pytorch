@@ -265,6 +265,7 @@ Connection::Connection(Connection&& c) : Connection(nullptr) {
   std::swap(queuePair, c.queuePair);
   std::swap(src, c.src);
   std::swap(sgidIndex, c.sgidIndex);
+  std::swap(activeMtu, c.activeMtu);
 }
 
 Connection::~Connection() {
@@ -312,6 +313,7 @@ const Destination& Connection::info() {
 
   ibv_port_attr portAttr;
   ibv().queryPort(ctx, 1, &portAttr);
+  activeMtu = portAttr.active_mtu;
 
   // Scan the GID table for the first non-zero entry. Implementations differ
   // on which index holds the usable GID — Linux RoCE commonly uses 1, Apple
@@ -331,6 +333,15 @@ const Destination& Connection::info() {
       break;
     }
   }
+
+  std::cerr << "[jaccl-port] state=" << portAttr.state
+            << " active_mtu=" << portAttr.active_mtu
+            << " max_mtu=" << portAttr.max_mtu
+            << " lid=" << portAttr.lid
+            << " gid_tbl_len=" << portAttr.gid_tbl_len
+            << " link_layer=" << static_cast<int>(portAttr.link_layer)
+            << " picked_sgid_index=" << static_cast<int>(sgidIndex)
+            << std::endl;
 
   src.localId = portAttr.lid;
   src.queuePairNumber = queuePair->qp_num;
@@ -359,7 +370,10 @@ void Connection::queuePairRtr(const Destination& dst) {
   ibv_qp_attr attr = {};
   memset(&attr, 0, sizeof(attr));
   attr.qp_state = IBV_QPS_RTR;
-  attr.path_mtu = IBV_MTU_1024;
+  // path_mtu must be <= active_mtu. Hardcoding IBV_MTU_1024 caused the driver
+  // to reject RTR on Apple Thunderbolt RDMA, whose active_mtu is smaller.
+  // Fall back to IBV_MTU_256 (smallest legal value) if we never queried.
+  attr.path_mtu = activeMtu != static_cast<ibv_mtu>(0) ? activeMtu : IBV_MTU_256;
   attr.rq_psn = dst.packetSequenceNumber;
   attr.dest_qp_num = dst.queuePairNumber;
   attr.ah_attr.dlid = dst.localId;
@@ -377,13 +391,19 @@ void Connection::queuePairRtr(const Destination& dst) {
 
   int mask = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
       IBV_QP_RQ_PSN;
+  std::cerr << "[jaccl-rtr] src lid=" << src.localId
+            << " qp=" << src.queuePairNumber
+            << " psn=" << src.packetSequenceNumber
+            << " gid_iface=" << std::hex << src.globalIdentifier.global.interface_id << std::dec
+            << " sgid_index=" << static_cast<int>(sgidIndex)
+            << " path_mtu=" << attr.path_mtu
+            << std::endl;
   std::cerr << "[jaccl-rtr] dst lid=" << dst.localId
             << " qp=" << dst.queuePairNumber
             << " psn=" << dst.packetSequenceNumber
             << " gid_subnet=" << std::hex << dst.globalIdentifier.global.subnet_prefix
             << " gid_iface=" << dst.globalIdentifier.global.interface_id << std::dec
             << " is_global=" << static_cast<int>(attr.ah_attr.is_global)
-            << " sgid_index=" << static_cast<int>(attr.ah_attr.grh.sgid_index)
             << std::endl;
   int status = ibv().modifyQp(queuePair, &attr, mask);
   TORCH_CHECK(

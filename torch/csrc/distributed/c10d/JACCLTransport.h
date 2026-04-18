@@ -164,6 +164,10 @@ struct Connection {
   // info() by scanning, because the index is not fixed across implementations
   // (Apple Thunderbolt RDMA exposes the usable GID at 0, not 1).
   uint8_t sgidIndex = 0;
+  // Cached port active_mtu from queryPort. Used as path_mtu for RTR — setting
+  // path_mtu > active_mtu is illegal and gets the driver to reject the RTR
+  // transition. 0 means "not queried yet".
+  ibv_mtu activeMtu = static_cast<ibv_mtu>(0);
 
   explicit Connection(ibv_context* ctx);
   Connection(Connection&& c);
