@@ -300,11 +300,10 @@ void Connection::createQueuePair() {
   initAttr.cap.max_send_sge = 1;
   initAttr.cap.max_recv_sge = 1;
   initAttr.cap.max_inline_data = 0;
-  // RC (reliable connected) rather than UC — Apple's Thunderbolt RDMA driver
-  // appears to reject UC at the RTR transition (errno=60). RC is the most
-  // broadly supported QP type across drivers; the mesh only uses SEND/RECV so
-  // reliability semantics are a superset of what we need.
-  initAttr.qp_type = IBV_QPT_RC;
+  // Apple Thunderbolt RDMA's createQp fails on IBV_QPT_RC — this driver
+  // only supports UC (unreliable connected). The mesh only uses SEND/RECV
+  // on a direct link, so UC is fine for our purposes.
+  initAttr.qp_type = IBV_QPT_UC;
   initAttr.sq_sig_all = 0;
 
   queuePair = ibv().createQp(protectionDomain, &initAttr);
@@ -395,12 +394,8 @@ void Connection::queuePairRtr(const Destination& dst) {
     attr.ah_attr.grh.sgid_index = sgidIndex;
   }
 
-  // RC requires max_dest_rd_atomic and min_rnr_timer at RTR.
-  attr.max_dest_rd_atomic = 1;
-  attr.min_rnr_timer = 12;
-
   int mask = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
-      IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
+      IBV_QP_RQ_PSN;
   std::cerr << "[jaccl-rtr] src lid=" << src.localId
             << " qp=" << src.queuePairNumber
             << " psn=" << src.packetSequenceNumber
@@ -425,14 +420,8 @@ void Connection::queuePairRts() {
   ibv_qp_attr attr = {};
   attr.qp_state = IBV_QPS_RTS;
   attr.sq_psn = src.packetSequenceNumber;
-  // RC requires timeout/retry/rnr_retry/max_rd_atomic at RTS.
-  attr.timeout = 14;
-  attr.retry_cnt = 7;
-  attr.rnr_retry = 7;
-  attr.max_rd_atomic = 1;
 
-  int mask = IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
-      IBV_QP_RNR_RETRY | IBV_QP_MAX_QP_RD_ATOMIC;
+  int mask = IBV_QP_STATE | IBV_QP_SQ_PSN;
   int status = ibv().modifyQp(queuePair, &attr, mask);
   TORCH_CHECK(
       status == 0,
