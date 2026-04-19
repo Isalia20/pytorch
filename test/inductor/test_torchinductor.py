@@ -8437,7 +8437,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             if self.device != "mps" or MACOS_VERSION >= 15.0
             else self.assertRaises(AssertionError)
         )
-        inp = torch.randn(128, 10).transpose(0, 1)
+        inp = torch.randn(4097, 10).transpose(0, 1)
         with ctx:
             self.common(fn, (inp, False))
             self.common(fn, (inp, True))
