@@ -599,36 +599,36 @@ kernel void mb_merge(
 // (T, TPTG): the bare name (unstable, fast) and a `_stable` variant (ties
 // broken by lower original index). mb_merge / mb_merge_final are stable
 // when fed stable input, so they need no STABLE template — one variant each.
-#define INSTANTIATE_SORT_VARIANT(T, TPTG, TN, STABLE, SUFFIX)             \
-  template [[host_name("sort_block_" #T "_tptg" #TPTG SUFFIX)]]           \
-  kernel void sort_block<T, TPTG, TN, STABLE>(                            \
-      const device T*,                                                    \
-      device T*,                                                          \
-      device long*,                                                       \
-      constant int&,                                                      \
-      constant long2&,                                                    \
-      constant bool&,                                                     \
-      uint3,                                                              \
-      uint3);                                                             \
-  template [[host_name("mb_sort_block_" #T "_tptg" #TPTG SUFFIX)]]        \
-  kernel void mb_sort_block<T, uint, TPTG, TN, STABLE>(                   \
-      const device T*,                                                    \
-      device T*,                                                          \
-      device uint*,                                                       \
-      constant int&,                                                      \
-      constant long2&,                                                    \
-      constant bool&,                                                     \
-      uint3,                                                              \
-      uint3);                                                             \
-  template [[host_name("mb_sort_block_" #T "_tptg" #TPTG "_u16" SUFFIX)]] \
-  kernel void mb_sort_block<T, ushort, TPTG, TN, STABLE>(                 \
-      const device T*,                                                    \
-      device T*,                                                          \
-      device ushort*,                                                     \
-      constant int&,                                                      \
-      constant long2&,                                                    \
-      constant bool&,                                                     \
-      uint3,                                                              \
+#define INSTANTIATE_SORT_VARIANT(T, TPTG, TN, STABLE, SUFFIX)                 \
+  template[[host_name("sort_block_" #T "_tptg" #TPTG SUFFIX)]] kernel void    \
+  sort_block<T, TPTG, TN, STABLE>(                                            \
+      const device T*,                                                        \
+      device T*,                                                              \
+      device long*,                                                           \
+      constant int&,                                                          \
+      constant long2&,                                                        \
+      constant bool&,                                                         \
+      uint3,                                                                  \
+      uint3);                                                                 \
+  template[[host_name("mb_sort_block_" #T "_tptg" #TPTG SUFFIX)]] kernel void \
+  mb_sort_block<T, uint, TPTG, TN, STABLE>(                                   \
+      const device T*,                                                        \
+      device T*,                                                              \
+      device uint*,                                                           \
+      constant int&,                                                          \
+      constant long2&,                                                        \
+      constant bool&,                                                         \
+      uint3,                                                                  \
+      uint3);                                                                 \
+  template [[host_name("mb_sort_block_" #T "_tptg" #TPTG "_u16" SUFFIX)]]     \
+  kernel void mb_sort_block<T, ushort, TPTG, TN, STABLE>(                     \
+      const device T*,                                                        \
+      device T*,                                                              \
+      device ushort*,                                                         \
+      constant int&,                                                          \
+      constant long2&,                                                        \
+      constant bool&,                                                         \
+      uint3,                                                                  \
       uint3);
 
 #define INSTANTIATE_MERGE(T, TPTG, TN)                              \
@@ -673,8 +673,8 @@ kernel void mb_merge(
       uint3,                                                        \
       uint3);
 
-#define INSTANTIATE_SORT(T, TPTG, TN)                  \
-  INSTANTIATE_SORT_VARIANT(T, TPTG, TN, false, "")     \
+#define INSTANTIATE_SORT(T, TPTG, TN)                    \
+  INSTANTIATE_SORT_VARIANT(T, TPTG, TN, false, "")       \
   INSTANTIATE_SORT_VARIANT(T, TPTG, TN, true, "_stable") \
   INSTANTIATE_MERGE(T, TPTG, TN)
 
