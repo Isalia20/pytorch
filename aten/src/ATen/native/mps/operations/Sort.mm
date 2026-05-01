@@ -32,8 +32,17 @@ static auto& lib = MetalShaderLibrary::getBundledLibrary();
 // TODO: reuse DEFAULT_ILP from c10/metal/common.h
 static constexpr int TN = 4; // elements per thread
 
-static int select_tptg(int sort_size, size_t elem_size) {
+static int select_tptg(int sort_size, size_t elem_size, int n_rows) {
   int potential_tptg = at::ceil_div(sort_size, TN);
+  // Few rows: shrink TPTG to force multi-block, giving the GPU more TGs.
+  if (n_rows <= 2 && sort_size > 2048) {
+    constexpr int target_total_tgs = 4;
+    int target_blocks_per_row = std::max(1, target_total_tgs / std::max(n_rows, 1));
+    int target_elems_per_tg = std::max(2048, at::ceil_div(sort_size, target_blocks_per_row));
+    int target_tptg = target_elems_per_tg / TN;
+    potential_tptg = std::min(potential_tptg, target_tptg);
+  }
+
   int tptg = std::clamp<int>(std::bit_ceil(static_cast<unsigned>(std::max(potential_tptg, 1))), 32, 1024);
 
   // 8-byte types: tgmem stages 8 bytes (value) + 4 bytes (uint index) per
@@ -42,11 +51,74 @@ static int select_tptg(int sort_size, size_t elem_size) {
   if (elem_size > 4) {
     tptg = std::min(tptg, 256);
   }
+  // TPTG=1024 uses ~24KB tgmem which limits occupancy, drop to 512 (~12KB) when rows hide the extra merge
+  const int tptg1024_n_blocks = at::ceil_div(sort_size, 1024 * TN);
+  if (tptg == 1024 && tptg1024_n_blocks > 1 && n_rows >= 8) {
+    tptg = 512;
+  }
   return tptg;
 }
 
-// Single-block sort (last-dim only). Loads the segment into threadgroup
-// memory, sorts in place, and writes indices directly.
+// returns true when multi-block merge sort would need so many merge-dispatch
+// passes that MPSGraph's sort is expected to win
+static bool should_use_mpsgraph_fallback(int sort_size, size_t elem_size, int elems_per_tg) {
+  if (elem_size > 4)
+    return false;
+  int n_blocks_merge = at::ceil_div(sort_size, elems_per_tg);
+  int merge_rounds = 0;
+  for (int m = 2; (m / 2) < n_blocks_merge; m *= 2)
+    merge_rounds++;
+  int merge_dispatches = 1 + merge_rounds;
+  int n_radix_passes = (elem_size <= 1) ? 2 : (elem_size <= 2) ? 2 : 4;
+  int radix_dispatches = n_radix_passes * 3;
+  return radix_dispatches <= 2 * merge_dispatches + 2;
+}
+
+static void sort_mpsgraph_fallback(const Tensor& self,
+                                   const Tensor& values,
+                                   const Tensor& indices,
+                                   int64_t dim,
+                                   bool descending) {
+  values.copy_(self);
+  MPSStream* stream = getCurrentMPSStream();
+  struct CachedGraph : public MPSCachedGraph {
+    CachedGraph(MPSGraph* graph) : MPSCachedGraph(graph) {}
+    MPSGraphTensor *selfTensor = nil, *valuesTensor = nil, *indicesTensor = nil;
+  };
+  @autoreleasepool {
+    MPSShape* input_shape = getMPSShape(self);
+    NSString* ns_shape_key = [[input_shape valueForKey:@"description"] componentsJoinedByString:@","];
+    std::string key = std::string("sort:") + [ns_shape_key UTF8String] + ":" + getMPSTypeString(self) + ":dim" +
+        std::to_string(dim) + ":descending" + std::to_string(descending);
+    auto cachedGraph = LookUpOrCreateCachedGraph<CachedGraph>(key, [&](auto mpsGraph, auto newCachedGraph) {
+      newCachedGraph->selfTensor = mpsGraphRankedPlaceHolder(mpsGraph, getMPSDataType(self), input_shape);
+      MPSGraphTensor* castInputTensor = castToIHFTypes(mpsGraph, newCachedGraph->selfTensor, self);
+      MPSGraphTensor* sortedTensor = [mpsGraph sortWithTensor:castInputTensor
+                                                         axis:(NSInteger)dim
+                                                   descending:(BOOL)descending
+                                                         name:@"sort_out"];
+      if ([sortedTensor dataType] != getMPSDataType(values)) {
+        sortedTensor = castMPSTensor(mpsGraph, sortedTensor, values.scalar_type());
+      }
+      MPSGraphTensor* argSortedTensor = [mpsGraph argSortWithTensor:castInputTensor
+                                                               axis:(NSInteger)dim
+                                                         descending:(BOOL)descending
+                                                               name:@"argsort_out"];
+      if ([argSortedTensor dataType] != getMPSDataType(indices)) {
+        argSortedTensor = castMPSTensor(mpsGraph, argSortedTensor, indices.scalar_type());
+      }
+      newCachedGraph->valuesTensor = sortedTensor;
+      newCachedGraph->indicesTensor = argSortedTensor;
+    });
+    Placeholder inputPlaceholder = Placeholder(cachedGraph->selfTensor, self);
+    Placeholder valuesPlaceholder = Placeholder(cachedGraph->valuesTensor, values);
+    Placeholder indicesPlaceholder = Placeholder(cachedGraph->indicesTensor, indices);
+    auto feeds = dictionaryFromPlaceholders(inputPlaceholder);
+    auto results = dictionaryFromPlaceholders(valuesPlaceholder, indicesPlaceholder);
+    runMPSGraph(stream, cachedGraph->graph(), feeds, results);
+  }
+}
+
 static void sort_single_block(const Tensor& input,
                               const Tensor& values,
                               const Tensor& indices,
@@ -74,8 +146,119 @@ static void sort_single_block(const Tensor& input,
   });
 }
 
+static void sort_multi_block(const Tensor& input,
+                             const Tensor& values,
+                             const Tensor& indices,
+                             int64_t dim,
+                             bool descending,
+                             int sort_size,
+                             int tptg,
+                             bool stable) {
+  const int elems_per_tg = tptg * TN;
+  const int n_rows = static_cast<int>(input.numel() / sort_size);
+  const int n_blocks = at::ceil_div(sort_size, elems_per_tg);
+  const bool need_permute = (dim != input.ndimension() - 1);
+
+  Tensor work_in = input;
+  std::vector<int64_t> inv_perm;
+  if (need_permute) {
+    std::vector<int64_t> perm;
+    for (int64_t i = 0; i < input.ndimension(); i++)
+      if (i != dim)
+        perm.push_back(i);
+    perm.push_back(dim);
+    work_in = input.permute(perm).contiguous();
+    inv_perm.resize(perm.size());
+    for (size_t i = 0; i < perm.size(); i++)
+      inv_perm[perm[i]] = static_cast<int64_t>(i);
+  }
+
+  // ushort indices halve merge bandwidth; direct_final lets the last merge
+  // write long indices straight to output, skipping a widen copy.
+  const bool direct_final = !need_permute;
+  const bool use_u16 = direct_final && sort_size <= 65536;
+  auto opts_val = values.options();
+  auto opts_idx = use_u16 ? at::TensorOptions().dtype(at::kShort).device(values.device())
+                          : at::TensorOptions().dtype(at::kInt).device(values.device());
+
+  auto buf_v0 = at::empty({n_rows, sort_size}, opts_val);
+  auto buf_i0 = at::empty({n_rows, sort_size}, opts_idx);
+  auto buf_v1 = n_blocks > 1 ? at::empty({n_rows, sort_size}, opts_val) : Tensor{};
+  auto buf_i1 = n_blocks > 1 ? at::empty({n_rows, sort_size}, opts_idx) : Tensor{};
+
+  const auto type_str = scalarToMetalTypeString(values);
+  const char* u16_sfx = use_u16 ? "_u16" : "";
+  const char* stable_sfx = stable ? "_stable" : "";
+  // mb_sort_block has stable variants; mb_merge doesn't (stable on stable input).
+  const auto block_fn = fmt::format("mb_sort_block_{}_tptg{}{}{}", type_str, tptg, u16_sfx, stable_sfx);
+  const auto merge_fn = fmt::format("mb_merge_{}_tptg{}{}", type_str, tptg, u16_sfx);
+  const auto final_fn = fmt::format("mb_merge_final_{}_tptg{}{}", type_str, tptg, u16_sfx);
+
+  int total_rounds = 0;
+  for (int m = 2; (m / 2) < n_blocks; m *= 2)
+    ++total_rounds;
+
+  auto mpsStream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+    @autoreleasepool {
+      auto enc = mpsStream->commandEncoder();
+
+      // Stage 1: independently sort each block
+      auto block_pso = lib.getPipelineStateForFunc(block_fn);
+      getMPSProfiler().beginProfileKernel(block_pso, block_fn, {work_in});
+      [enc setComputePipelineState:block_pso];
+      mtl_setArgs(enc,
+                  work_in,
+                  buf_v0,
+                  buf_i0,
+                  sort_size,
+                  std::array<int64_t, 2>{1, static_cast<int64_t>(sort_size)},
+                  descending);
+      [enc dispatchThreadgroups:MTLSizeMake(n_blocks, n_rows, 1) threadsPerThreadgroup:MTLSizeMake(tptg, 1, 1)];
+      getMPSProfiler().endProfileKernel(block_pso);
+
+      // Stage 2: pairwise merge passes, doubling run length each round
+      if (n_blocks > 1) {
+        auto merge_pso = lib.getPipelineStateForFunc(merge_fn);
+        auto final_pso = direct_final ? lib.getPipelineStateForFunc(final_fn) : nil;
+        bool ping = false;
+        int round = 0;
+        for (int merge_tiles = 2; (merge_tiles / 2) < n_blocks; merge_tiles *= 2, ++round) {
+          const bool is_last = direct_final && (round == total_rounds - 1);
+          const auto& v_in = ping ? buf_v1 : buf_v0;
+          const auto& i_in = ping ? buf_i1 : buf_i0;
+          const auto& v_out = is_last ? values : (ping ? buf_v0 : buf_v1);
+          const auto& i_out = is_last ? indices : (ping ? buf_i0 : buf_i1);
+          auto pso = is_last ? final_pso : merge_pso;
+          ping = !ping;
+
+          getMPSProfiler().beginProfileKernel(pso, is_last ? final_fn : merge_fn, {v_in});
+          [enc setComputePipelineState:pso];
+          mtl_setArgs(
+              enc, v_in, i_in, v_out, i_out, std::array<int32_t, 3>{sort_size, merge_tiles, n_blocks}, descending);
+          [enc dispatchThreadgroups:MTLSizeMake(n_blocks, n_rows, 1) threadsPerThreadgroup:MTLSizeMake(tptg, 1, 1)];
+          getMPSProfiler().endProfileKernel(pso);
+        }
+      }
+    }
+  });
+
+  // direct_final already wrote to values/indices.
+  if (direct_final && n_blocks > 1)
+    return;
+
+  const auto& final_v = (total_rounds % 2 == 1) ? buf_v1 : buf_v0;
+  const auto& final_i = (total_rounds % 2 == 1) ? buf_i1 : buf_i0;
+  if (need_permute) {
+    values.copy_(final_v.view(work_in.sizes()).permute(inv_perm));
+    indices.copy_(final_i.view(work_in.sizes()).permute(inv_perm));
+  } else {
+    values.copy_(final_v.view(values.sizes()));
+    indices.copy_(final_i.view(indices.sizes()));
+  }
+}
+
 void kthvalue_out_mps_impl(const Tensor& self, int64_t k, int64_t dim, Tensor& values, Tensor& indices) {
-  using namespace mps;
   if (self.dim() == 0 && self.numel() == 1) {
     values.copy_(self);
     indices.zero_();
@@ -176,23 +359,27 @@ TORCH_IMPL_FUNC(sort_stable_out_mps)
     return;
   }
 
-  // Single-block sort: last dim, segment fits in one threadgroup, and at
-  // least two rows so the dispatch uses enough GPU cores to beat MPSGraph.
-  // Everything else falls through to MPSGraph.
+  Tensor out_vals = values;
+  Tensor out_inds = indices;
+  const bool need_copy_back = !values.is_contiguous() || !indices.is_contiguous();
+  if (need_copy_back) {
+    out_vals = at::empty(self.sizes(), values.options());
+    out_inds = at::empty(self.sizes(), indices.options());
+  }
+
+  const int n_rows = static_cast<int>(self.numel() / sort_size);
+  const int tptg = select_tptg(sort_size, self.element_size(), n_rows);
+  const int elems_per_tg = tptg * TN;
   const bool is_last_dim = (dim == self.ndimension() - 1);
-  if (is_last_dim) {
-    const int n_rows = static_cast<int>(self.numel() / sort_size);
-    const int tptg = select_tptg(sort_size, self.element_size());
-    const int elems_per_tg = tptg * TN;
-    if (n_rows >= 2 && sort_size <= elems_per_tg) {
-      Tensor input = self.contiguous();
-      Tensor out_vals = values;
-      Tensor out_inds = indices;
-      const bool need_copy_back = !values.is_contiguous() || !indices.is_contiguous();
-      if (need_copy_back) {
-        out_vals = at::empty(self.sizes(), values.options());
-        out_inds = at::empty(self.sizes(), indices.options());
-      }
+  const bool stable_kernel = stable.value_or(false);
+
+  const bool use_mpsgraph = should_use_mpsgraph_fallback(sort_size, self.element_size(), elems_per_tg);
+
+  if (use_mpsgraph) {
+    sort_mpsgraph_fallback(self, out_vals, out_inds, dim, descending);
+  } else {
+    Tensor input = self.contiguous();
+    if (is_last_dim && sort_size <= elems_per_tg) {
       sort_single_block(input,
                         out_vals,
                         out_inds,
@@ -201,58 +388,15 @@ TORCH_IMPL_FUNC(sort_stable_out_mps)
                         /*stride_sort=*/1,
                         /*stride_seg=*/sort_size,
                         tptg,
-                        /*stable=*/stable.value_or(false));
-      if (need_copy_back) {
-        values.copy_(out_vals);
-        indices.copy_(out_inds);
-      }
-      return;
+                        stable_kernel);
+    } else {
+      sort_multi_block(input, out_vals, out_inds, dim, descending, sort_size, tptg, stable_kernel);
     }
   }
 
-  // MPSGraph fallback for everything else.
-  values.copy_(self);
-  MPSStream* stream = getCurrentMPSStream();
-  struct CachedGraph : public MPSCachedGraph {
-    CachedGraph(MPSGraph* graph) : MPSCachedGraph(graph) {}
-    MPSGraphTensor *selfTensor = nil, *valuesTensor = nil, *indicesTensor = nil;
-  };
-  @autoreleasepool {
-    // Input as placeholders
-    MPSShape* input_shape = getMPSShape(self);
-    NSString* ns_shape_key = [[input_shape valueForKey:@"description"] componentsJoinedByString:@","];
-    std::string key = std::string("sort:") + [ns_shape_key UTF8String] + ":" + getMPSTypeString(self) + ":dim" +
-        std::to_string(dim) + ":descending" + std::to_string(descending);
-    auto cachedGraph = LookUpOrCreateCachedGraph<CachedGraph>(key, [&](auto mpsGraph, auto newCachedGraph) {
-      newCachedGraph->selfTensor = mpsGraphRankedPlaceHolder(mpsGraph, getMPSDataType(self), input_shape);
-
-      MPSGraphTensor* castInputTensor = castToIHFTypes(mpsGraph, newCachedGraph->selfTensor, self);
-      MPSGraphTensor* sortedTensor = [mpsGraph sortWithTensor:castInputTensor
-                                                         axis:(NSInteger)dim
-                                                   descending:(BOOL)descending
-                                                         name:@"sort_out"];
-      if ([sortedTensor dataType] != getMPSDataType(values)) {
-        sortedTensor = castMPSTensor(mpsGraph, sortedTensor, values.scalar_type());
-      }
-      MPSGraphTensor* argSortedTensor = [mpsGraph argSortWithTensor:castInputTensor
-                                                               axis:(NSInteger)dim
-                                                         descending:(BOOL)descending
-                                                               name:@"argsort_out"];
-      if ([argSortedTensor dataType] != getMPSDataType(indices)) {
-        argSortedTensor = castMPSTensor(mpsGraph, argSortedTensor, indices.scalar_type());
-      }
-      newCachedGraph->valuesTensor = sortedTensor;
-      newCachedGraph->indicesTensor = argSortedTensor;
-    });
-    Placeholder inputPlaceholder = Placeholder(cachedGraph->selfTensor, self);
-    // Outputs as placeholders
-    Placeholder valuesPlaceholder = Placeholder(cachedGraph->valuesTensor, values);
-    Placeholder indicesPlaceholder = Placeholder(cachedGraph->indicesTensor, indices);
-    // Create dictionary of inputs and outputs
-    auto feeds = dictionaryFromPlaceholders(inputPlaceholder);
-    auto results = dictionaryFromPlaceholders(valuesPlaceholder, indicesPlaceholder);
-
-    runMPSGraph(stream, cachedGraph->graph(), feeds, results);
+  if (need_copy_back) {
+    values.copy_(out_vals);
+    indices.copy_(out_inds);
   }
 }
 
