@@ -93,6 +93,7 @@ REGISTER_UNARY_TI_DISPATCH(digamma);
 REGISTER_UNARY_TI_DISPATCH(bitwise_not);
 REGISTER_UNARY_TI_DISPATCH(round);
 REGISTER_UNARY_TI_DISPATCH(sigmoid);
+REGISTER_UNARY_TI_DISPATCH(logical_not);
 REGISTER_DISPATCH(special_erfcx_stub, erfcx_kernel);
 REGISTER_DISPATCH(round_decimals_stub, round_decimals_kernel);
 REGISTER_DISPATCH(pow_tensor_scalar_stub, pow_tensor_scalar_kernel);
