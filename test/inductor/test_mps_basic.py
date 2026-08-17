@@ -229,9 +229,12 @@ class MPSBasicTests(TestCase):
             ),
         )
 
-    @parametrize("shape", [(4, 5000), (3, 1023), (7, 1025), (5, 32), (1, 30000)])
+    @parametrize(
+        "shape",
+        [(4, 5000), (3, 1023), (7, 1025), (5, 31), (5, 32), (5, 33), (1, 30000)],
+    )
     def test_welford_reduction_dynamic_shape(self, shape):
-        # (5, 32): single-stage welford_reduce
+        # (5, 31), (5, 32), (5, 33): SIMD boundary cases
         # (3, 1023), (4, 5000), (7, 1025): multistage welford_reduce
         # (1, 30000): split reduction -> welford_combine
         @torch.compile(dynamic=True)
@@ -241,6 +244,63 @@ class MPSBasicTests(TestCase):
         x = torch.randn(*shape, device=self.device)
         torch._dynamo.mark_dynamic(x, 1)
         self.assertEqual(fn(x), x.var(dim=-1))
+
+    @parametrize("size", [768, 2048])
+    def test_fused_welford_threadgroup_memory(self, size):
+        # 768 previously needed 3 * 768 * 16 = 36 KiB, exceeding the affected
+        # devices' 32 KiB threadgroup-memory limit. 2048 covers the multistage
+        # path, which is capped at 1024 threads.
+        def fn(p, q, r):
+            return (
+                torch.nn.functional.layer_norm(p, p.shape[-1:])
+                + torch.nn.functional.layer_norm(q, q.shape[-1:])
+                + torch.nn.functional.layer_norm(r, r.shape[-1:])
+            )
+
+        inputs = tuple(torch.randn(8, size, device=self.device) for _ in range(3))
+        expected = fn(*inputs)
+        actual = torch.compile(fn, backend="inductor", fullgraph=True)(*inputs)
+        self.assertEqual(actual, expected)
+
+    def test_welford_zero_weight_identity(self):
+        def fn(x):
+            return x.var(dim=-1, correction=0)
+
+        # Squaring 1e20 overflows fp32, so the zero-weight identity must bypass it.
+        x = torch.full((1, 1025), 1e20, device=self.device)
+        self.assertEqual(torch.compile(fn, fullgraph=True)(x), fn(x))
+
+    @parametrize("size", [31, 33, 1025])
+    def test_welford_nonfinite(self, size):
+        def fn(x):
+            return torch.var_mean(x, dim=-1, correction=0)
+
+        # Cover single-SIMD, two-SIMD, and multistage reductions.
+        x = torch.zeros(8, size, device=self.device)
+        x[0, 0] = float("nan")
+        x[1, 0] = float("inf")
+        x[2, 0] = float("-inf")
+        # Exercise both reduction-tree operand orders and infinity categories.
+        x[3, -2] = float("inf")
+        x[4, -1] = float("inf")
+        x[5, 0] = float("inf")
+        x[5, -1] = float("-inf")
+        x[6, :2] = float("inf")
+        x[7, :2] = float("-inf")
+        self.assertEqual(torch.compile(fn, fullgraph=True)(x), fn(x))
+
+    @parametrize(
+        "dtype",
+        [dtype for dtype in (torch.float16, torch.bfloat16) if dtype in MPS_DTYPES],
+    )
+    def test_welford_lowp_backward(self, dtype):
+        def fn(x):
+            return x.var(dim=-1, correction=0)
+
+        # Multiples of 1/32 are exactly representable in both lowp dtypes.
+        x = (torch.arange(66).reshape(2, 33) - 32.5).div(16).to(dtype)
+        x.requires_grad_()
+        self.common(fn, (x,), check_gradient=True, check_lowp=False)
 
     def test_while_loop_kernel_naming(self):
         # Regression test for https://github.com/pytorch/pytorch/issues/187852

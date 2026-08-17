@@ -329,35 +329,70 @@ T threadgroup_min(threadgroup T* data, T val, unsigned idx, unsigned size) {
   return data[0];
 }
 
-// Each vec3type is tuple of mean, m2 and weight
+// A float4 stores (mean, m2, weight, check_sum). check_sum is the plain sum
+// of the inputs: it stays out of the Welford arithmetic and is only inspected
+// once at the end to recover eager nonfinite semantics without per-element
+// branches.
 template <typename T>
-float3 welford_combine(T a, T b) {
-  float delta = b.x - a.x;
-  float new_weight = a.z + b.z;
-  auto w2_over_w = new_weight != 0 ? b.z / new_weight : 0.0;
-  return float3(
+float4 welford_combine(T a, T b) {
+  const auto new_weight = a.z + b.z;
+  const auto delta = b.x - a.x;
+  const auto w2_over_w = new_weight != 0 ? b.z / new_weight : 0.0;
+  // The m2 term multiplies delta by a.z before squaring so that a zero-weight
+  // operand contributes exactly 0 even when delta * delta would overflow.
+  return float4(
       a.x + delta * w2_over_w,
-      a.y + b.y + delta * delta * a.z * w2_over_w,
-      new_weight);
+      a.y + b.y + delta * a.z * w2_over_w * delta,
+      new_weight,
+      a.w + b.w);
 }
 
-template <typename T>
-float3 threadgroup_welford_combine(
-    threadgroup T* data,
+// Combine the (mean, m2, weight) triples of a SIMD group via the parallel
+// axis theorem: m2_total = sum(m2_i) + sum(w_i * (mean_i - mean_total)^2).
+// Zero-weight lanes contribute exactly 0 to every sum, so padding needs no
+// guards.
+inline float4 simd_welford_combine(float4 val) {
+  const auto new_weight = ::metal::simd_sum(val.z);
+  const auto total = ::metal::simd_sum(val.x * val.z);
+  const auto mean = new_weight != 0 ? total / new_weight : 0.0;
+  const auto delta = val.x - mean;
+  const auto m2 = ::metal::simd_sum(val.y + val.z * delta * delta);
+  return float4(mean, m2, new_weight, ::metal::simd_sum(val.w));
+}
+
+inline float3 threadgroup_welford_combine(
+    threadgroup float4* data,
+    float4 val,
     unsigned idx,
     unsigned size) {
-  unsigned stride = 1;
-  while (stride < size) {
-    stride <<= 1;
+  auto rc = simd_welford_combine(val);
+  if (idx % simdgroup_size == 0) {
+    data[idx / simdgroup_size] = rc;
   }
-  for (stride >>= 1; stride > 0; stride >>= 1) {
+  if (size > simdgroup_size) {
     ::metal::threadgroup_barrier(::metal::mem_flags::mem_threadgroup);
-    if (idx < stride && idx + stride < size) {
-      data[idx] = welford_combine(data[idx], data[idx + stride]);
+    const auto nsimd = ceil_div(size, simdgroup_size);
+    if (idx < simdgroup_size) {
+      float4 partial = 0.0;
+      if (idx < nsimd) {
+        partial = data[idx];
+      }
+      auto rc1 = simd_welford_combine(partial);
+      if (idx == 0) {
+        data[0] = rc1;
+      }
     }
   }
   ::metal::threadgroup_barrier(::metal::mem_flags::mem_threadgroup);
-  return data[0];
+  const auto res = data[0];
+  // Match eager MPS for nonfinite inputs: any NaN or opposing infinities make
+  // both mean and m2 NaN, a single-signed infinity keeps its sign in the mean.
+  if (!::metal::isfinite(res.w)) {
+    const auto nan_value = ::metal::numeric_limits<float>::quiet_NaN();
+    const auto mean = ::metal::isnan(res.w) ? nan_value : res.w;
+    return float3(mean, nan_value, res.z);
+  }
+  return res.xyz;
 }
 
 template <typename ARG_T, typename IDX_T>

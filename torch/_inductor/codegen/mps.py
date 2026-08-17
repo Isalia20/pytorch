@@ -699,18 +699,12 @@ class MetalKernel(SIMDKernel):
 
         acc_buf_size = Min(acc_buf_size, self.max_threadgroup_size)
         acc_buf_size_str = self.sexpr(acc_buf_size)
-        # metal threadgroup arrays need a compile time constant size, so
-        # fall back to the static upper bound when acc buf size is symbolic
-        # happens when dynamic=True
-        acc_buf_alloc_size = (
-            acc_buf_size
-            if isinstance(acc_buf_size, sympy.Integer)
-            else self.max_threadgroup_size
-        )
+        # Metal threadgroup arrays require compile-time sizes, so dynamic
+        # reductions allocate for the maximum number of SIMD groups.
         shmem_buf_size = (
             ceildiv(acc_buf_size, self.simd_group_size)
             if isinstance(acc_buf_size, sympy.Integer)
-            else self.simd_group_size
+            else ceildiv(self.max_threadgroup_size, self.simd_group_size)
         )
 
         if reduction_type == "any":
@@ -802,47 +796,28 @@ class MetalKernel(SIMDKernel):
                 f"{val}, {idx_val}, {reduction_idx}, {acc_buf_size_str})",
                 dtype=dtype,
             )
-        if reduction_type == "welford_reduce":
-            if not self.multistage_reduction_entry:
-                acc_buf = self._new_idxvar("float3", acc_buf_alloc_size)
-                self.compute.splice(
-                    f"{acc_buf}[{reduction_idx}] = float3({value}, 0.0, 1.0);"
-                )
-                wf_res = self.cse.generate(
-                    self.compute,
-                    f"c10::metal::threadgroup_welford_combine({acc_buf}, {reduction_idx}, {acc_buf_size_str})",
-                    dtype=torch.float32,
-                )
-                return _unwrap_helper(wf_res)
-            acc_buf = self._new_idxvar("float3", acc_buf_alloc_size)
-            acc_thread_var = f"{acc_buf}[{reduction_idx}]"
-            self.indexing_code.splice(f"{acc_thread_var} = 0.0;")
-            self.compute.writeline(
-                f"{acc_thread_var} = ::c10::metal::welford_combine({acc_thread_var}, float3({value}, 0.0, 1.0));"
-            )
-            wf_res = self.cse.generate(
-                self.stores,
-                f"c10::metal::threadgroup_welford_combine({acc_buf}, {reduction_idx}, {acc_buf_size_str})",
-                dtype=torch.float32,
-            )
-            return _unwrap_helper(wf_res)
-        if reduction_type == "welford_combine":
-            if not isinstance(value, tuple):
-                raise AssertionError("Input to welford combine must be tuple")
-            acc_buf = self._new_idxvar("float3", acc_buf_alloc_size)
-            acc_thread_var = f"{acc_buf}[{reduction_idx}]"
-            inp_value = f"float3({value[0]}, {value[1]}, {value[2]})"
-            self.indexing_code.splice(f"{acc_thread_var} = 0.0;")
-            if self.multistage_reduction_entry:
-                self.indexing_code.splice(f"{acc_thread_var} = 0.0;")
-                self.compute.writeline(
-                    f"{acc_thread_var} = ::c10::metal::welford_combine({acc_thread_var}, {inp_value});"
-                )
+        if reduction_type in ["welford_reduce", "welford_combine"]:
+            if reduction_type == "welford_reduce":
+                inp_value = f"float4({value}, 0.0, 1.0, {value})"
             else:
-                self.compute.writeline(f"{acc_thread_var} = {inp_value};")
+                if not isinstance(value, tuple):
+                    raise AssertionError("Input to welford combine must be tuple")
+                inp_value = f"float4({value[0]}, {value[1]}, {value[2]}, {value[0]} * {value[2]})"
+            acc_buf = self._new_idxvar("float4", shmem_buf_size)
+            if self.multistage_reduction_entry:
+                val = self._new_idxvar(
+                    "float4", default_value="float4(0.0)", is_threadgroup=False
+                )
+                self.compute.writeline(
+                    f"{val} = ::c10::metal::welford_combine({val}, {inp_value});"
+                )
+                result_buffer = self.stores
+            else:
+                val = inp_value
+                result_buffer = self.compute
             wf_res = self.cse.generate(
-                self.stores if self.multistage_reduction_entry else self.compute,
-                f"c10::metal::threadgroup_welford_combine({acc_buf}, {reduction_idx}, {acc_buf_size_str})",
+                result_buffer,
+                f"c10::metal::threadgroup_welford_combine({acc_buf}, {val}, {reduction_idx}, {acc_buf_size_str})",
                 dtype=torch.float32,
             )
             return _unwrap_helper(wf_res)
