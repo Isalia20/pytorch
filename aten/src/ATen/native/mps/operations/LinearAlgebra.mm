@@ -1,9 +1,11 @@
 //  Copyright © 2022 Apple Inc.
 
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
+#include <ATen/OpMathType.h>
 #include <ATen/ceil_div.h>
 #include <ATen/mps/MPSProfiler.h>
 #include <ATen/native/BatchLinearAlgebra.h>
+#include <ATen/native/CanUse32BitIndexMath.h>
 #include <ATen/native/LinearAlgebra.h>
 #include <ATen/native/LinearAlgebraUtils.h>
 #include <ATen/native/Pool.h>
@@ -2049,21 +2051,90 @@ static void cholesky_stub_impl(const Tensor& out, const Tensor& info, bool upper
   }
 }
 
+static GeqrfParams<> get_geqrf_params(const Tensor& A, const Tensor& tau) {
+  TORCH_CHECK_NOT_IMPLEMENTED(A.dim() <= c10::metal::max_ndim, "MPS QR supports at most 16 dimensions");
+  TORCH_CHECK_NOT_IMPLEMENTED(canUse32BitIndexMath(A) && canUse32BitIndexMath(tau),
+                              "MPS QR requires tensors addressable with 32-bit indices");
+  GeqrfParams params{.num_batch_dims = c10::checked_convert<int32_t>(A.dim() - 2, "int32_t")};
+  for (const auto dim : c10::irange(A.dim())) {
+    params.A_sizes[dim] = c10::checked_convert<uint32_t>(A.size(dim), "uint32_t");
+    params.A_strides[dim] = c10::checked_convert<uint32_t>(A.stride(dim), "uint32_t");
+    if (dim < tau.dim()) {
+      params.tau_strides[dim] = c10::checked_convert<uint32_t>(tau.stride(dim), "uint32_t");
+    }
+  }
+  return params;
+}
+
+static std::pair<Tensor, Tensor> householder_block(const Tensor& A, const Tensor& tau) {
+  auto sizes = A.sizes().vec();
+  std::swap(sizes[sizes.size() - 2], sizes.back());
+  auto V = at::empty(sizes, A.options()).transpose(-2, -1);
+  auto W = at::empty_like(V);
+  auto params = get_geqrf_params(A, tau);
+  auto batches = batchCount(A);
+  auto stream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      auto encoder = stream->commandEncoder();
+      auto pso = lib.getPipelineStateForFunc(fmt::format("householder_block_{}", scalarToMetalTypeString(A)));
+      getMPSProfiler().beginProfileKernel(pso, "householder_block", {A, tau}, stream);
+      [encoder setComputePipelineState:pso];
+      mtl_setArgs(encoder, A, tau, V, W, params);
+      auto threads = A.size(-2) > 8192 ? 1024 : A.size(-2) > 1024 ? 512 : 128;
+      threads = std::min<NSUInteger>(threads, pso.maxTotalThreadsPerThreadgroup);
+      [encoder dispatchThreadgroups:MTLSizeMake(A.size(-1) * batches, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+      getMPSProfiler().endProfileKernel(pso, stream);
+    }
+  });
+  return {V, W};
+}
+
+static void apply_householder_block(const Tensor& V, const Tensor& W, Tensor target) {
+  // Apply I - V W^H; swap the factors when constructing Q.
+  auto projection = at::matmul(W.mH(), target);
+  if (target.dim() == 2) {
+    target.addmm_(V, projection, 1, -1);
+  } else {
+    target.sub_(at::matmul(V, projection));
+  }
+}
+
 static Tensor& orgqr_stub_impl(Tensor& self, const Tensor& tau) {
   if (self.numel() == 0) {
     return self;
   }
 
   auto m = self.size(-2);
-  auto m2 = m * m;
   auto n = self.size(-1);
   auto k = tau.size(-1);
 
   if (tau.numel() == 0) {
-    auto I = eye(m, self.scalar_type(), std::nullopt, self.device());
-    return self.copy_(I.slice(-1, 0, n));
+    return self.copy_(at::eye(m, n, self.options()));
   }
 
+  if (m > 32) {
+    auto opmath_dtype = at::toOpMathType(self.scalar_type());
+    if (self.scalar_type() != opmath_dtype) {
+      auto result = self.to(opmath_dtype);
+      orgqr_stub_impl(result, tau.to(result.scalar_type()));
+      return self.copy_(result);
+    }
+    auto block_size = m > 2048 && m > 4 * n ? 32 : 128;
+    auto reflectors = cloneBatchedColumnMajor(self.narrow(-1, 0, k));
+    auto tau_work = self.is_alias_of(tau) ? tau.clone() : tau;
+    self.copy_(at::eye(m, n, self.options()));
+    for (int64_t i = (k - 1) / block_size * block_size; i >= 0; i -= block_size) {
+      auto width = std::min<int64_t>(block_size, k - i);
+      auto panel = reflectors.narrow(-2, i, m - i).narrow(-1, i, width);
+      auto [V, W] = householder_block(panel, tau_work.narrow(-1, i, width));
+      apply_householder_block(W, V, self.narrow(-2, i, m - i).narrow(-1, i, n - i));
+    }
+    return self;
+  }
+
+  auto m2 = m * m;
   auto num_batch_dims = self.dim() - 2;
   auto batch_sizes = self.sizes().slice(0, num_batch_dims);
   int64_t num_batches = c10::multiply_integers(batch_sizes);
@@ -2420,36 +2491,54 @@ static void geqrf_kernel_mps(const Tensor& A, const Tensor& tau) {
   }
 
   auto m = A.size(-2);
-  auto batch_size = c10::multiply_integers(A.sizes().slice(0, A.dim() - 2));
-  auto v_work = at::empty({batch_size, m}, A.options());
-
-  GeqrfParams params;
-
-  for (const auto dim : c10::irange(A.dim())) {
-    params.A_sizes[dim] = A.size(dim);
-    params.A_strides[dim] = A.stride(dim);
-
-    if (dim < tau.dim()) {
-      params.tau_strides[dim] = tau.stride(dim);
+  auto n = A.size(-1);
+  if (m > 32 && n > 32) {
+    auto block_size = m > 4096 && m > 4 * n ? 8 : 32;
+    auto k = std::min(m, n);
+    for (int64_t i = 0; i < k; i += block_size) {
+      auto width = std::min<int64_t>(block_size, k - i);
+      auto panel = A.narrow(-2, i, m - i).narrow(-1, i, width);
+      auto panel_tau = tau.narrow(-1, i, width);
+      geqrf_kernel_mps(panel, panel_tau);
+      if (i + width < n) {
+        auto [V, W] = householder_block(panel, panel_tau);
+        apply_householder_block(V, W, A.narrow(-2, i, m - i).narrow(-1, i + width, n - i - width));
+      }
     }
+    return;
   }
 
-  params.num_batch_dims = A.dim() - 2;
+  auto batch_size = batchCount(A);
+  auto use_panel = m > 32 && m <= 2048 && n <= 32;
+  auto rows_per_thread = m <= 256 ? 8 : m <= 512 ? 16 : m <= 1024 ? 32 : 64;
+  constexpr auto simd_size = c10::metal::simdgroup_size;
+  auto pso = lib.getPipelineStateForFunc(use_panel ? fmt::format("geqrf_panel_{}", rows_per_thread)
+                                                   : fmt::format("geqrf_{}", scalarToMetalTypeString(A)));
+  if (use_panel && n * simd_size > pso.maxTotalThreadsPerThreadgroup) {
+    use_panel = false;
+    pso = lib.getPipelineStateForFunc(fmt::format("geqrf_{}", scalarToMetalTypeString(A)));
+  }
+  auto v_work = use_panel ? Tensor() : at::empty({batch_size, m}, A.options());
+  auto params = get_geqrf_params(A, tau);
 
   MPSStream* stream = getCurrentMPSStream();
 
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
       auto compute_encoder = stream->commandEncoder();
-      auto pso = lib.getPipelineStateForFunc(fmt::format("geqrf_{}", scalarToMetalTypeString(A)));
-
       getMPSProfiler().beginProfileKernel(pso, "geqrf", {A}, stream);
       [compute_encoder setComputePipelineState:pso];
 
-      MTLSize threadGroupSize = MTLSizeMake([pso maxTotalThreadsPerThreadgroup], 1, 1);
+      auto threads = use_panel               ? n * simd_size
+          : m <= simd_size && n <= simd_size ? simd_size
+                                             : pso.maxTotalThreadsPerThreadgroup;
+      MTLSize threadGroupSize = MTLSizeMake(threads, 1, 1);
       MTLSize gridSize = MTLSizeMake(batch_size, 1, 1);
 
-      mtl_setArgs(compute_encoder, A, tau, params, v_work);
+      mtl_setArgs(compute_encoder, A, tau, params);
+      if (!use_panel) {
+        mtl_setBuffer(compute_encoder, v_work, 3);
+      }
       [compute_encoder dispatchThreadgroups:gridSize threadsPerThreadgroup:threadGroupSize];
 
       getMPSProfiler().endProfileKernel(pso, stream);
