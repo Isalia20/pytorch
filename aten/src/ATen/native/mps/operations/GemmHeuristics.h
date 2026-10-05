@@ -1,8 +1,11 @@
 #pragma once
 
+#include <ATen/native/mps/kernels/Gemm.h>
 #include <c10/core/ScalarType.h>
 
+#include <array>
 #include <cstdint>
+#include <string>
 
 namespace at::native::mps {
 
@@ -63,5 +66,24 @@ class GemvPolicy {
  private:
   uint32_t cores_; // scales the occupancy targets with device size
 };
+
+struct GemmPlan {
+  std::string kernel;
+  GemmParams params;
+  std::array<uint64_t, 3> groups, threads;
+  uint64_t threadgroup_memory;
+};
+
+GemmPlan gemm_plan(
+    c10::ScalarType dt,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t batch,
+    bool ta,
+    bool tb,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc);
 
 } // namespace at::native::mps
