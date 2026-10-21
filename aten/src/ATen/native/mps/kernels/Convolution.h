@@ -39,6 +39,18 @@ struct Conv2DParams {
   bool has_bias;
 };
 
+// conv2d_mpp: K (per tap) is split into `splits` chunks of K_split; Wp > 0 is
+// the position pitch of FLAT tiles; parity > 0 is where the odd columns of a
+// de-interleaved (stride 2) input row start.
+struct Conv2dMppParams {
+  Conv2DParams conv;
+  int32_t K;
+  int32_t K_split;
+  int32_t splits;
+  int32_t Wp;
+  int32_t parity;
+};
+
 // Shared between Convolution.metal and operations/Convolution.mm. conv3d_mpp
 // bakes kernel, stride, and dilation into template args; conv3d_simd reads
 // them from here.

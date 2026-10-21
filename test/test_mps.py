@@ -13698,6 +13698,123 @@ class TestViewOpsMPS(TestCaseMPS):
             res[device] = dst.resolve_conj().resolve_neg().cpu()
         self.assertEqual(res["cpu"], res["mps"])
 
+class TestConvolutionMetal(TestCaseMPS):
+    @dtypes(torch.float32, torch.float16, torch.bfloat16)
+    @parametrize("channels_last", [False, True])
+    @parametrize("with_bias", [False, True])
+    @parametrize("groups", [1, 3])
+    def test_conv2d_strided_operands(self, device, dtype, channels_last, with_bias, groups):
+        x = torch.randn(2, 5 * groups, 15, 38, device=device, dtype=dtype)
+        if channels_last:
+            x = x.to(memory_format=torch.channels_last)
+        x = x[..., 1::2]
+        w = torch.randn(7 * groups, 5, 3, 6, device=device, dtype=dtype)[..., 1::2]
+        b = torch.randn(14 * groups, device=device, dtype=dtype)[1::2] if with_bias else None
+        kwargs = dict(stride=(2, 1), padding=(2, 3), dilation=(2, 3), groups=groups)
+        expected = F.conv2d(x.cpu().float(), w.cpu().float(), b.cpu().float() if with_bias else None, **kwargs)
+        actual = F.conv2d(x, w, b, **kwargs)
+        tol = {torch.float32: 1e-4, torch.float16: 5e-3, torch.bfloat16: 5e-2}[dtype]
+        self.assertEqual(actual.cpu().float(), expected, atol=tol, rtol=tol)
+
+    @dtypes(torch.float32, torch.bfloat16)
+    @parametrize("layout", ["contiguous", "channels_last"])
+    @parametrize("case", [
+        # (input, weight, stride, padding, dilation, groups), one per Metal conv2d route
+        ((2, 48, 17, 70), (40, 48, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # row tiles, left padding shift
+        ((1, 33, 129, 131), (95, 33, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # fixed 3x3, 96-channel output tile
+        ((1, 63, 257, 513), (63, 63, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # fixed 3x3, large map with partial tiles
+        ((1, 48, 9, 130), (40, 48, 3, 5), (1, 1), (2, 3), (2, 2), 1),  # dilation, partial tiles
+        ((3, 48, 20, 20), (40, 48, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # flat tiles with junk columns
+        ((2, 48, 41, 71), (40, 48, 3, 3), (2, 3), (1, 2), (1, 1), 1),  # strided, merged taps on NHWC copy
+        ((1, 32, 64, 97), (40, 32, 3, 3), (2, 2), (1, 1), (1, 1), 1),  # stride 2, de-interleaved rows
+        ((2, 48, 50, 130), (40, 48, 3, 5), (2, 2), (1, 2), (1, 1), 1),  # stride 2, taps two columns into the padding
+        ((1, 64, 48, 60), (64, 32, 3, 3), (2, 2), (1, 1), (1, 1), 2),  # stride 2, grouped
+        ((2, 40, 20, 200), (100, 40, 3, 5), (2, 2), (1, 2), (1, 1), 1),  # stride 2, de-interleaved in threadgroup memory
+        ((2, 34, 97, 129), (190, 17, 3, 3), (2, 2), (1, 1), (1, 1), 2),  # stride 2, 96-channel tile and partial groups
+        ((2, 16, 17, 72), (257, 16, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # packed 3x3, fixed input channels
+        ((2, 49, 65, 66), (137, 49, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # packed flat 3x3, partial chunks and tiles
+        ((2, 13, 31, 137), (29, 13, 3, 3), (2, 2), (1, 1), (1, 1), 1),  # stride 2, all taps in one channel chunk
+        ((8, 129, 31, 29), (255, 129, 3, 3), (2, 2), (1, 1), (1, 1), 1),  # stride 2, 256-channel tile and partial chunk
+        ((2, 64, 30, 31), (96, 64, 1, 1), (2, 2), (0, 0), (1, 1), 1),  # pointwise, strided
+        ((32, 129, 55, 50), (257, 129, 1, 1), (2, 2), (0, 0), (1, 1), 1),  # fused sampling, partial channels and row
+        ((32, 129, 56, 51), (257, 129, 1, 1), (2, 2), (0, 0), (1, 1), 1),  # fused sampling, odd width with aligned rows
+        ((1, 512, 64, 64), (512, 512, 1, 1), (1, 1), (0, 0), (1, 1), 1),  # pointwise matmul
+        ((1, 128, 513, 513), (129, 128, 1, 1), (1, 1), (0, 0), (1, 1), 1),  # pointwise register input, partial tiles
+        ((1, 256, 512, 512), (160, 256, 1, 1), (1, 1), (0, 0), (1, 1), 1),  # pointwise register input, C256
+        ((8, 64, 33, 65), (63, 64, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # narrow collective tile, full reduction
+        ((8, 128, 33, 65), (63, 128, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # narrow collective tile, transposed weights
+        ((1, 176, 129, 131), (63, 176, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # narrow collective tile, compact masks
+        ((1, 96, 150, 150), (257, 96, 1, 1), (1, 1), (0, 0), (1, 1), 1),  # direct pointwise, partial output tile
+        ((32, 257, 27, 31), (255, 257, 1, 1), (1, 1), (0, 0), (1, 1), 1),  # direct pointwise, 128x32 tile
+        ((2, 257, 65, 67), (47, 257, 1, 1), (1, 1), (0, 0), (1, 1), 1),  # direct pointwise, 64x128 tile
+        ((2, 160, 63, 67), (480, 160, 1, 1), (1, 1), (0, 0), (1, 1), 1),  # batched pointwise, 160x32 tile
+        ((3, 127, 23, 25), (513, 127, 1, 1), (1, 1), (0, 0), (1, 1), 1),  # batched pointwise, partial channels and tiles
+        ((1, 256, 16, 16), (256, 32, 1, 1), (1, 1), (0, 0), (1, 1), 8),  # grouped pointwise
+        ((2, 32, 33, 37), (48, 32, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # winograd, odd map
+        ((2, 160, 120, 120), (176, 160, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # winograd, two tile chunks
+        ((40, 257, 25, 33), (128, 257, 3, 3), (1, 1), (2, 2), (1, 1), 1),  # 4x2 winograd, chunk boundary and padding
+        ((8, 129, 51, 67), (65, 129, 3, 3), (1, 1), (0, 0), (1, 1), 1),  # 4x2 winograd, partial channels on Apple9
+        ((1, 129, 65, 67), (128, 129, 3, 3), (1, 1), (0, 2), (1, 1), 1),  # 4x2 winograd, single image
+        ((1, 128, 183, 185), (255, 128, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # 4x2 winograd, partial output tile on Apple10
+        ((2, 13, 257, 257), (15, 13, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # fused winograd, 16x16 tile
+        ((4, 17, 129, 129), (15, 17, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # fused winograd, batched small maps
+        ((1, 19, 363, 363), (3, 19, 3, 3), (1, 1), (2, 2), (1, 1), 1),  # fused winograd, 8x32 tile
+        ((2, 257, 92, 94), (3, 257, 3, 3), (1, 1), (2, 2), (1, 1), 1),  # fused winograd, 8x8 tile
+        ((2, 33, 91, 93), (65, 33, 3, 3), (1, 1), (2, 2), (1, 1), 1),  # fused winograd, register output transform
+        ((2, 257, 91, 93), (32, 257, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # fused winograd, many input channels
+        ((1, 96, 129, 129), (96, 96, 3, 3), (1, 1), (0, 0), (1, 1), 1),  # fused winograd instead of separate transforms
+        ((2, 3, 100, 100), (64, 3, 7, 7), (2, 2), (3, 3), (1, 1), 1),  # few input channels
+        ((1, 3, 64, 96), (64, 3, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # few input channels, all taps folded
+        ((1, 4, 40, 40), (64, 4, 1, 1), (1, 1), (0, 0), (1, 1), 1),  # few input channels, pointwise
+        ((2, 4, 17, 40), (12, 4, 1, 1), (1, 1), (0, 0), (2, 2), 1),  # packed pointwise, partial threadgroup
+        ((2, 1, 31, 80), (68, 1, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # packed 3x3, partial threadgroup
+        ((2, 3, 33, 72), (16, 3, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # packed 3x3, three input channels
+        ((2, 3, 65, 80), (16, 3, 3, 3), (2, 2), (1, 1), (1, 1), 1),  # packed stride 2, odd height
+        ((2, 129, 28, 34), (384, 129, 2, 2), (2, 2), (0, 0), (1, 1), 1),  # fused patch merge, partial channel chunk and row
+        ((1, 4, 33, 33), (100, 4, 2, 2), (2, 2), (0, 0), (1, 1), 1),  # patch embedding via im2col
+        ((8, 385, 13, 15), (513, 385, 3, 3), (2, 2), (1, 1), (1, 1), 1),  # im2col, direct 64x64 GEMM
+        ((1, 513, 47, 49), (1027, 513, 3, 3), (2, 2), (1, 1), (1, 1), 1),  # im2col, direct 64x32 GEMM on Apple9
+        ((1, 256, 28, 28), (256, 8, 3, 3), (1, 1), (1, 1), (1, 1), 32),  # grouped via im2col
+        ((1, 128, 56, 56), (256, 64, 3, 3), (1, 1), (1, 1), (1, 1), 2),  # grouped direct
+        ((1, 48, 9, 9), (10, 48, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # 16-wide output tile
+        ((2, 24, 13, 37), (1, 24, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # single output channel, direct
+        ((2, 31, 129, 133), (1, 31, 1, 1), (1, 1), (0, 0), (1, 1), 1),  # single output channel, fixed pointwise
+        ((9, 15, 257, 257), (1, 15, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # single output channel, paired output rows
+        ((2, 65, 257, 259), (1, 65, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # paired output rows on Apple10, partial tile
+        ((1, 16, 11, 21), (2, 8, 5, 3), (2, 1), (2, 1), (1, 1), 2),  # single output channel per group, generic
+        ((2, 65, 31, 32), (130, 1, 3, 3), (1, 1), (1, 1), (1, 1), 65),  # depthwise full tiles
+        ((1, 32, 33, 35), (32, 1, 3, 3), (2, 2), (1, 1), (1, 1), 32),  # depthwise
+        ((1, 32, 33, 35), (64, 1, 5, 5), (1, 1), (2, 2), (1, 1), 32),  # depthwise multiplier
+        ((1, 32, 33, 35), (32, 1, 4, 6), (1, 1), (1, 2), (1, 1), 32),  # depthwise generic taps
+        ((1, 8, 300, 300), (8, 8, 256, 3), (1, 1), (0, 0), (1, 1), 1),  # filter dim >= 256
+    ], name_fn=lambda c: "x".join(map(str, c[0])) + "_w" + "x".join(map(str, c[1])))
+    def test_conv2d_metal_routes(self, device, dtype, layout, case):
+        input_shape, weight_shape, stride, padding, dilation, groups = case
+        x = torch.randn(input_shape, dtype=dtype)
+        w = torch.randn(weight_shape, dtype=dtype) * (weight_shape[1] * weight_shape[2] * weight_shape[3]) ** -0.5
+        b = torch.randn(weight_shape[0], dtype=dtype)
+        x_device = x.to(device)
+        if layout == "channels_last":
+            x_device = x_device.to(memory_format=torch.channels_last)
+        ref = F.conv2d(x.float(), w.float(), b.float(), stride, padding, dilation, groups)
+        out = F.conv2d(x_device, w.to(device), b.to(device), stride, padding, dilation, groups)
+        if layout == "channels_last":
+            self.assertTrue(out.is_contiguous(memory_format=torch.channels_last))
+        tol = (2e-4 if dtype == torch.float32 else 5e-2) * ref.abs().max().item()
+        self.assertEqual(out.cpu().float(), ref, atol=tol, rtol=0)
+        if (input_shape[1] <= 4 or weight_shape[2:] == (2, 2) or
+                (weight_shape[2:] in ((1, 1), (3, 3)) and stride == (2, 2)) or
+                (input_shape[1] == 16 and weight_shape[0] >= 256) or
+                (weight_shape[2:] == (1, 1) and input_shape[1] in (128, 256)) or
+                (input_shape[0] >= 8 and input_shape[1] in (64, 128) and weight_shape[0] <= 64) or
+                (input_shape[0] == 1 and input_shape[1] == 176) or
+                (weight_shape[2:] == (3, 3) and 32 < input_shape[1] < 128 and weight_shape[0] > 128)) and layout == "contiguous":
+            offset_input = torch.empty(x.numel() + 1, dtype=dtype, device=device)[1:].view(input_shape)
+            offset_input.copy_(x_device)
+            out = F.conv2d(offset_input, w.to(device), b.to(device), stride, padding, dilation, groups)
+            self.assertEqual(out.cpu().float(), ref, atol=tol, rtol=0)
+
+
 class TestConvolutionMPS(TestCaseMPS):
     def test_conv1d_all_strides_paddings(self):
         # https://github.com/pytorch/pytorch/issues/82921
@@ -16795,7 +16912,7 @@ class TestMetalLibrary(TestCaseMPS):
         src = torch.arange(2 * 11 * 35, dtype=torch.float32, device="mps").reshape(2, 11, 35)
         dst = torch.empty(2, 35, 11, device="mps")
         kernel = lib.nchw_to_nhwc_float_16_64_false_false
-        kernel(src, dst, [11, 35], threads=(256, 1, 2), group_size=(256, 1, 1), arg_casts="int32")
+        kernel(src, dst, [11, 1, 35, 35], [0, 0], [1, 1, 1, 1], threads=(256, 1, 2), group_size=(256, 1, 1), arg_casts="int32")
         self.assertEqual(dst, src.permute(0, 2, 1))
 
     def test_conv_weight_to_dhwio_kernel(self):
@@ -16825,6 +16942,7 @@ instantiate_device_type_tests(TestErrorInputs, globals(), allow_mps=True, only_f
 instantiate_device_type_tests(TestCommon, globals(), allow_mps=True, only_for="mps")
 instantiate_device_type_tests(TestLinalgMPS, globals(), allow_mps=True, only_for="mps")
 instantiate_device_type_tests(TestInnerContiguous, globals(), allow_mps=True, only_for="mps")
+instantiate_device_type_tests(TestConvolutionMetal, globals(), allow_mps=True, only_for="mps")
 instantiate_parametrized_tests(TestAdvancedIndexing)
 instantiate_parametrized_tests(TestNondeterministic)
 instantiate_parametrized_tests(TestAutocastMPS)
