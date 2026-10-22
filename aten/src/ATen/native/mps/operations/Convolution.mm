@@ -119,6 +119,24 @@ static at::native::mps::Placeholder make_conv_placeholder(MPSGraphTensor* graphT
                                       at::native::mps::getMPSNDArray(t, at::native::mps::getMPSShape(t, desc_layout)));
 }
 
+template <typename Encode>
+static void conv_metal_launch(id<MTLComputePipelineState> pipeline,
+                              const char* kernel_name,
+                              ArrayRef<Tensor> inputs,
+                              const Encode& encode) {
+  using namespace mps;
+  auto stream = getCurrentMPSStream();
+  dispatch_sync_with_rethrow(stream->queue(), ^() {
+    @autoreleasepool {
+      auto encoder = stream->commandEncoder();
+      getMPSProfiler().beginProfileKernel(pipeline, kernel_name, inputs, stream);
+      [encoder setComputePipelineState:pipeline];
+      encode(encoder);
+      getMPSProfiler().endProfileKernel(pipeline, stream);
+    }
+  });
+}
+
 static void nchw_to_nhwc(const Tensor& source,
                          const Tensor& output,
                          int64_t channels,
@@ -155,16 +173,9 @@ static void nchw_to_nhwc(const Tensor& source,
   const auto threadgroups = MTLSizeMake(c10::metal::ceil_div(padded, int64_t(spatial_tile)),
                                         c10::metal::ceil_div(channels, int64_t(channel_tile)),
                                         batches);
-  auto stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
-    @autoreleasepool {
-      auto encoder = stream->commandEncoder();
-      getMPSProfiler().beginProfileKernel(pipeline, "nchw_to_nhwc", {source}, stream);
-      [encoder setComputePipelineState:pipeline];
-      mtl_setArgs(encoder, source, output, dims, pad, filter_rows);
-      [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-      getMPSProfiler().endProfileKernel(pipeline, stream);
-    }
+  conv_metal_launch(pipeline, "nchw_to_nhwc", {source}, [&](id<MTLComputeCommandEncoder> encoder) {
+    mtl_setArgs(encoder, source, output, dims, pad, filter_rows);
+    [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   });
 }
 
@@ -276,29 +287,6 @@ MTLComputePipelineState_t mps::Conv3dSimdTile::pipeline_state(mps::MetalShaderLi
   return library.getPipelineStateForFunc(name);
 }
 
-static void conv3d_metal_launch(id<MTLComputePipelineState> pipeline,
-                                const char* kernel_name,
-                                const Tensor& activation,
-                                const Tensor& weights,
-                                const std::optional<Tensor>& bias,
-                                const Tensor& output,
-                                Conv3DParams params,
-                                MTLSize threadgroups,
-                                MTLSize threads_per_threadgroup) {
-  using namespace mps;
-  auto stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
-    @autoreleasepool {
-      auto encoder = stream->commandEncoder();
-      getMPSProfiler().beginProfileKernel(pipeline, kernel_name, {activation, weights}, stream);
-      [encoder setComputePipelineState:pipeline];
-      mtl_setArgs(encoder, activation, weights, output, params, bias ? *bias : activation);
-      [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_threadgroup];
-      getMPSProfiler().endProfileKernel(pipeline, stream);
-    }
-  });
-}
-
 // conv3d forward on the Metal kernels: MPP on macOS 26.2+, simdgroup otherwise;
 // planes past int32 take the long-indexed simdgroup variant on any macOS.
 static void conv3d_metal_forward(const Tensor& input_t,
@@ -408,8 +396,10 @@ static void conv3d_metal_forward(const Tensor& input_t,
                                             static_cast<NSUInteger>(width_tiles),
                                             static_cast<NSUInteger>(height_tiles) * conv2d.N * params.outD);
       const auto threads_per_threadgroup = MTLSizeMake(tile.simdgroups * 32, 1, 1);
-      conv3d_metal_launch(
-          pipeline, "conv3d_mpp", activation, weights, bias, output_t, params, threadgroups, threads_per_threadgroup);
+      conv_metal_launch(pipeline, "conv3d_mpp", {activation, weights}, [&](id<MTLComputeCommandEncoder> encoder) {
+        mtl_setArgs(encoder, activation, weights, output_t, params, bias ? *bias : activation);
+        [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_threadgroup];
+      });
       return;
     }
   }
@@ -424,8 +414,10 @@ static void conv3d_metal_forward(const Tensor& input_t,
                                         static_cast<NSUInteger>(conv2d.N) * params.outD);
   const auto threads_per_threadgroup =
       MTLSizeMake(static_cast<NSUInteger>(tile.simdgroups_rows) * tile.simdgroups_columns * 32, 1, 1);
-  conv3d_metal_launch(
-      pipeline, "conv3d_simd", activation, weights, bias, output_t, params, threadgroups, threads_per_threadgroup);
+  conv_metal_launch(pipeline, "conv3d_simd", {activation, weights}, [&](id<MTLComputeCommandEncoder> encoder) {
+    mtl_setArgs(encoder, activation, weights, output_t, params, bias ? *bias : activation);
+    [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_threadgroup];
+  });
 }
 
 // A 1x1x1 stride-1 no-pad conv is a per-voxel GEMM over channels; both the
@@ -731,19 +723,12 @@ static void conv2d_depthwise_forward(const Tensor& input_t,
                                                           fast ? params.sW : 0,
                                                           scalarToMetalTypeString(input),
                                                           full));
-  auto stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
-    @autoreleasepool {
-      auto encoder = stream->commandEncoder();
-      getMPSProfiler().beginProfileKernel(pipeline, "conv2d_depthwise", {input, weight}, stream);
-      [encoder setComputePipelineState:pipeline];
-      mtl_setArgs(encoder, input, weight, output, params, bias);
-      const auto nx = c10::metal::ceil_div(int64_t(params.outW), rw);
-      const auto ny = c10::metal::ceil_div(int64_t(params.outH), int64_t(2));
-      [encoder dispatchThreads:MTLSizeMake(nx, ny, params.N * params.C_in)
-          threadsPerThreadgroup:MTLSizeMake(std::min<int64_t>(nx, 32), std::min<int64_t>(ny, 8), 1)];
-      getMPSProfiler().endProfileKernel(pipeline, stream);
-    }
+  const auto nx = c10::metal::ceil_div(int64_t(params.outW), rw);
+  const auto ny = c10::metal::ceil_div(int64_t(params.outH), int64_t(2));
+  conv_metal_launch(pipeline, "conv2d_depthwise", {input, weight}, [&](id<MTLComputeCommandEncoder> encoder) {
+    mtl_setArgs(encoder, input, weight, output, params, bias);
+    [encoder dispatchThreads:MTLSizeMake(nx, ny, params.N * params.C_in)
+        threadsPerThreadgroup:MTLSizeMake(std::min<int64_t>(nx, 32), std::min<int64_t>(ny, 8), 1)];
   });
   if (!output.is_same(output_t)) {
     output_t.copy_(output);
@@ -756,18 +741,11 @@ static Tensor conv2d_im2col(const Tensor& input, const Conv2DParams& params) {
   auto columns = at::empty({params.N, params.C_in * taps, params.outH, params.outW}, input.options());
   const std::array<int64_t, 4> strides{input.stride(0), input.stride(1), input.stride(2), input.stride(3)};
   auto pipeline = lib.getPipelineStateForFunc(fmt::format("conv2d_im2col_{}", scalarToMetalTypeString(input)));
-  auto stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
-    @autoreleasepool {
-      auto encoder = stream->commandEncoder();
-      getMPSProfiler().beginProfileKernel(pipeline, "conv2d_im2col", {input}, stream);
-      [encoder setComputePipelineState:pipeline];
-      mtl_setArgs(encoder, input, columns, params, strides);
-      const auto groups8 = c10::metal::ceil_div(positions, int64_t(8));
-      [encoder dispatchThreads:MTLSizeMake(groups8, params.C_in * taps, params.N)
-          threadsPerThreadgroup:MTLSizeMake(std::min<int64_t>(groups8, 256), 1, 1)];
-      getMPSProfiler().endProfileKernel(pipeline, stream);
-    }
+  const auto groups8 = c10::metal::ceil_div(positions, int64_t(8));
+  conv_metal_launch(pipeline, "conv2d_im2col", {input}, [&](id<MTLComputeCommandEncoder> encoder) {
+    mtl_setArgs(encoder, input, columns, params, strides);
+    [encoder dispatchThreads:MTLSizeMake(groups8, params.C_in * taps, params.N)
+        threadsPerThreadgroup:MTLSizeMake(std::min<int64_t>(groups8, 256), 1, 1)];
   });
   return columns;
 }
@@ -778,18 +756,11 @@ static Tensor conv2d_deinterleave(const Tensor& input) {
   auto output = at::empty({input.size(0), input.size(1), input.size(2), W + 1}, input.options());
   const std::array<int32_t, 2> dims{static_cast<int32_t>(W), static_cast<int32_t>((W + 1) / 2 + 1)};
   auto pipeline = lib.getPipelineStateForFunc("conv2d_deinterleave_" + scalarToMetalTypeString(input));
-  auto stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
-    @autoreleasepool {
-      auto encoder = stream->commandEncoder();
-      getMPSProfiler().beginProfileKernel(pipeline, "conv2d_deinterleave", {input}, stream);
-      [encoder setComputePipelineState:pipeline];
-      mtl_setArgs(encoder, input, output, dims);
-      const auto columns = c10::metal::ceil_div(W + 1, int64_t(4));
-      [encoder dispatchThreads:MTLSizeMake(columns, rows, 1)
-          threadsPerThreadgroup:MTLSizeMake(std::min<int64_t>(columns, 256), 1, 1)];
-      getMPSProfiler().endProfileKernel(pipeline, stream);
-    }
+  const auto columns = c10::metal::ceil_div(W + 1, int64_t(4));
+  conv_metal_launch(pipeline, "conv2d_deinterleave", {input}, [&](id<MTLComputeCommandEncoder> encoder) {
+    mtl_setArgs(encoder, input, output, dims);
+    [encoder dispatchThreads:MTLSizeMake(columns, rows, 1)
+        threadsPerThreadgroup:MTLSizeMake(std::min<int64_t>(columns, 256), 1, 1)];
   });
   return output;
 }
@@ -806,6 +777,7 @@ static void conv2d_mpp_forward(const Tensor& input_t,
   using namespace mps;
   constexpr int64_t kTile = 64;
   const int64_t kH = weight_t.size(2), kW = weight_t.size(3), Cg = weight_t.size(1), Og = output_t.size(1) / groups;
+  const auto dtype = mps::scalarToMetalTypeString(input_t);
   const bool out_nhwc = !output_t.is_contiguous();
   const bool has_bias = bias_opt && bias_opt->defined();
   const auto bias = has_bias ? bias_opt->to(input_t.scalar_type()).contiguous() : input_t;
@@ -832,73 +804,65 @@ static void conv2d_mpp_forward(const Tensor& input_t,
       .C_out_per_group = static_cast<int32_t>(Og),
       .has_bias = has_bias,
   };
+  const auto launch =
+      [&](const std::string& name, const Tensor& weight, MTLSize grid, MTLSize block, bool dispatch_threads = false) {
+        auto pipeline = lib.getPipelineStateForFunc(name);
+        conv_metal_launch(pipeline, name.c_str(), {input, weight}, [&](id<MTLComputeCommandEncoder> encoder) {
+          mtl_setArgs(encoder, input, weight, output_t, params, bias);
+          if (dispatch_threads) {
+            [encoder dispatchThreads:grid threadsPerThreadgroup:block];
+          } else {
+            [encoder dispatchThreadgroups:grid threadsPerThreadgroup:block];
+          }
+        });
+      };
   const bool pointwise = kH == 1 && kW == 1 && padding[0] == 0 && padding[1] == 0;
   const bool patch_embed =
       kH == stride[0] && kW == stride[1] && padding[0] == 0 && padding[1] == 0 && dilation[0] == 1 && dilation[1] == 1;
   const bool strided = stride[0] > 1 || stride[1] > 1;
   const bool apple10 = is_apple_family_or_newer(AppleGPUFamily::APPLE_10_PLUS);
+  const bool bfloat_simd = is_apple_family_or_newer(AppleGPUFamily::APPLE_9_PLUS) && input.scalar_type() == kBFloat16;
+  const bool bfloat_nchw = bfloat_simd && groups == 1 && !in_nhwc && !out_nhwc;
   static const int64_t cores = std::max<int64_t>(at::mps::MPSDevice::getInstance()->getCoreCount(), 8);
   const int64_t target = (apple10 ? 8 : 16) * cores;
   const bool tiny_s2 = Cg == 3 && stride[0] == 2 && stride[1] == 2 && params.W % 16 == 0 && Og <= (apple10 ? 16 : 32);
   const bool tiny_3x3 = kH == 3 && kW == 3 && padding[0] == 1 && padding[1] == 1 && dilation[0] == 1 &&
       dilation[1] == 1 && params.W % 8 == 0 &&
       ((!strided && (Cg == 1 || (Cg == 3 && (!apple10 || Og <= 32)))) || tiny_s2);
-  if (is_apple_family_or_newer(AppleGPUFamily::APPLE_9_PLUS) && input.scalar_type() == kBFloat16 && groups == 1 &&
-      !in_nhwc && !out_nhwc && Og % 4 == 0 && input.storage_offset() % 2 == 0 && output_t.storage_offset() % 2 == 0 &&
+  if (bfloat_nchw && Og % 4 == 0 && input.storage_offset() % 2 == 0 && output_t.storage_offset() % 2 == 0 &&
       ((pointwise && !strided && Cg == 4 && int64_t(params.H) * params.W % 8 == 0) || tiny_3x3)) {
     const auto w = weight_t.contiguous();
-    auto pipeline = lib.getPipelineStateForFunc(fmt::format("conv2d_tiny_{}_{}_{}_bfloat", Cg, kW, stride[1]));
     const int64_t columns = pointwise ? int64_t(params.H) * params.W / 8 : params.outW / 8;
-    auto stream = getCurrentMPSStream();
-    dispatch_sync_with_rethrow(stream->queue(), ^() {
-      @autoreleasepool {
-        auto encoder = stream->commandEncoder();
-        getMPSProfiler().beginProfileKernel(pipeline, "conv2d_tiny", {input, w}, stream);
-        [encoder setComputePipelineState:pipeline];
-        mtl_setArgs(encoder, input, w, output_t, params, bias);
-        [encoder dispatchThreads:MTLSizeMake(columns,
-                                             pointwise ? Og / 4 : params.outH,
-                                             pointwise ? params.N : params.N * Og / 4)
-            threadsPerThreadgroup:MTLSizeMake(std::min<int64_t>(columns, 256), 1, 1)];
-        getMPSProfiler().endProfileKernel(pipeline, stream);
-      }
-    });
+    launch(fmt::format("conv2d_tiny_{}_{}_{}_bfloat", Cg, kW, stride[1]),
+           w,
+           MTLSizeMake(columns, pointwise ? Og / 4 : params.outH, pointwise ? params.N : params.N * Og / 4),
+           MTLSizeMake(std::min<int64_t>(columns, 256), 1, 1),
+           true);
     return;
   }
   const int64_t o1_threads = c10::metal::ceil_div(int64_t(params.outW), int64_t(8)) * params.outH;
   if (Og == 1 && !in_nhwc && !out_nhwc && o1_threads * params.N * params.C_out >= 4096) {
-    const bool wide = input.scalar_type() == kBFloat16 && is_apple_family_or_newer(AppleGPUFamily::APPLE_9_PLUS) &&
-        stride[1] == 1 && dilation[1] == 1 &&
+    const bool wide = bfloat_simd && stride[1] == 1 && dilation[1] == 1 &&
         ((kW == 1 && Cg <= 32) || (kW == 3 && Cg <= 16 && o1_threads * params.N * params.C_out >= 65536));
-    const bool paired = input.scalar_type() == kBFloat16 && is_apple_family_or_newer(AppleGPUFamily::APPLE_9_PLUS) &&
-        kH == 3 && kW == 3 && stride[0] == 1 && stride[1] == 1 && dilation[0] == 1 && dilation[1] == 1 && Cg <= 128 &&
-        o1_threads * params.N * params.C_out >= 16384 && (apple10 || (Cg <= 16 && o1_threads >= 4096));
+    const bool paired = bfloat_simd && kH == 3 && kW == 3 && stride[0] == 1 && stride[1] == 1 && dilation[0] == 1 &&
+        dilation[1] == 1 && Cg <= 128 && o1_threads * params.N * params.C_out >= 16384 &&
+        (apple10 || (Cg <= 16 && o1_threads >= 4096));
     const bool fixed = (kW == 3 || wide) && stride[1] == 1 && dilation[1] == 1;
     const int64_t width = paired ? 4 : wide ? 16 : 8, height = paired ? 2 : 1;
     const int64_t threads =
         c10::metal::ceil_div(int64_t(params.outW), width) * c10::metal::ceil_div(int64_t(params.outH), height);
     const auto w = weight_t.contiguous();
-    auto pipeline = lib.getPipelineStateForFunc(fmt::format(
-        "conv2d_o1_{}_{}_{}_{}_{}", fixed ? kW : 0, fixed ? 1 : 0, height, width, scalarToMetalTypeString(input)));
-    auto stream = getCurrentMPSStream();
-    dispatch_sync_with_rethrow(stream->queue(), ^() {
-      @autoreleasepool {
-        auto encoder = stream->commandEncoder();
-        getMPSProfiler().beginProfileKernel(pipeline, "conv2d_o1", {input, w}, stream);
-        [encoder setComputePipelineState:pipeline];
-        mtl_setArgs(encoder, input, w, output_t, params, bias);
-        [encoder dispatchThreads:MTLSizeMake(threads, params.N * params.C_out, 1)
-            threadsPerThreadgroup:MTLSizeMake(std::min<int64_t>(threads, 256), 1, 1)];
-        getMPSProfiler().endProfileKernel(pipeline, stream);
-      }
-    });
+    launch(fmt::format("conv2d_o1_{}_{}_{}_{}_{}", fixed ? kW : 0, fixed ? 1 : 0, height, width, dtype),
+           w,
+           MTLSizeMake(threads, params.N * params.C_out, 1),
+           MTLSizeMake(std::min<int64_t>(threads, 256), 1, 1),
+           true);
     return;
   }
   const bool small_wino = Og > 1 && Og <= 4 && Cg >= 256 && Cg <= 384 && int64_t(params.H) * params.W < 131072 &&
       int64_t(params.N) * params.H * params.W >= 16384;
-  if (!apple10 && is_apple_family_or_newer(AppleGPUFamily::APPLE_9_PLUS) && !in_nhwc && !out_nhwc &&
-      input.scalar_type() == kBFloat16 && groups == 1 && kH == 3 && kW == 3 && stride[0] == 1 && stride[1] == 1 &&
-      dilation[0] == 1 && dilation[1] == 1 && Cg >= 8 &&
+  if (!apple10 && bfloat_nchw && kH == 3 && kW == 3 && stride[0] == 1 && stride[1] == 1 && dilation[0] == 1 &&
+      dilation[1] == 1 && Cg >= 8 &&
       (fused_mid || small_wino ||
        (Og > 1 && Og <= 16 && int64_t(params.H) * params.W * (Og <= 8 ? 1 : params.N) >= (Og <= 8 ? 131072 : 65536)))) {
     const int64_t rows = fused_mid ? 32 : Og <= 8 ? 8 : 16, columns = small_wino ? 8 : rows == 8 ? 32 : 16;
@@ -907,22 +871,10 @@ static void conv2d_mpp_forward(const Tensor& input_t,
     constexpr int64_t max_int = std::numeric_limits<int32_t>::max();
     const bool index32 = int64_t(params.C_in) * params.H * params.W <= max_int &&
         int64_t(params.C_out) * params.outH * params.outW <= max_int && w.numel() <= max_int;
-    auto pipeline = lib.getPipelineStateForFunc(
-        fmt::format("conv2d_winograd_fused_{}x{}_bfloat_{}", rows, columns, index32 ? "int" : "long"));
-    auto stream = getCurrentMPSStream();
-    dispatch_sync_with_rethrow(stream->queue(), ^() {
-      @autoreleasepool {
-        auto encoder = stream->commandEncoder();
-        getMPSProfiler().beginProfileKernel(pipeline, "conv2d_winograd_fused", {input, w}, stream);
-        [encoder setComputePipelineState:pipeline];
-        mtl_setArgs(encoder, input, w, output_t, params, bias);
-        [encoder
-             dispatchThreadgroups:MTLSizeMake(
-                                      c10::metal::ceil_div(Og, rows), c10::metal::ceil_div(tiles, columns), params.N)
-            threadsPerThreadgroup:MTLSizeMake(fused_mid ? 256 : 128, 1, 1)];
-        getMPSProfiler().endProfileKernel(pipeline, stream);
-      }
-    });
+    launch(fmt::format("conv2d_winograd_fused_{}x{}_bfloat_{}", rows, columns, index32 ? "int" : "long"),
+           w,
+           MTLSizeMake(c10::metal::ceil_div(Og, rows), c10::metal::ceil_div(tiles, columns), params.N),
+           MTLSizeMake(fused_mid ? 256 : 128, 1, 1));
     return;
   }
   const bool single_pointwise = apple10 && params.N == 1 && input.scalar_type() == kBFloat16 &&
@@ -933,21 +885,10 @@ static void conv2d_mpp_forward(const Tensor& input_t,
       !in_nhwc && !strided && (Cg == 128 || Cg == 256) && Og >= 128 && Og <= 256 && pointwise_plane >= 262144 &&
       pointwise_plane <= std::numeric_limits<int32_t>::max() / std::max(Cg, Og)) {
     const auto w = weight_t.contiguous();
-    auto pipeline = lib.getPipelineStateForFunc(fmt::format("conv2d_pointwise_{}", Cg));
-    auto stream = getCurrentMPSStream();
-    dispatch_sync_with_rethrow(stream->queue(), ^() {
-      @autoreleasepool {
-        auto encoder = stream->commandEncoder();
-        getMPSProfiler().beginProfileKernel(pipeline, "conv2d_pointwise", {input, w}, stream);
-        [encoder setComputePipelineState:pipeline];
-        mtl_setArgs(encoder, input, w, output_t, params, bias);
-        [encoder dispatchThreadgroups:MTLSizeMake(c10::metal::ceil_div(pointwise_plane, int64_t(128)),
-                                                  c10::metal::ceil_div(Og, int64_t(64)),
-                                                  1)
-                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-        getMPSProfiler().endProfileKernel(pipeline, stream);
-      }
-    });
+    launch(fmt::format("conv2d_pointwise_{}", Cg),
+           w,
+           MTLSizeMake(c10::metal::ceil_div(pointwise_plane, int64_t(128)), c10::metal::ceil_div(Og, int64_t(64)), 1),
+           MTLSizeMake(128, 1, 1));
     return;
   }
   if (pointwise && apple10 && groups == 1 && params.N == 1 && !out_nhwc && !in_nhwc && !strided && !single_pointwise &&
@@ -972,24 +913,14 @@ static void conv2d_mpp_forward(const Tensor& input_t,
   const bool narrow_large =
       params.N == 1 && Cg == 176 && params.W >= 128 && params.W <= 512 && positions >= 16384 && positions <= 131072;
   const int64_t narrow_columns = Cg == 64 ? 64 : 128;
-  if (packed3 && !strided && groups == 1 && input.scalar_type() == kBFloat16 && !in_nhwc && !out_nhwc &&
-      (narrow_batch || narrow_large) && Og > 32 && Og <= 64 &&
+  if (packed3 && !strided && bfloat_nchw && (narrow_batch || narrow_large) && Og > 32 && Og <= 64 &&
       params.N * c10::metal::ceil_div(positions, narrow_columns) >= target) {
     const auto w = conv3d_weights_to_dhwio((Cg == 128 ? weight_t : weight_t.transpose(0, 1)).unsqueeze(2));
     const int64_t simdgroups = Cg == 128 ? 8 : 4;
-    auto pipeline = lib.getPipelineStateForFunc(fmt::format("conv2d_narrow_{}", Cg));
-    auto stream = getCurrentMPSStream();
-    dispatch_sync_with_rethrow(stream->queue(), ^() {
-      @autoreleasepool {
-        auto encoder = stream->commandEncoder();
-        getMPSProfiler().beginProfileKernel(pipeline, "conv2d_narrow", {input, w}, stream);
-        [encoder setComputePipelineState:pipeline];
-        mtl_setArgs(encoder, input, w, output_t, params, bias);
-        [encoder dispatchThreadgroups:MTLSizeMake(1, c10::metal::ceil_div(positions, narrow_columns), params.N)
-                threadsPerThreadgroup:MTLSizeMake(32 * simdgroups, 1, 1)];
-        getMPSProfiler().endProfileKernel(pipeline, stream);
-      }
-    });
+    launch(fmt::format("conv2d_narrow_{}", Cg),
+           w,
+           MTLSizeMake(1, c10::metal::ceil_div(positions, narrow_columns), params.N),
+           MTLSizeMake(32 * simdgroups, 1, 1));
     return;
   }
   const bool patch_flat = packed3 && !strided && Cg > 32 && Cg < 128 && Og > 128 && Og <= 256 && params.W >= 32 &&
@@ -1003,35 +934,22 @@ static void conv2d_mpp_forward(const Tensor& input_t,
        (Cg >= 128 && Og > 128 && Og <= 256 && params.outW > 8 && params.outW <= 16 &&
         int64_t(params.N) * params.outH >= target));
   const bool packed_patch = (params.W % 2 == 0 || (sample_s2 && params.H % 2 == 0)) && input.storage_offset() % 2 == 0;
-  if (is_apple_family_or_newer(AppleGPUFamily::APPLE_9_PLUS) && groups == 1 && input.scalar_type() == kBFloat16 &&
-      !in_nhwc && !out_nhwc && (patch_s1 || patch_s2 || (packed_patch && (sample_s2 || patch2)))) {
+  if (bfloat_nchw && (patch_s1 || patch_s2 || (packed_patch && (sample_s2 || patch2)))) {
     const auto w = weight_t.contiguous();
     const int64_t rows = patch_flat ? 128 : patch_s1 ? 64 : patch_s2 ? (Cg <= 16 ? 32 : 256) : sample_s2 ? 128 : 192;
     const int64_t columns = patch_flat ? 32 : patch_s1 || (patch_s2 && Cg <= 16) ? 64 : sample_s2 ? 32 : 16;
-    auto pipeline = lib.getPipelineStateForFunc(fmt::format("conv2d_patch_{}_{}_s{}_bfloat", kH, rows, params.sH));
-    auto stream = getCurrentMPSStream();
-    dispatch_sync_with_rethrow(stream->queue(), ^() {
-      @autoreleasepool {
-        auto encoder = stream->commandEncoder();
-        getMPSProfiler().beginProfileKernel(pipeline, "conv2d_patch", {input, w}, stream);
-        [encoder setComputePipelineState:pipeline];
-        mtl_setArgs(encoder, input, w, output_t, params, bias);
-        [encoder dispatchThreadgroups:MTLSizeMake(c10::metal::ceil_div(Og, rows),
-                                                  patch_flat ? c10::metal::ceil_div(positions, columns)
-                                                             : params.outH *
-                                                          c10::metal::ceil_div(int64_t(params.outW), columns),
-                                                  params.N)
-                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-        getMPSProfiler().endProfileKernel(pipeline, stream);
-      }
-    });
+    launch(fmt::format("conv2d_patch_{}_{}_s{}_bfloat", kH, rows, params.sH),
+           w,
+           MTLSizeMake(c10::metal::ceil_div(Og, rows),
+                       patch_flat ? c10::metal::ceil_div(positions, columns)
+                                  : params.outH * c10::metal::ceil_div(int64_t(params.outW), columns),
+                       params.N),
+           MTLSizeMake(128, 1, 1));
     return;
   }
   const int64_t im2col_bytes = output_t.numel() / output_t.size(1) * Cg * kH * kW * groups * input.element_size();
-  const bool direct_columns = is_apple_family_or_newer(AppleGPUFamily::APPLE_9_PLUS) &&
-      input.scalar_type() == kBFloat16 && groups == 1 && !in_nhwc && !out_nhwc && stride[0] == 2 && stride[1] == 2 &&
-      dilation[0] == 1 && dilation[1] == 1 && kH == kW && (kH == 2 || kH == 3) && Og >= 512 &&
-      im2col_bytes <= (int64_t(128) << 20) &&
+  const bool direct_columns = bfloat_nchw && stride[0] == 2 && stride[1] == 2 && dilation[0] == 1 && dilation[1] == 1 &&
+      kH == kW && (kH == 2 || kH == 3) && Og >= 512 && im2col_bytes <= (int64_t(128) << 20) &&
       (apple10 ? (params.N > 1 && Cg >= 384 && positions <= 256) ||
                (params.N == 1 && Cg >= 512 && positions >= 512 &&
                 (padding[0] > 0 || padding[1] > 0 || positions >= 8192))
@@ -1042,8 +960,7 @@ static void conv2d_mpp_forward(const Tensor& input_t,
   const bool flat = !strided && tile_waste > 11.0f / float(Og) + 0.08f && tile_waste * float(Cg * kH * kW) > 1000.0f;
   const float waste32 = 1.0f - float(params.outW) / float(c10::metal::ceil_div(int64_t(params.outW), int64_t(32)) * 32);
   const bool narrow_better = tile_waste - waste32 >= 0.14f;
-  const bool s2_mid =
-      Og > 64 && Og <= 96 && input.scalar_type() == kBFloat16 && is_apple_family_or_newer(AppleGPUFamily::APPLE_9_PLUS);
+  const bool s2_mid = Og > 64 && Og <= 96 && bfloat_simd;
   const int64_t bm = Og <= 16 ? 16 : Og <= 32 ? 32 : Og <= 64 ? 64 : s2_mid ? 96 : 128;
   const auto s2_threadgroups = [&](int64_t bn) {
     return c10::metal::ceil_div(Og, bm) * groups * params.outH * c10::metal::ceil_div(int64_t(params.outW), bn) *
@@ -1056,22 +973,12 @@ static void conv2d_mpp_forward(const Tensor& input_t,
       Cg <= 128 && params.outW >= 24 && std::min(tile_waste, waste32) < 0.35f && s2_threadgroups(bn) >= 4 * cores) {
     const int64_t simdgroups = bm == 128 ? 8 : 4;
     const auto w = conv3d_weights_to_dhwio(weight_t.transpose(0, 1).unsqueeze(2));
-    auto pipeline = lib.getPipelineStateForFunc(
-        fmt::format("conv2d_s2_b{}x{}_s{}_{}", bm, bn, simdgroups, scalarToMetalTypeString(input)));
-    auto stream = getCurrentMPSStream();
-    dispatch_sync_with_rethrow(stream->queue(), ^() {
-      @autoreleasepool {
-        auto encoder = stream->commandEncoder();
-        getMPSProfiler().beginProfileKernel(pipeline, "conv2d_s2", {input, w}, stream);
-        [encoder setComputePipelineState:pipeline];
-        mtl_setArgs(encoder, input, w, output_t, params, bias);
-        [encoder dispatchThreadgroups:MTLSizeMake(c10::metal::ceil_div(Og, bm) * groups,
-                                                  params.outH * c10::metal::ceil_div(int64_t(params.outW), bn),
-                                                  params.N)
-                threadsPerThreadgroup:MTLSizeMake(simdgroups * 32, 1, 1)];
-        getMPSProfiler().endProfileKernel(pipeline, stream);
-      }
-    });
+    launch(fmt::format("conv2d_s2_b{}x{}_s{}_{}", bm, bn, simdgroups, dtype),
+           w,
+           MTLSizeMake(c10::metal::ceil_div(Og, bm) * groups,
+                       params.outH * c10::metal::ceil_div(int64_t(params.outW), bn),
+                       params.N),
+           MTLSizeMake(simdgroups * 32, 1, 1));
     return;
   }
   // Folding taps into K needs an NHWC staging copy (kH copies for every tap);
@@ -1189,13 +1096,11 @@ static void conv2d_mpp_forward(const Tensor& input_t,
           target;
   const bool long_pointwise = apple10 && params.N > 1 && Cg >= 256 && Og > 32 && Og <= 64 && params.W >= 4096;
   const bool fast_pointwise = direct_columns ||
-      (is_apple_family_or_newer(AppleGPUFamily::APPLE_9_PLUS) && pointwise && !strided && groups == 1 &&
-       input.scalar_type() == kBFloat16 && !in_nhwc && !out_nhwc &&
+      (bfloat_nchw && pointwise && !strided &&
        (wide_pointwise || compact_pointwise || long_pointwise || single_pointwise ||
         (apple10 && params.N > 1 && Cg > 16 && Cg <= 128 && Og >= 512 && params.W >= 512)));
-  const bool fixed3x3 = apple10 && input.scalar_type() == kBFloat16 && !in_nhwc && !out_nhwc && groups == 1 &&
-      Wp == 0 && params.kH == 3 && params.kW == 3 && params.sH == 1 && params.sW == 1 && params.dH == 1 &&
-      params.dW == 1 && params.padH == 1 && params.padW == 1 &&
+  const bool fixed3x3 = apple10 && bfloat_nchw && Wp == 0 && params.kH == 3 && params.kW == 3 && params.sH == 1 &&
+      params.sW == 1 && params.dH == 1 && params.dW == 1 && params.padH == 1 && params.padW == 1 &&
       ((params.N == 1 && Cg > 32 && Cg <= 64 && Og > 32 && Og <= 64 && positions >= 131072) ||
        (Cg > 16 && Og > 64 && Og <= 96 && params.outW >= 64 &&
         params.N * params.outH * c10::metal::ceil_div(int64_t(params.outW), int64_t(64)) >= target));
@@ -1269,7 +1174,7 @@ static void conv2d_mpp_forward(const Tensor& input_t,
                                                               : fast_pointwise ? "pw1_"
                                                               : staged         ? "st_"
                                                                                : "",
-                                                          scalarToMetalTypeString(input)));
+                                                          dtype));
   auto stream = getCurrentMPSStream();
   dispatch_sync_with_rethrow(stream->queue(), ^() {
     @autoreleasepool {
@@ -1281,7 +1186,7 @@ static void conv2d_mpp_forward(const Tensor& input_t,
               threadsPerThreadgroup:MTLSizeMake(simdgroups * 32, 1, 1)];
       getMPSProfiler().endProfileKernel(pipeline, stream);
       if (partials) {
-        auto reduce = lib.getPipelineStateForFunc("conv2d_split_reduce_" + scalarToMetalTypeString(input));
+        auto reduce = lib.getPipelineStateForFunc("conv2d_split_reduce_" + dtype);
         const auto image = int64_t(params.C_out) * params.outH * params.outW;
         const std::array<int32_t, 4> geometry{params.C_out, params.outH, params.outW, static_cast<int32_t>(pitch)};
         const std::array<int32_t, 4> counts{static_cast<int32_t>(splits), params.N, has_bias, out_nhwc};
@@ -1324,18 +1229,12 @@ static void conv2d_winograd_forward(const Tensor& input_t,
                                      static_cast<int32_t>(TW),
                                      static_cast<int32_t>(padding[0]),
                                      static_cast<int32_t>(padding[1])};
-  auto stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
-    @autoreleasepool {
-      auto encoder = stream->commandEncoder();
-      auto wk = lib.getPipelineStateForFunc(fmt::format("winograd_weights_{}{}", tile_h == 4 ? "4_" : "", dtype));
-      getMPSProfiler().beginProfileKernel(wk, "winograd_weights", {weight}, stream);
-      [encoder setComputePipelineState:wk];
-      mtl_setArgs(encoder, weight, weights, wdims);
-      [encoder dispatchThreads:MTLSizeMake(C, O, 1) threadsPerThreadgroup:MTLSizeMake(std::min<int64_t>(C, 256), 1, 1)];
-      getMPSProfiler().endProfileKernel(wk, stream);
-    }
+  auto wk = lib.getPipelineStateForFunc(fmt::format("winograd_weights_{}{}", tile_h == 4 ? "4_" : "", dtype));
+  conv_metal_launch(wk, "winograd_weights", {weight}, [&](id<MTLComputeCommandEncoder> encoder) {
+    mtl_setArgs(encoder, weight, weights, wdims);
+    [encoder dispatchThreads:MTLSizeMake(C, O, 1) threadsPerThreadgroup:MTLSizeMake(std::min<int64_t>(C, 256), 1, 1)];
   });
+  auto stream = getCurrentMPSStream();
   for (int64_t t0 = 0; t0 < tiles; t0 += chunk) {
     const int32_t count = static_cast<int32_t>(std::min(chunk, tiles - t0)), start = static_cast<int32_t>(t0);
     const auto v = transformed.as_strided({1, coefficients * C, 1, count}, {coefficients * C * count, count, count, 1});
@@ -1378,21 +1277,15 @@ static void conv2d_winograd_forward(const Tensor& input_t,
     if (tile_h == 2) {
       conv2d_mpp_forward(v, weights.view({16 * O, C, 1, 1}), std::nullopt, {0, 0}, {1, 1}, {1, 1}, 16, m);
     }
-    dispatch_sync_with_rethrow(stream->queue(), ^() {
-      @autoreleasepool {
-        auto encoder = stream->commandEncoder();
-        auto ok = lib.getPipelineStateForFunc(fmt::format("winograd_output_{}_{}",
-                                                          tile_h == 4    ? "4"
-                                                              : out_nhwc ? "nhwc"
-                                                                         : "nchw",
-                                                          dtype));
-        getMPSProfiler().beginProfileKernel(ok, "winograd_output", {m}, stream);
-        [encoder setComputePipelineState:ok];
-        mtl_setArgs(encoder, m, has_bias ? std::optional<Tensor>(bias) : std::nullopt, output_t, odims, ogeom);
-        [encoder dispatchThreads:MTLSizeMake(count, O, 1)
-            threadsPerThreadgroup:MTLSizeMake(std::min<int64_t>(count, 256), 1, 1)];
-        getMPSProfiler().endProfileKernel(ok, stream);
-      }
+    auto ok = lib.getPipelineStateForFunc(fmt::format("winograd_output_{}_{}",
+                                                      tile_h == 4    ? "4"
+                                                          : out_nhwc ? "nhwc"
+                                                                     : "nchw",
+                                                      dtype));
+    conv_metal_launch(ok, "winograd_output", {m}, [&](id<MTLComputeCommandEncoder> encoder) {
+      mtl_setArgs(encoder, m, has_bias ? std::optional<Tensor>(bias) : std::nullopt, output_t, odims, ogeom);
+      [encoder dispatchThreads:MTLSizeMake(count, O, 1)
+          threadsPerThreadgroup:MTLSizeMake(std::min<int64_t>(count, 256), 1, 1)];
     });
   }
 }

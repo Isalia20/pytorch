@@ -7,29 +7,8 @@
 
 using namespace metal;
 
-// 4-wide loads of 16-bit types go through ushort; to_float restores T.
-template <typename T>
-struct conv2d_vec {
-  using scalar = ushort;
-  using packed = packed_ushort4;
-  static float to_float(ushort v) {
-    return float(as_type<T>(v));
-  }
-  static ushort bits(T v) {
-    return as_type<ushort>(v);
-  }
-};
-template <>
-struct conv2d_vec<float> {
-  using scalar = float;
-  using packed = packed_float4;
-  static float to_float(float v) {
-    return v;
-  }
-  static float bits(float v) {
-    return v;
-  }
-};
+#define INSTANTIATE_CONV2D(NAME, ...) \
+  template [[host_name(NAME)]] [[kernel]] decltype(__VA_ARGS__) __VA_ARGS__
 
 // NCHW -> zero-padded NHWC whose rows are the KH filter rows of each output
 // row; dims = {C, H, W, Wp}, pad = {padH, padW}, rows = {KH, SH, DH, Hout}.
@@ -1095,16 +1074,8 @@ kernel void conv2d_pointwise(
   res.store(out.slice(x0, o0));
 }
 
-#define INSTANTIATE_CONV2D_POINTWISE_REGISTERS(C)            \
-  template [[host_name("conv2d_pointwise_" #C)]] kernel void \
-  conv2d_pointwise<C>(                                       \
-      device bfloat*,                                        \
-      device bfloat*,                                        \
-      device bfloat*,                                        \
-      constant Conv2DParams&,                                \
-      device const bfloat*,                                  \
-      uint3,                                                 \
-      uint);
+#define INSTANTIATE_CONV2D_POINTWISE_REGISTERS(C) \
+  INSTANTIATE_CONV2D("conv2d_pointwise_" #C, conv2d_pointwise<C>);
 
 INSTANTIATE_CONV2D_POINTWISE_REGISTERS(128)
 INSTANTIATE_CONV2D_POINTWISE_REGISTERS(256)
@@ -1225,15 +1196,9 @@ kernel void conv2d_narrow(
   res.store(out.slice(t0, o0));
 }
 
-#define INSTANTIATE_CONV2D_NARROW(C)                                        \
-  template [[host_name("conv2d_narrow_" #C)]] kernel void conv2d_narrow<C>( \
-      device bfloat*,                                                       \
-      device bfloat*,                                                       \
-      device bfloat*,                                                       \
-      constant Conv2DParams&,                                               \
-      device const bfloat*,                                                 \
-      uint3,                                                                \
-      uint);
+#define INSTANTIATE_CONV2D_NARROW(C) \
+  INSTANTIATE_CONV2D("conv2d_narrow_" #C, conv2d_narrow<C>);
+
 INSTANTIATE_CONV2D_NARROW(64)
 INSTANTIATE_CONV2D_NARROW(128)
 INSTANTIATE_CONV2D_NARROW(176)
@@ -1442,7 +1407,7 @@ kernel void conv2d_mpp(
   } else {
     // Small-K tiles are store bound: go through threadgroup memory so each
     // output row leaves as 16-byte vectors.
-    using P4 = typename conv2d_vec<T>::packed;
+    using P4 = packed_vec<T, 4>;
     threadgroup T stage[BM * BN];
     tensor<threadgroup T, extents, tensor_inline> st(
         stage, extents(BN, BM), strides{1, BN});
@@ -1470,30 +1435,15 @@ kernel void conv2d_mpp(
   }
 }
 
-#define INSTANTIATE_CONV2D_MPP(DT, IN, IN_NHWC, OUT, OUT_NHWC, BM, BN, NSG)  \
-  template [[host_name("conv2d_mpp_" #IN "_" #OUT "_b" #BM "x" #BN "_s" #NSG \
-                       "_" #DT)]] kernel void                                \
-  conv2d_mpp<DT, IN_NHWC, OUT_NHWC, BM, BN, NSG>(                            \
-      device DT*,                                                            \
-      device DT*,                                                            \
-      device DT*,                                                            \
-      constant Conv2dMppParams&,                                             \
-      device const DT*,                                                      \
-      device float*,                                                         \
-      uint3,                                                                 \
-      uint);
+#define INSTANTIATE_CONV2D_MPP(DT, IN, IN_NHWC, OUT, OUT_NHWC, BM, BN, NSG) \
+  INSTANTIATE_CONV2D(                                                       \
+      "conv2d_mpp_" #IN "_" #OUT "_b" #BM "x" #BN "_s" #NSG "_" #DT,        \
+      conv2d_mpp<DT, IN_NHWC, OUT_NHWC, BM, BN, NSG>);
 
-#define INSTANTIATE_CONV2D_MPP_STAGED(DT, NSG)                            \
-  template [[host_name("conv2d_mpp_nhwc_nchw_b64x64_s" #NSG "_st_" #DT)]] \
-  kernel void conv2d_mpp<DT, true, false, 64, 64, NSG, true>(             \
-      device DT*,                                                         \
-      device DT*,                                                         \
-      device DT*,                                                         \
-      constant Conv2dMppParams&,                                          \
-      device const DT*,                                                   \
-      device float*,                                                      \
-      uint3,                                                              \
-      uint);
+#define INSTANTIATE_CONV2D_MPP_STAGED(DT, NSG)         \
+  INSTANTIATE_CONV2D(                                  \
+      "conv2d_mpp_nhwc_nchw_b64x64_s" #NSG "_st_" #DT, \
+      conv2d_mpp<DT, true, false, 64, 64, NSG, true>);
 
 #define INSTANTIATE_CONV2D_MPP_LAYOUTS(DT, BM, BN, NSG)             \
   INSTANTIATE_CONV2D_MPP(DT, nchw, false, nchw, false, BM, BN, NSG) \
@@ -1501,50 +1451,28 @@ kernel void conv2d_mpp(
   INSTANTIATE_CONV2D_MPP(DT, nhwc, true, nchw, false, BM, BN, NSG)  \
   INSTANTIATE_CONV2D_MPP(DT, nhwc, true, nhwc, true, BM, BN, NSG)
 
-#define INSTANTIATE_CONV2D_MPP_ALL(DT, BM)      \
-  INSTANTIATE_CONV2D_MPP_LAYOUTS(DT, BM, 64, 2) \
-  INSTANTIATE_CONV2D_MPP_LAYOUTS(DT, BM, 64, 4)
+#define INSTANTIATE_CONV2D_MPP_ALL(DT)           \
+  INSTANTIATE_CONV2D_MPP_LAYOUTS(DT, 16, 64, 2)  \
+  INSTANTIATE_CONV2D_MPP_LAYOUTS(DT, 16, 64, 4)  \
+  INSTANTIATE_CONV2D_MPP_LAYOUTS(DT, 32, 64, 2)  \
+  INSTANTIATE_CONV2D_MPP_LAYOUTS(DT, 32, 64, 4)  \
+  INSTANTIATE_CONV2D_MPP_LAYOUTS(DT, 64, 64, 2)  \
+  INSTANTIATE_CONV2D_MPP_LAYOUTS(DT, 64, 64, 4)  \
+  INSTANTIATE_CONV2D_MPP_LAYOUTS(DT, 64, 16, 2)  \
+  INSTANTIATE_CONV2D_MPP_LAYOUTS(DT, 64, 32, 2)  \
+  INSTANTIATE_CONV2D_MPP_LAYOUTS(DT, 32, 32, 2)  \
+  INSTANTIATE_CONV2D_MPP_LAYOUTS(DT, 16, 128, 2) \
+  INSTANTIATE_CONV2D_MPP_STAGED(DT, 2)           \
+  INSTANTIATE_CONV2D_MPP_STAGED(DT, 4)
 
-INSTANTIATE_CONV2D_MPP_ALL(float, 16)
-INSTANTIATE_CONV2D_MPP_ALL(float, 32)
-INSTANTIATE_CONV2D_MPP_ALL(float, 64)
-INSTANTIATE_CONV2D_MPP_ALL(half, 16)
-INSTANTIATE_CONV2D_MPP_ALL(half, 32)
-INSTANTIATE_CONV2D_MPP_ALL(half, 64)
-INSTANTIATE_CONV2D_MPP_ALL(bfloat, 16)
-INSTANTIATE_CONV2D_MPP_ALL(bfloat, 32)
-INSTANTIATE_CONV2D_MPP_ALL(bfloat, 64)
-INSTANTIATE_CONV2D_MPP_LAYOUTS(float, 64, 16, 2)
-INSTANTIATE_CONV2D_MPP_LAYOUTS(float, 64, 32, 2)
-INSTANTIATE_CONV2D_MPP_LAYOUTS(float, 32, 32, 2)
-INSTANTIATE_CONV2D_MPP_LAYOUTS(float, 16, 128, 2)
-INSTANTIATE_CONV2D_MPP_LAYOUTS(half, 64, 16, 2)
-INSTANTIATE_CONV2D_MPP_LAYOUTS(half, 64, 32, 2)
-INSTANTIATE_CONV2D_MPP_LAYOUTS(half, 32, 32, 2)
-INSTANTIATE_CONV2D_MPP_LAYOUTS(half, 16, 128, 2)
-INSTANTIATE_CONV2D_MPP_LAYOUTS(bfloat, 64, 16, 2)
-INSTANTIATE_CONV2D_MPP_LAYOUTS(bfloat, 64, 32, 2)
-INSTANTIATE_CONV2D_MPP_LAYOUTS(bfloat, 32, 32, 2)
-INSTANTIATE_CONV2D_MPP_LAYOUTS(bfloat, 16, 128, 2)
-INSTANTIATE_CONV2D_MPP_STAGED(float, 2)
-INSTANTIATE_CONV2D_MPP_STAGED(float, 4)
-INSTANTIATE_CONV2D_MPP_STAGED(half, 2)
-INSTANTIATE_CONV2D_MPP_STAGED(half, 4)
-INSTANTIATE_CONV2D_MPP_STAGED(bfloat, 2)
-INSTANTIATE_CONV2D_MPP_STAGED(bfloat, 4)
+INSTANTIATE_CONV2D_MPP_ALL(float)
+INSTANTIATE_CONV2D_MPP_ALL(half)
+INSTANTIATE_CONV2D_MPP_ALL(bfloat)
 
-#define INSTANTIATE_CONV2D_POINTWISE(BM, BN, NSG, PW)                   \
-  template [[host_name("conv2d_mpp_nchw_nchw_b" #BM "x" #BN "_s" #NSG   \
-                       "_pw" #PW "_bfloat")]]                           \
-  kernel void conv2d_mpp<bfloat, false, false, BM, BN, NSG, false, PW>( \
-      device bfloat*,                                                   \
-      device bfloat*,                                                   \
-      device bfloat*,                                                   \
-      constant Conv2dMppParams&,                                        \
-      device const bfloat*,                                             \
-      device float*,                                                    \
-      uint3,                                                            \
-      uint);
+#define INSTANTIATE_CONV2D_POINTWISE(BM, BN, NSG, PW)                     \
+  INSTANTIATE_CONV2D(                                                     \
+      "conv2d_mpp_nchw_nchw_b" #BM "x" #BN "_s" #NSG "_pw" #PW "_bfloat", \
+      conv2d_mpp<bfloat, false, false, BM, BN, NSG, false, PW>);
 
 INSTANTIATE_CONV2D_POINTWISE(160, 32, 4, 1)
 INSTANTIATE_CONV2D_POINTWISE(64, 64, 4, 1)
@@ -1555,18 +1483,10 @@ INSTANTIATE_CONV2D_POINTWISE(64, 32, 4, 1)
 INSTANTIATE_CONV2D_POINTWISE(64, 64, 4, 2)
 INSTANTIATE_CONV2D_POINTWISE(64, 32, 4, 2)
 
-#define INSTANTIATE_CONV2D_FIXED3(BM, NSG)                                   \
-  template [[host_name("conv2d_mpp_nchw_nchw_b" #BM "x64_s" #NSG             \
-                       "_k3_bfloat")]]                                       \
-  kernel void conv2d_mpp<bfloat, false, false, BM, 64, NSG, false, 0, true>( \
-      device bfloat*,                                                        \
-      device bfloat*,                                                        \
-      device bfloat*,                                                        \
-      constant Conv2dMppParams&,                                             \
-      device const bfloat*,                                                  \
-      device float*,                                                         \
-      uint3,                                                                 \
-      uint);
+#define INSTANTIATE_CONV2D_FIXED3(BM, NSG)                    \
+  INSTANTIATE_CONV2D(                                         \
+      "conv2d_mpp_nchw_nchw_b" #BM "x64_s" #NSG "_k3_bfloat", \
+      conv2d_mpp<bfloat, false, false, BM, 64, NSG, false, 0, true>);
 
 INSTANTIATE_CONV2D_FIXED3(64, 2)
 INSTANTIATE_CONV2D_FIXED3(96, 4)
@@ -1720,32 +1640,31 @@ kernel void conv2d_patch(
             d = v;
         }
       }
-      const uint2 a0 = as_type<uint2>(S == 1 ? a : bfloat4(a.x, a.z, b.x, b.z));
-      const uint2 a1 = as_type<uint2>(S == 1 ? b : bfloat4(z.x, z.z, d.x, d.z));
-      *reinterpret_cast<threadgroup packed_uint4*>(
-          stage + (cj * taps + kh * KS) * BN + j) =
-          packed_uint4(a0.x, a0.y, a1.x, a1.y);
-      if constexpr (KS >= 2) {
-        const uint2 b0 =
-            as_type<uint2>(S == 1 ? z : bfloat4(a.y, a.w, b.y, b.w));
-        const uint2 b1 =
-            as_type<uint2>(S == 1 ? d : bfloat4(z.y, z.w, d.y, d.w));
+      const auto store = [&](int kw, bfloat4 lo, bfloat4 hi) {
+        const uint2 low = as_type<uint2>(lo), high = as_type<uint2>(hi);
         *reinterpret_cast<threadgroup packed_uint4*>(
-            stage + (cj * taps + kh * KS + 1) * BN + j) =
-            packed_uint4(b0.x, b0.y, b1.x, b1.y);
+            stage + (cj * taps + kh * KS + kw) * BN + j) =
+            packed_uint4(low.x, low.y, high.x, high.y);
+      };
+      store(
+          0,
+          S == 1 ? a : bfloat4(a.x, a.z, b.x, b.z),
+          S == 1 ? b : bfloat4(z.x, z.z, d.x, d.z));
+      if constexpr (KS >= 2) {
+        store(
+            1,
+            S == 1 ? z : bfloat4(a.y, a.w, b.y, b.w),
+            S == 1 ? d : bfloat4(z.y, z.w, d.y, d.w));
       }
       if constexpr (KS == 3) {
         const bfloat last = S == 2 && c < channels && ih >= 0 && ih < p.H &&
                 iw + 16 >= 0 && iw + 16 < p.W
             ? src[16]
             : bfloat(0);
-        const uint2 c0 =
-            as_type<uint2>(S == 1 ? right0 : bfloat4(a.z, b.x, b.z, z.x));
-        const uint2 c1 =
-            as_type<uint2>(S == 1 ? right1 : bfloat4(z.z, d.x, d.z, last));
-        *reinterpret_cast<threadgroup packed_uint4*>(
-            stage + (cj * taps + kh * KS + 2) * BN + j) =
-            packed_uint4(c0.x, c0.y, c1.x, c1.y);
+        store(
+            2,
+            S == 1 ? right0 : bfloat4(a.z, b.x, b.z, z.x),
+            S == 1 ? right1 : bfloat4(z.z, d.x, d.z, last));
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1773,17 +1692,10 @@ kernel void conv2d_patch(
   res.store(out.slice(ow0, o0));
 }
 
-#define INSTANTIATE_CONV2D_PATCH(KS, BM, BN, CC, S, FLAT)                      \
-  template                                                                     \
-      [[host_name("conv2d_patch_" #KS "_" #BM "_s" #S "_bfloat")]] kernel void \
-      conv2d_patch<KS, BM, BN, CC, S, FLAT>(                                   \
-          device bfloat*,                                                      \
-          device bfloat*,                                                      \
-          device bfloat*,                                                      \
-          constant Conv2DParams&,                                              \
-          device const bfloat*,                                                \
-          uint3,                                                               \
-          uint);
+#define INSTANTIATE_CONV2D_PATCH(KS, BM, BN, CC, S, FLAT) \
+  INSTANTIATE_CONV2D(                                     \
+      "conv2d_patch_" #KS "_" #BM "_s" #S "_bfloat",      \
+      conv2d_patch<KS, BM, BN, CC, S, FLAT>);
 
 INSTANTIATE_CONV2D_PATCH(1, 128, 32, 128, 2, false)
 INSTANTIATE_CONV2D_PATCH(2, 192, 16, 128, 2, false)
@@ -1806,8 +1718,8 @@ kernel void conv2d_s2(
     device const T* bias [[buffer(4)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]]) {
-  using S = typename conv2d_vec<T>::scalar;
-  using P4 = typename conv2d_vec<T>::packed;
+  using S = conditional_t<is_same_v<T, float>, float, ushort>;
+  using P4 = packed_vec<S, 4>;
   constexpr int KC = (BN == 32       ? 64
                           : BN == 64 ? 32
                                      : 16) /
@@ -1932,17 +1844,10 @@ kernel void conv2d_s2(
   res.store(dst.slice(x_off, o_off));
 }
 
-#define INSTANTIATE_CONV2D_S2(DT, BM, BN, NSG)                               \
-  template                                                                   \
-      [[host_name("conv2d_s2_b" #BM "x" #BN "_s" #NSG "_" #DT)]] kernel void \
-      conv2d_s2<DT, BM, BN, NSG>(                                            \
-          device DT*,                                                        \
-          device DT*,                                                        \
-          device DT*,                                                        \
-          constant Conv2DParams&,                                            \
-          device const DT*,                                                  \
-          uint3,                                                             \
-          uint);
+#define INSTANTIATE_CONV2D_S2(DT, BM, BN, NSG)     \
+  INSTANTIATE_CONV2D(                              \
+      "conv2d_s2_b" #BM "x" #BN "_s" #NSG "_" #DT, \
+      conv2d_s2<DT, BM, BN, NSG>);
 
 #define INSTANTIATE_CONV2D_S2_ALL(DT)   \
   INSTANTIATE_CONV2D_S2(DT, 16, 32, 4)  \
@@ -2047,16 +1952,10 @@ kernel void conv2d_depthwise(
   }
 }
 
-#define INSTANTIATE_CONV2D_DEPTHWISE(DT, KW, S, FULL)         \
-  template [[host_name("conv2d_depthwise_" #KW "_" #S "_" #DT \
-                       "_" #FULL)]] kernel void               \
-  conv2d_depthwise<DT, KW, S, FULL>(                          \
-      device const DT*,                                       \
-      device const DT*,                                       \
-      device DT*,                                             \
-      constant Conv2DParams&,                                 \
-      device const DT*,                                       \
-      uint3);
+#define INSTANTIATE_CONV2D_DEPTHWISE(DT, KW, S, FULL)   \
+  INSTANTIATE_CONV2D(                                   \
+      "conv2d_depthwise_" #KW "_" #S "_" #DT "_" #FULL, \
+      conv2d_depthwise<DT, KW, S, FULL>);
 
 #define INSTANTIATE_CONV2D_DEPTHWISE_ALL(DT)    \
   INSTANTIATE_CONV2D_DEPTHWISE(DT, 0, 0, false) \
@@ -2089,12 +1988,7 @@ kernel void conv2d_tiny(
   const int64_t outplane = S == 1 ? plane : int64_t(p.outH) * p.outW;
   const int64_t position =
       KW == 3 ? int64_t(oh) * (S == 1 ? p.W : p.outW) + ow : int64_t(pos.x) * 8;
-  float4 lo[4], hi[4];
-#pragma unroll
-  for (int o = 0; o < 4; ++o) {
-    lo[o] = float4(0);
-    hi[o] = float4(0);
-  }
+  float4 lo[4] = {}, hi[4] = {};
 #pragma unroll
   for (int c = 0; c < C; ++c) {
 #pragma unroll
@@ -2158,16 +2052,9 @@ kernel void conv2d_tiny(
   }
 }
 
-#define INSTANTIATE_CONV2D_TINY(C, KW, S)                                   \
-  template                                                                  \
-      [[host_name("conv2d_tiny_" #C "_" #KW "_" #S "_bfloat")]] kernel void \
-      conv2d_tiny<C, KW, S>(                                                \
-          device const bfloat*,                                             \
-          device const bfloat*,                                             \
-          device bfloat*,                                                   \
-          constant Conv2DParams&,                                           \
-          device const bfloat*,                                             \
-          uint3);
+#define INSTANTIATE_CONV2D_TINY(C, KW, S) \
+  INSTANTIATE_CONV2D(                     \
+      "conv2d_tiny_" #C "_" #KW "_" #S "_bfloat", conv2d_tiny<C, KW, S>);
 
 INSTANTIATE_CONV2D_TINY(4, 1, 1)
 INSTANTIATE_CONV2D_TINY(1, 3, 1)
@@ -2185,7 +2072,7 @@ kernel void conv2d_o1(
     constant Conv2DParams& p [[buffer(3)]],
     device const T* bias [[buffer(4)]],
     uint2 pos [[thread_position_in_grid]]) {
-  using P4 = typename conv2d_vec<T>::packed;
+  using P4 = packed_vec<T, 4>;
   constexpr int LW = KW ? (RW - 1) * S + KW : 1;
   constexpr int LV = (LW + 3) / 4 * 4;
   const int cg = p.C_in_per_group, columns = (p.outW + RW - 1) / RW;
@@ -2220,7 +2107,7 @@ kernel void conv2d_o1(
           for (int t = 0; t < LV; t += 4) {
             const P4 v = *reinterpret_cast<device const P4*>(row + iw0 + t);
             for (int q = 0; q < 4; ++q) {
-              win[t + q] = conv2d_vec<T>::to_float(v[q]);
+              win[t + q] = float(v[q]);
             }
           }
         } else {
@@ -2258,16 +2145,10 @@ kernel void conv2d_o1(
   }
 }
 
-#define INSTANTIATE_CONV2D_O1(DT, KW, S, RH, RW)               \
-  template [[host_name("conv2d_o1_" #KW "_" #S "_" #RH "_" #RW \
-                       "_" #DT)]] kernel void                  \
-  conv2d_o1<DT, KW, S, RH, RW>(                                \
-      device const DT*,                                        \
-      device const DT*,                                        \
-      device DT*,                                              \
-      constant Conv2DParams&,                                  \
-      device const DT*,                                        \
-      uint2);
+#define INSTANTIATE_CONV2D_O1(DT, KW, S, RH, RW)       \
+  INSTANTIATE_CONV2D(                                  \
+      "conv2d_o1_" #KW "_" #S "_" #RH "_" #RW "_" #DT, \
+      conv2d_o1<DT, KW, S, RH, RW>);
 
 #define INSTANTIATE_CONV2D_O1_ALL(DT)   \
   INSTANTIATE_CONV2D_O1(DT, 0, 0, 1, 8) \
@@ -2306,21 +2187,13 @@ kernel void conv2d_split_reduce(
   output[pos.y * int64_t(C) * outH * outW + e] = T(v);
 }
 
-#define INSTANTIATE_CONV2D_SPLIT_REDUCE(DT)                      \
-  template [[host_name("conv2d_split_reduce_" #DT)]] kernel void \
-  conv2d_split_reduce<DT>(                                       \
-      device const float*,                                       \
-      device const DT*,                                          \
-      device DT*,                                                \
-      constant int4&,                                            \
-      constant int4&,                                            \
-      uint2);
+#define INSTANTIATE_CONV2D_SPLIT_REDUCE(DT) \
+  INSTANTIATE_CONV2D("conv2d_split_reduce_" #DT, conv2d_split_reduce<DT>);
 
 INSTANTIATE_CONV2D_SPLIT_REDUCE(float)
 INSTANTIATE_CONV2D_SPLIT_REDUCE(half)
 INSTANTIATE_CONV2D_SPLIT_REDUCE(bfloat)
 
-// im2col with (c, kh, kw) innermost; `strides` are the input element strides.
 // im2col into [N][C * taps][outH * outW]: a thread fills 8 consecutive
 // positions of one (c, kh, kw) column.
 template <typename T>
@@ -2330,7 +2203,7 @@ kernel void conv2d_im2col(
     constant Conv2DParams& p [[buffer(2)]],
     constant long4& strides [[buffer(3)]],
     uint3 pos [[thread_position_in_grid]]) {
-  using P4 = typename conv2d_vec<T>::packed;
+  using P4 = packed_vec<T, 4>;
   const int taps = p.kH * p.kW, positions = p.outH * p.outW;
   const int k = int(pos.y), c = k / taps, kh = k % taps / p.kW, kw = k % p.kW;
   const int p0 = int(pos.x) * 8;
@@ -2351,16 +2224,8 @@ kernel void conv2d_im2col(
     }
   }
   if (p0 + 8 <= positions) {
-    *reinterpret_cast<device P4*>(out) =
-        P4(conv2d_vec<T>::bits(v[0]),
-           conv2d_vec<T>::bits(v[1]),
-           conv2d_vec<T>::bits(v[2]),
-           conv2d_vec<T>::bits(v[3]));
-    *reinterpret_cast<device P4*>(out + 4) =
-        P4(conv2d_vec<T>::bits(v[4]),
-           conv2d_vec<T>::bits(v[5]),
-           conv2d_vec<T>::bits(v[6]),
-           conv2d_vec<T>::bits(v[7]));
+    *reinterpret_cast<device P4*>(out) = P4(v[0], v[1], v[2], v[3]);
+    *reinterpret_cast<device P4*>(out + 4) = P4(v[4], v[5], v[6], v[7]);
   } else {
     for (int j = 0; p0 + j < positions; ++j) {
       out[j] = v[j];
@@ -2397,17 +2262,7 @@ kernel void conv2d_winograd_fused(
   input += int64_t(n) * p.C_in * p.H * p.W;
   output += int64_t(n) * p.C_out * p.outH * p.outW;
   // Only two elements of each simdgroup matrix belong to a lane.
-  float2 acc[TP][TM][TN];
-#pragma unroll
-  for (int v = 0; v < TP; ++v) {
-#pragma unroll
-    for (int m = 0; m < TM; ++m) {
-#pragma unroll
-      for (int t = 0; t < TN; ++t) {
-        acc[v][m][t] = float2(0);
-      }
-    }
-  }
+  float2 acc[TP][TM][TN] = {};
   for (int c0 = 0; c0 < p.C_in; c0 += KC) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
 #pragma unroll
@@ -2591,17 +2446,9 @@ kernel void conv2d_winograd_fused(
 }
 
 #define INSTANTIATE_CONV2D_WINOGRAD_FUSED(BM, BN, IDX)      \
-  template [[host_name("conv2d_winograd_fused_" #BM "x" #BN \
-                       "_bfloat_" #IDX)]] kernel void       \
-  conv2d_winograd_fused<bfloat, BM, BN, IDX>(               \
-      device const bfloat*,                                 \
-      device const bfloat*,                                 \
-      device bfloat*,                                       \
-      constant Conv2DParams&,                               \
-      device const bfloat*,                                 \
-      uint3,                                                \
-      uint,                                                 \
-      uint);
+  INSTANTIATE_CONV2D(                                       \
+      "conv2d_winograd_fused_" #BM "x" #BN "_bfloat_" #IDX, \
+      conv2d_winograd_fused<bfloat, BM, BN, IDX>);
 
 INSTANTIATE_CONV2D_WINOGRAD_FUSED(8, 32, int)
 INSTANTIATE_CONV2D_WINOGRAD_FUSED(8, 32, long)
@@ -2770,77 +2617,25 @@ kernel void winograd_output(
   }
 }
 
-#define INSTANTIATE_WINOGRAD(DT)                                             \
-  template [[host_name("winograd_weights_" #DT)]] kernel void                \
-  winograd_weights<DT>(device const DT*, device DT*, constant int2&, uint2); \
-  template [[host_name("winograd_input_nchw_" #DT)]] kernel void             \
-  winograd_input<DT, false>(                                                 \
-      device const DT*,                                                      \
-      device DT*,                                                            \
-      constant int4&,                                                        \
-      constant int4&,                                                        \
-      constant int&,                                                         \
-      uint2);                                                                \
-  template [[host_name("winograd_input_nhwc_" #DT)]] kernel void             \
-  winograd_input<DT, true>(                                                  \
-      device const DT*,                                                      \
-      device DT*,                                                            \
-      constant int4&,                                                        \
-      constant int4&,                                                        \
-      constant int&,                                                         \
-      uint2);                                                                \
-  template [[host_name("winograd_output_nchw_" #DT)]] kernel void            \
-  winograd_output<DT, false>(                                                \
-      device const DT*,                                                      \
-      device const DT*,                                                      \
-      device DT*,                                                            \
-      constant int4&,                                                        \
-      constant int4&,                                                        \
-      uint2);                                                                \
-  template [[host_name("winograd_output_nhwc_" #DT)]] kernel void            \
-  winograd_output<DT, true>(                                                 \
-      device const DT*,                                                      \
-      device const DT*,                                                      \
-      device DT*,                                                            \
-      constant int4&,                                                        \
-      constant int4&,                                                        \
-      uint2);
+#define INSTANTIATE_WINOGRAD(DT)                                               \
+  INSTANTIATE_CONV2D("winograd_weights_" #DT, winograd_weights<DT>);           \
+  INSTANTIATE_CONV2D("winograd_input_nchw_" #DT, winograd_input<DT, false>);   \
+  INSTANTIATE_CONV2D("winograd_input_nhwc_" #DT, winograd_input<DT, true>);    \
+  INSTANTIATE_CONV2D("winograd_output_nchw_" #DT, winograd_output<DT, false>); \
+  INSTANTIATE_CONV2D("winograd_output_nhwc_" #DT, winograd_output<DT, true>);
 
 INSTANTIATE_WINOGRAD(float)
 INSTANTIATE_WINOGRAD(half)
 INSTANTIATE_WINOGRAD(bfloat)
 
-template [[host_name("winograd_weights_4_bfloat")]] kernel void winograd_weights<
-    bfloat,
-    4>(device const bfloat*, device bfloat*, constant int2&, uint2);
-template [[host_name("winograd_input_4_bfloat")]] kernel void winograd_input<
-    bfloat,
-    false,
-    4>(
-    device const bfloat*,
-    device bfloat*,
-    constant int4&,
-    constant int4&,
-    constant int&,
-    uint2);
-template [[host_name("winograd_output_4_bfloat")]] kernel void winograd_output<
-    bfloat,
-    false,
-    4>(
-    device const bfloat*,
-    device const bfloat*,
-    device bfloat*,
-    constant int4&,
-    constant int4&,
-    uint2);
+INSTANTIATE_CONV2D("winograd_weights_4_bfloat", winograd_weights<bfloat, 4>);
+INSTANTIATE_CONV2D("winograd_input_4_bfloat", winograd_input<bfloat, false, 4>);
+INSTANTIATE_CONV2D(
+    "winograd_output_4_bfloat",
+    winograd_output<bfloat, false, 4>);
 
-#define INSTANTIATE_CONV2D_IM2COL(DT)                                         \
-  template [[host_name("conv2d_im2col_" #DT)]] kernel void conv2d_im2col<DT>( \
-      device const DT*,                                                       \
-      device DT*,                                                             \
-      constant Conv2DParams&,                                                 \
-      constant long4&,                                                        \
-      uint3);
+#define INSTANTIATE_CONV2D_IM2COL(DT) \
+  INSTANTIATE_CONV2D("conv2d_im2col_" #DT, conv2d_im2col<DT>);
 
 INSTANTIATE_CONV2D_IM2COL(float)
 INSTANTIATE_CONV2D_IM2COL(half)
@@ -2863,10 +2658,8 @@ kernel void conv2d_deinterleave(
   }
 }
 
-#define INSTANTIATE_CONV2D_DEINTERLEAVE(DT)                      \
-  template [[host_name("conv2d_deinterleave_" #DT)]] kernel void \
-  conv2d_deinterleave<DT>(                                       \
-      device const DT*, device DT*, constant int2&, uint2);
+#define INSTANTIATE_CONV2D_DEINTERLEAVE(DT) \
+  INSTANTIATE_CONV2D("conv2d_deinterleave_" #DT, conv2d_deinterleave<DT>);
 
 INSTANTIATE_CONV2D_DEINTERLEAVE(float)
 INSTANTIATE_CONV2D_DEINTERLEAVE(half)
