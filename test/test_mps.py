@@ -13802,13 +13802,7 @@ class TestConvolutionMetal(TestCaseMPS):
             self.assertTrue(out.is_contiguous(memory_format=torch.channels_last))
         tol = (2e-4 if dtype == torch.float32 else 5e-2) * ref.abs().max().item()
         self.assertEqual(out.cpu().float(), ref, atol=tol, rtol=0)
-        if (input_shape[1] <= 4 or weight_shape[2:] == (2, 2) or
-                (weight_shape[2:] in ((1, 1), (3, 3)) and stride == (2, 2)) or
-                (input_shape[1] == 16 and weight_shape[0] >= 256) or
-                (weight_shape[2:] == (1, 1) and input_shape[1] in (128, 256)) or
-                (input_shape[0] >= 8 and input_shape[1] in (64, 128) and weight_shape[0] <= 64) or
-                (input_shape[0] == 1 and input_shape[1] == 176) or
-                (weight_shape[2:] == (3, 3) and 32 < input_shape[1] < 128 and weight_shape[0] > 128)) and layout == "contiguous":
+        if layout == "contiguous":
             offset_input = torch.empty(x.numel() + 1, dtype=dtype, device=device)[1:].view(input_shape)
             offset_input.copy_(x_device)
             out = F.conv2d(offset_input, w.to(device), b.to(device), stride, padding, dilation, groups)

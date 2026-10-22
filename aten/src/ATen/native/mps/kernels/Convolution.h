@@ -39,9 +39,6 @@ struct Conv2DParams {
   bool has_bias;
 };
 
-// conv2d_mpp: K (per tap) is split into `splits` chunks of K_split; Wp > 0 is
-// the position pitch of FLAT tiles; parity > 0 is where the odd columns of a
-// de-interleaved (stride 2) input row start.
 struct Conv2dMppParams {
   Conv2DParams conv;
   int32_t K;

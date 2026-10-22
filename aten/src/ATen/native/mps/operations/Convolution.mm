@@ -142,19 +142,18 @@ static void nchw_to_nhwc(const Tensor& source,
                          int64_t channels,
                          int64_t height,
                          int64_t width,
-                         int64_t padH,
-                         int64_t padW,
+                         IntArrayRef pad = {0, 0},
                          int64_t kH = 1,
                          int64_t sH = 1,
                          int64_t dH = 1) {
   using namespace mps;
   const int64_t batches = source.numel() / (channels * height * width);
-  const int64_t rows = output.numel() / (batches * channels * (width + 2 * padW) * kH);
-  const int64_t padded = rows * (width + 2 * padW) * kH;
+  const int64_t rows = output.numel() / (batches * channels * (width + 2 * pad[1]) * kH);
+  const int64_t padded = rows * (width + 2 * pad[1]) * kH;
   const int channel_tile = channels <= 4 ? 4 : channels <= 8 ? 8 : channels <= 16 ? 16 : 32;
   const int spatial_tile = channels <= 4 ? 256 : channels <= 8 ? 128 : channels <= 16 ? 64 : 32;
   // vec2 loads need the buffer base 2-element aligned too
-  const bool vectorized_read = channel_tile >= 16 && padH == 0 && padW == 0 && kH == 1 && sH == 1 && dH == 1 &&
+  const bool vectorized_read = channel_tile >= 16 && pad[0] == 0 && pad[1] == 0 && kH == 1 && sH == 1 && dH == 1 &&
       padded % 2 == 0 && source.storage_offset() % 2 == 0;
   const bool vectorized_write = channels % 2 == 0;
   auto pipeline = lib.getPipelineStateForFunc(fmt::format("nchw_to_nhwc_{}_{}_{}_{}_{}",
@@ -166,15 +165,15 @@ static void nchw_to_nhwc(const Tensor& source,
   const std::array<int32_t, 4> dims = {static_cast<int32_t>(channels),
                                        static_cast<int32_t>(height),
                                        static_cast<int32_t>(width),
-                                       static_cast<int32_t>(width + 2 * padW)};
-  const std::array<int32_t, 2> pad = {static_cast<int32_t>(padH), static_cast<int32_t>(padW)};
+                                       static_cast<int32_t>(width + 2 * pad[1])};
+  const std::array<int32_t, 2> pads = {static_cast<int32_t>(pad[0]), static_cast<int32_t>(pad[1])};
   const std::array<int32_t, 4> filter_rows = {
       static_cast<int32_t>(kH), static_cast<int32_t>(sH), static_cast<int32_t>(dH), static_cast<int32_t>(rows)};
   const auto threadgroups = MTLSizeMake(c10::metal::ceil_div(padded, int64_t(spatial_tile)),
                                         c10::metal::ceil_div(channels, int64_t(channel_tile)),
                                         batches);
   conv_metal_launch(pipeline, "nchw_to_nhwc", {source}, [&](id<MTLComputeCommandEncoder> encoder) {
-    mtl_setArgs(encoder, source, output, dims, pad, filter_rows);
+    mtl_setArgs(encoder, source, output, dims, pads, filter_rows);
     [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   });
 }
@@ -191,7 +190,7 @@ static Tensor conv3d_to_ndhwc(const Tensor& tensor) {
     return tensor.contiguous(MemoryFormat::ChannelsLast3d);
   }
   auto output = at::empty(tensor.sizes(), tensor.options(), MemoryFormat::ChannelsLast3d);
-  nchw_to_nhwc(tensor.contiguous(), output, channels, 1, spatial_size, 0, 0);
+  nchw_to_nhwc(tensor.contiguous(), output, channels, 1, spatial_size);
   return output;
 }
 
@@ -703,6 +702,33 @@ static void conv1d_metal_forward(const Tensor& input_t,
   });
 }
 
+static Conv2DParams conv2d_params(const Tensor& input,
+                                  const Tensor& weight,
+                                  const Tensor& output,
+                                  IntArrayRef padding,
+                                  IntArrayRef stride,
+                                  IntArrayRef dilation,
+                                  bool has_bias) {
+  return {.N = static_cast<int32_t>(input.size(0)),
+          .C_in = static_cast<int32_t>(input.size(1)),
+          .C_out = static_cast<int32_t>(output.size(1)),
+          .H = static_cast<int32_t>(input.size(2)),
+          .W = static_cast<int32_t>(input.size(3)),
+          .outH = static_cast<int32_t>(output.size(2)),
+          .outW = static_cast<int32_t>(output.size(3)),
+          .kH = static_cast<int32_t>(weight.size(2)),
+          .kW = static_cast<int32_t>(weight.size(3)),
+          .sH = static_cast<int32_t>(stride[0]),
+          .sW = static_cast<int32_t>(stride[1]),
+          .padH = static_cast<int32_t>(padding[0]),
+          .padW = static_cast<int32_t>(padding[1]),
+          .dH = static_cast<int32_t>(dilation[0]),
+          .dW = static_cast<int32_t>(dilation[1]),
+          .C_in_per_group = static_cast<int32_t>(weight.size(1)),
+          .C_out_per_group = static_cast<int32_t>(output.size(1) / (input.size(1) / weight.size(1))),
+          .has_bias = has_bias};
+}
+
 static void conv2d_depthwise_forward(const Tensor& input_t,
                                      const Tensor& weight_t,
                                      const std::optional<Tensor>& bias_opt,
@@ -718,11 +744,9 @@ static void conv2d_depthwise_forward(const Tensor& input_t,
   const bool full =
       fast && params.kW == 3 && params.sW == 1 && params.outW % 8 == 0 && input.scalar_type() == kBFloat16;
   const auto bias = params.has_bias ? bias_opt->to(input.scalar_type()).contiguous() : input;
-  auto pipeline = lib.getPipelineStateForFunc(fmt::format("conv2d_depthwise_{}_{}_{}_{}",
-                                                          fast ? params.kW : 0,
-                                                          fast ? params.sW : 0,
-                                                          scalarToMetalTypeString(input),
-                                                          full));
+  const auto name = fmt::format(
+      "conv2d_depthwise_{}_{}_{}_{}", fast ? params.kW : 0, fast ? params.sW : 0, scalarToMetalTypeString(input), full);
+  auto pipeline = lib.getPipelineStateForFunc(name);
   const auto nx = c10::metal::ceil_div(int64_t(params.outW), rw);
   const auto ny = c10::metal::ceil_div(int64_t(params.outH), int64_t(2));
   conv_metal_launch(pipeline, "conv2d_depthwise", {input, weight}, [&](id<MTLComputeCommandEncoder> encoder) {
@@ -739,11 +763,10 @@ static Tensor conv2d_im2col(const Tensor& input, const Conv2DParams& params) {
   using namespace mps;
   const int64_t positions = int64_t(params.outH) * params.outW, taps = int64_t(params.kH) * params.kW;
   auto columns = at::empty({params.N, params.C_in * taps, params.outH, params.outW}, input.options());
-  const std::array<int64_t, 4> strides{input.stride(0), input.stride(1), input.stride(2), input.stride(3)};
   auto pipeline = lib.getPipelineStateForFunc(fmt::format("conv2d_im2col_{}", scalarToMetalTypeString(input)));
   const auto groups8 = c10::metal::ceil_div(positions, int64_t(8));
   conv_metal_launch(pipeline, "conv2d_im2col", {input}, [&](id<MTLComputeCommandEncoder> encoder) {
-    mtl_setArgs(encoder, input, columns, params, strides);
+    mtl_setArgs(encoder, input, columns, params, input.strides());
     [encoder dispatchThreads:MTLSizeMake(groups8, params.C_in * taps, params.N)
         threadsPerThreadgroup:MTLSizeMake(std::min<int64_t>(groups8, 256), 1, 1)];
   });
@@ -784,38 +807,19 @@ static void conv2d_mpp_forward(const Tensor& input_t,
   auto input = input_t;
   bool in_nhwc = !input.is_contiguous() && input.is_contiguous(MemoryFormat::ChannelsLast);
   input = input.contiguous(in_nhwc ? MemoryFormat::ChannelsLast : MemoryFormat::Contiguous);
-  Conv2DParams params{
-      .N = static_cast<int32_t>(input.size(0)),
-      .C_in = static_cast<int32_t>(input.size(1)),
-      .C_out = static_cast<int32_t>(output_t.size(1)),
-      .H = static_cast<int32_t>(input.size(2)),
-      .W = static_cast<int32_t>(input.size(3)),
-      .outH = static_cast<int32_t>(output_t.size(2)),
-      .outW = static_cast<int32_t>(output_t.size(3)),
-      .kH = static_cast<int32_t>(kH),
-      .kW = static_cast<int32_t>(kW),
-      .sH = static_cast<int32_t>(stride[0]),
-      .sW = static_cast<int32_t>(stride[1]),
-      .padH = static_cast<int32_t>(padding[0]),
-      .padW = static_cast<int32_t>(padding[1]),
-      .dH = static_cast<int32_t>(dilation[0]),
-      .dW = static_cast<int32_t>(dilation[1]),
-      .C_in_per_group = static_cast<int32_t>(Cg),
-      .C_out_per_group = static_cast<int32_t>(Og),
-      .has_bias = has_bias,
+  auto params = conv2d_params(input, weight_t, output_t, padding, stride, dilation, has_bias);
+  const auto launch = [&](const std::string& name, const Tensor& w, MTLSize grid, int64_t tg, bool threads = false) {
+    auto pipeline = lib.getPipelineStateForFunc(name);
+    conv_metal_launch(pipeline, name.c_str(), {input, w}, [&](id<MTLComputeCommandEncoder> encoder) {
+      mtl_setArgs(encoder, input, w, output_t, params, bias);
+      const auto block = MTLSizeMake(threads ? std::min<int64_t>(grid.width, tg) : tg, 1, 1);
+      if (threads) {
+        [encoder dispatchThreads:grid threadsPerThreadgroup:block];
+      } else {
+        [encoder dispatchThreadgroups:grid threadsPerThreadgroup:block];
+      }
+    });
   };
-  const auto launch =
-      [&](const std::string& name, const Tensor& weight, MTLSize grid, MTLSize block, bool dispatch_threads = false) {
-        auto pipeline = lib.getPipelineStateForFunc(name);
-        conv_metal_launch(pipeline, name.c_str(), {input, weight}, [&](id<MTLComputeCommandEncoder> encoder) {
-          mtl_setArgs(encoder, input, weight, output_t, params, bias);
-          if (dispatch_threads) {
-            [encoder dispatchThreads:grid threadsPerThreadgroup:block];
-          } else {
-            [encoder dispatchThreadgroups:grid threadsPerThreadgroup:block];
-          }
-        });
-      };
   const bool pointwise = kH == 1 && kW == 1 && padding[0] == 0 && padding[1] == 0;
   const bool patch_embed =
       kH == stride[0] && kW == stride[1] && padding[0] == 0 && padding[1] == 0 && dilation[0] == 1 && dilation[1] == 1;
@@ -831,13 +835,9 @@ static void conv2d_mpp_forward(const Tensor& input_t,
       ((!strided && (Cg == 1 || (Cg == 3 && (!apple10 || Og <= 32)))) || tiny_s2);
   if (bfloat_nchw && Og % 4 == 0 && input.storage_offset() % 2 == 0 && output_t.storage_offset() % 2 == 0 &&
       ((pointwise && !strided && Cg == 4 && int64_t(params.H) * params.W % 8 == 0) || tiny_3x3)) {
-    const auto w = weight_t.contiguous();
     const int64_t columns = pointwise ? int64_t(params.H) * params.W / 8 : params.outW / 8;
-    launch(fmt::format("conv2d_tiny_{}_{}_{}_bfloat", Cg, kW, stride[1]),
-           w,
-           MTLSizeMake(columns, pointwise ? Og / 4 : params.outH, pointwise ? params.N : params.N * Og / 4),
-           MTLSizeMake(std::min<int64_t>(columns, 256), 1, 1),
-           true);
+    const auto grid = MTLSizeMake(columns, pointwise ? Og / 4 : params.outH, pointwise ? params.N : params.N * Og / 4);
+    launch(fmt::format("conv2d_tiny_{}_{}_{}_bfloat", Cg, kW, stride[1]), weight_t.contiguous(), grid, 256, true);
     return;
   }
   const int64_t o1_threads = c10::metal::ceil_div(int64_t(params.outW), int64_t(8)) * params.outH;
@@ -851,12 +851,8 @@ static void conv2d_mpp_forward(const Tensor& input_t,
     const int64_t width = paired ? 4 : wide ? 16 : 8, height = paired ? 2 : 1;
     const int64_t threads =
         c10::metal::ceil_div(int64_t(params.outW), width) * c10::metal::ceil_div(int64_t(params.outH), height);
-    const auto w = weight_t.contiguous();
-    launch(fmt::format("conv2d_o1_{}_{}_{}_{}_{}", fixed ? kW : 0, fixed ? 1 : 0, height, width, dtype),
-           w,
-           MTLSizeMake(threads, params.N * params.C_out, 1),
-           MTLSizeMake(std::min<int64_t>(threads, 256), 1, 1),
-           true);
+    const auto name = fmt::format("conv2d_o1_{}_{}_{}_{}_{}", fixed ? kW : 0, fixed ? 1 : 0, height, width, dtype);
+    launch(name, weight_t.contiguous(), MTLSizeMake(threads, params.N * params.C_out, 1), 256, true);
     return;
   }
   const bool small_wino = Og > 1 && Og <= 4 && Cg >= 256 && Cg <= 384 && int64_t(params.H) * params.W < 131072 &&
@@ -867,14 +863,12 @@ static void conv2d_mpp_forward(const Tensor& input_t,
        (Og > 1 && Og <= 16 && int64_t(params.H) * params.W * (Og <= 8 ? 1 : params.N) >= (Og <= 8 ? 131072 : 65536)))) {
     const int64_t rows = fused_mid ? 32 : Og <= 8 ? 8 : 16, columns = small_wino ? 8 : rows == 8 ? 32 : 16;
     const int64_t tiles = ((int64_t(params.outH) + 1) / 2) * ((int64_t(params.outW) + 1) / 2);
-    const auto w = weight_t.contiguous();
     constexpr int64_t max_int = std::numeric_limits<int32_t>::max();
     const bool index32 = int64_t(params.C_in) * params.H * params.W <= max_int &&
-        int64_t(params.C_out) * params.outH * params.outW <= max_int && w.numel() <= max_int;
-    launch(fmt::format("conv2d_winograd_fused_{}x{}_bfloat_{}", rows, columns, index32 ? "int" : "long"),
-           w,
-           MTLSizeMake(c10::metal::ceil_div(Og, rows), c10::metal::ceil_div(tiles, columns), params.N),
-           MTLSizeMake(fused_mid ? 256 : 128, 1, 1));
+        int64_t(params.C_out) * params.outH * params.outW <= max_int && weight_t.numel() <= max_int;
+    const auto grid = MTLSizeMake(c10::metal::ceil_div(Og, rows), c10::metal::ceil_div(tiles, columns), params.N);
+    const auto name = fmt::format("conv2d_winograd_fused_{}x{}_bfloat_{}", rows, columns, index32 ? "int" : "long");
+    launch(name, weight_t.contiguous(), grid, fused_mid ? 256 : 128);
     return;
   }
   const bool single_pointwise = apple10 && params.N == 1 && input.scalar_type() == kBFloat16 &&
@@ -884,11 +878,9 @@ static void conv2d_mpp_forward(const Tensor& input_t,
   if (pointwise && apple10 && groups == 1 && params.N == 1 && input.scalar_type() == kBFloat16 && !out_nhwc &&
       !in_nhwc && !strided && (Cg == 128 || Cg == 256) && Og >= 128 && Og <= 256 && pointwise_plane >= 262144 &&
       pointwise_plane <= std::numeric_limits<int32_t>::max() / std::max(Cg, Og)) {
-    const auto w = weight_t.contiguous();
-    launch(fmt::format("conv2d_pointwise_{}", Cg),
-           w,
-           MTLSizeMake(c10::metal::ceil_div(pointwise_plane, int64_t(128)), c10::metal::ceil_div(Og, int64_t(64)), 1),
-           MTLSizeMake(128, 1, 1));
+    const auto grid =
+        MTLSizeMake(c10::metal::ceil_div(pointwise_plane, int64_t(128)), c10::metal::ceil_div(Og, int64_t(64)), 1);
+    launch(fmt::format("conv2d_pointwise_{}", Cg), weight_t.contiguous(), grid, 128);
     return;
   }
   if (pointwise && apple10 && groups == 1 && params.N == 1 && !out_nhwc && !in_nhwc && !strided && !single_pointwise &&
@@ -916,11 +908,8 @@ static void conv2d_mpp_forward(const Tensor& input_t,
   if (packed3 && !strided && bfloat_nchw && (narrow_batch || narrow_large) && Og > 32 && Og <= 64 &&
       params.N * c10::metal::ceil_div(positions, narrow_columns) >= target) {
     const auto w = conv3d_weights_to_dhwio((Cg == 128 ? weight_t : weight_t.transpose(0, 1)).unsqueeze(2));
-    const int64_t simdgroups = Cg == 128 ? 8 : 4;
-    launch(fmt::format("conv2d_narrow_{}", Cg),
-           w,
-           MTLSizeMake(1, c10::metal::ceil_div(positions, narrow_columns), params.N),
-           MTLSizeMake(32 * simdgroups, 1, 1));
+    const auto grid = MTLSizeMake(1, c10::metal::ceil_div(positions, narrow_columns), params.N);
+    launch(fmt::format("conv2d_narrow_{}", Cg), w, grid, Cg == 128 ? 256 : 128);
     return;
   }
   const bool patch_flat = packed3 && !strided && Cg > 32 && Cg < 128 && Og > 128 && Og <= 256 && params.W >= 32 &&
@@ -935,16 +924,12 @@ static void conv2d_mpp_forward(const Tensor& input_t,
         int64_t(params.N) * params.outH >= target));
   const bool packed_patch = (params.W % 2 == 0 || (sample_s2 && params.H % 2 == 0)) && input.storage_offset() % 2 == 0;
   if (bfloat_nchw && (patch_s1 || patch_s2 || (packed_patch && (sample_s2 || patch2)))) {
-    const auto w = weight_t.contiguous();
     const int64_t rows = patch_flat ? 128 : patch_s1 ? 64 : patch_s2 ? (Cg <= 16 ? 32 : 256) : sample_s2 ? 128 : 192;
     const int64_t columns = patch_flat ? 32 : patch_s1 || (patch_s2 && Cg <= 16) ? 64 : sample_s2 ? 32 : 16;
-    launch(fmt::format("conv2d_patch_{}_{}_s{}_bfloat", kH, rows, params.sH),
-           w,
-           MTLSizeMake(c10::metal::ceil_div(Og, rows),
-                       patch_flat ? c10::metal::ceil_div(positions, columns)
-                                  : params.outH * c10::metal::ceil_div(int64_t(params.outW), columns),
-                       params.N),
-           MTLSizeMake(128, 1, 1));
+    const int64_t row_tiles = c10::metal::ceil_div(int64_t(params.outW), columns);
+    const int64_t tiles = patch_flat ? c10::metal::ceil_div(positions, columns) : params.outH * row_tiles;
+    const auto grid = MTLSizeMake(c10::metal::ceil_div(Og, rows), tiles, params.N);
+    launch(fmt::format("conv2d_patch_{}_{}_s{}_bfloat", kH, rows, params.sH), weight_t.contiguous(), grid, 128);
     return;
   }
   const int64_t im2col_bytes = output_t.numel() / output_t.size(1) * Cg * kH * kW * groups * input.element_size();
@@ -973,16 +958,11 @@ static void conv2d_mpp_forward(const Tensor& input_t,
       Cg <= 128 && params.outW >= 24 && std::min(tile_waste, waste32) < 0.35f && s2_threadgroups(bn) >= 4 * cores) {
     const int64_t simdgroups = bm == 128 ? 8 : 4;
     const auto w = conv3d_weights_to_dhwio(weight_t.transpose(0, 1).unsqueeze(2));
-    launch(fmt::format("conv2d_s2_b{}x{}_s{}_{}", bm, bn, simdgroups, dtype),
-           w,
-           MTLSizeMake(c10::metal::ceil_div(Og, bm) * groups,
-                       params.outH * c10::metal::ceil_div(int64_t(params.outW), bn),
-                       params.N),
-           MTLSizeMake(simdgroups * 32, 1, 1));
+    const int64_t row_tiles = c10::metal::ceil_div(int64_t(params.outW), bn);
+    const auto grid = MTLSizeMake(c10::metal::ceil_div(Og, bm) * groups, params.outH * row_tiles, params.N);
+    launch(fmt::format("conv2d_s2_b{}x{}_s{}_{}", bm, bn, simdgroups, dtype), w, grid, simdgroups * 32);
     return;
   }
-  // Folding taps into K needs an NHWC staging copy (kH copies for every tap);
-  // de-interleaving rows lets stride 2 read NCHW at unit stride.
   const bool tiny = groups == 1 && dilation[1] == 1 && Cg <= 8;
   const bool unfolded = tiny && Og >= 64 && 5 * kH * Cg * padded_w <= 3 * Og * params.outW;
   const bool parity = !direct_columns && !in_nhwc && !tiny && !(groups > 1 && Cg <= 8) && stride[1] == 2 &&
@@ -1026,16 +1006,7 @@ static void conv2d_mpp_forward(const Tensor& input_t,
     if (unfolded) {
       auto rows =
           at::empty({params.N, kH * params.C_in, params.outH, padded_w}, input.options(), MemoryFormat::ChannelsLast);
-      nchw_to_nhwc(input.contiguous(),
-                   rows,
-                   params.C_in,
-                   params.H,
-                   params.W,
-                   padding[0],
-                   padding[1],
-                   kH,
-                   stride[0],
-                   dilation[0]);
+      nchw_to_nhwc(input.contiguous(), rows, params.C_in, params.H, params.W, padding, kH, stride[0], dilation[0]);
       input = rows;
       in_nhwc = true;
       K = static_cast<int32_t>(kW * kH * Cg);
@@ -1054,7 +1025,7 @@ static void conv2d_mpp_forward(const Tensor& input_t,
       } else {
         auto padded =
             at::empty({params.N, params.C_in, padded_h, padded_w}, input.options(), MemoryFormat::ChannelsLast);
-        nchw_to_nhwc(input, padded, params.C_in, params.H, params.W, padding[0], padding[1]);
+        nchw_to_nhwc(input, padded, params.C_in, params.H, params.W, padding);
         input = padded;
       }
       in_nhwc = true;
@@ -1164,42 +1135,26 @@ static void conv2d_mpp_forward(const Tensor& input_t,
       : width >= kTile || (block == 32 && width == 32) ? block
                                                        : kTile;
   const bool staged = unfolded && in_nhwc && !apple10 && !out_nhwc && rows == kTile && width == kTile && !partials;
-  auto pipeline = lib.getPipelineStateForFunc(fmt::format("conv2d_mpp_{}_{}_b{}x{}_s{}_{}{}",
-                                                          in_nhwc ? "nhwc" : "nchw",
-                                                          out_nhwc ? "nhwc" : "nchw",
-                                                          rows,
-                                                          width,
-                                                          simdgroups,
-                                                          fixed3x3             ? "k3_"
-                                                              : fast_pointwise ? "pw1_"
-                                                              : staged         ? "st_"
-                                                                               : "",
-                                                          dtype));
-  auto stream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(stream->queue(), ^() {
-    @autoreleasepool {
-      auto encoder = stream->commandEncoder();
-      getMPSProfiler().beginProfileKernel(pipeline, "conv2d_mpp", {input, weight}, stream);
-      [encoder setComputePipelineState:pipeline];
-      mtl_setArgs(encoder, input, weight, output_t, mpp_params, bias, partial);
-      [encoder dispatchThreadgroups:MTLSizeMake(c10::metal::ceil_div(Og, rows) * groups, tiles, params.N * splits)
-              threadsPerThreadgroup:MTLSizeMake(simdgroups * 32, 1, 1)];
-      getMPSProfiler().endProfileKernel(pipeline, stream);
-      if (partials) {
-        auto reduce = lib.getPipelineStateForFunc("conv2d_split_reduce_" + dtype);
-        const auto image = int64_t(params.C_out) * params.outH * params.outW;
-        const std::array<int32_t, 4> geometry{params.C_out, params.outH, params.outW, static_cast<int32_t>(pitch)};
-        const std::array<int32_t, 4> counts{static_cast<int32_t>(splits), params.N, has_bias, out_nhwc};
-        [encoder setComputePipelineState:reduce];
-        mtl_setArgs(encoder, partial, bias, output_t, geometry, counts);
-        [encoder dispatchThreads:MTLSizeMake(image, params.N, 1)
-            threadsPerThreadgroup:MTLSizeMake(std::min<int64_t>(image, 256), 1, 1)];
-      }
+  const auto layout = fmt::format("{}_{}", in_nhwc ? "nhwc" : "nchw", out_nhwc ? "nhwc" : "nchw");
+  const char* variant = fixed3x3 ? "k3_" : fast_pointwise ? "pw1_" : staged ? "st_" : "";
+  const auto name = fmt::format("conv2d_mpp_{}_b{}x{}_s{}_{}{}", layout, rows, width, simdgroups, variant, dtype);
+  auto pipeline = lib.getPipelineStateForFunc(name);
+  conv_metal_launch(pipeline, "conv2d_mpp", {input, weight}, [&](id<MTLComputeCommandEncoder> encoder) {
+    mtl_setArgs(encoder, input, weight, output_t, mpp_params, bias, partial);
+    [encoder dispatchThreadgroups:MTLSizeMake(c10::metal::ceil_div(Og, rows) * groups, tiles, params.N * splits)
+            threadsPerThreadgroup:MTLSizeMake(simdgroups * 32, 1, 1)];
+    if (partials) {
+      const auto image = int64_t(params.C_out) * params.outH * params.outW;
+      const std::array<int32_t, 4> geometry{params.C_out, params.outH, params.outW, static_cast<int32_t>(pitch)};
+      const std::array<int32_t, 4> counts{static_cast<int32_t>(splits), params.N, has_bias, out_nhwc};
+      [encoder setComputePipelineState:lib.getPipelineStateForFunc("conv2d_split_reduce_" + dtype)];
+      mtl_setArgs(encoder, partial, bias, output_t, geometry, counts);
+      [encoder dispatchThreads:MTLSizeMake(image, params.N, 1)
+          threadsPerThreadgroup:MTLSizeMake(std::min<int64_t>(image, 256), 1, 1)];
     }
   });
 }
 
-// Winograd products are independent GEMMs over chunks of transformed tiles.
 static void conv2d_winograd_forward(const Tensor& input_t,
                                     const Tensor& weight_t,
                                     const std::optional<Tensor>& bias_opt,
@@ -1234,7 +1189,6 @@ static void conv2d_winograd_forward(const Tensor& input_t,
     mtl_setArgs(encoder, weight, weights, wdims);
     [encoder dispatchThreads:MTLSizeMake(C, O, 1) threadsPerThreadgroup:MTLSizeMake(std::min<int64_t>(C, 256), 1, 1)];
   });
-  auto stream = getCurrentMPSStream();
   for (int64_t t0 = 0; t0 < tiles; t0 += chunk) {
     const int32_t count = static_cast<int32_t>(std::min(chunk, tiles - t0)), start = static_cast<int32_t>(t0);
     const auto v = transformed.as_strided({1, coefficients * C, 1, count}, {coefficients * C * count, count, count, 1});
@@ -1244,44 +1198,29 @@ static void conv2d_winograd_forward(const Tensor& input_t,
     const std::array<int32_t, 4> odims{
         static_cast<int32_t>(O), count, static_cast<int32_t>(outH), static_cast<int32_t>(outW)};
     const std::array<int32_t, 4> ogeom{static_cast<int32_t>(TH), static_cast<int32_t>(TW), start, 0};
-    dispatch_sync_with_rethrow(stream->queue(), ^() {
-      @autoreleasepool {
-        auto encoder = stream->commandEncoder();
-        auto ik = lib.getPipelineStateForFunc(fmt::format("winograd_input_{}_{}",
-                                                          tile_h == 4   ? "4"
-                                                              : in_nhwc ? "nhwc"
-                                                                        : "nchw",
-                                                          dtype));
-        getMPSProfiler().beginProfileKernel(ik, "winograd_input", {input}, stream);
-        [encoder setComputePipelineState:ik];
-        mtl_setArgs(encoder, input, v, idims, igeom, start);
-        [encoder dispatchThreads:MTLSizeMake(count, C, 1)
-            threadsPerThreadgroup:MTLSizeMake(std::min<int64_t>(count, 256), 1, 1)];
-        getMPSProfiler().endProfileKernel(ik, stream);
-        if (tile_h == 4) {
-          const int64_t columns = is_apple_family_or_newer(AppleGPUFamily::APPLE_10_PLUS) ? 64 : 32;
-          const Conv2dMppParams gemm_params{
-              .conv = {.N = 24, .C_in = static_cast<int32_t>(C), .C_out = static_cast<int32_t>(O), .H = 1, .W = count}};
-          auto pk = lib.getPipelineStateForFunc(fmt::format("conv2d_mpp_nchw_nchw_b64x{}_s4_pw2_bfloat", columns));
-          getMPSProfiler().beginProfileKernel(pk, "winograd_products", {v, weights}, stream);
-          [encoder setComputePipelineState:pk];
-          mtl_setArgs(encoder, v, weights, m, gemm_params, input, m);
-          [encoder dispatchThreadgroups:MTLSizeMake(c10::metal::ceil_div(O, int64_t(64)),
-                                                    c10::metal::ceil_div(int64_t(count), columns),
-                                                    coefficients)
-                  threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-          getMPSProfiler().endProfileKernel(pk, stream);
-        }
+    const char* input_kind = tile_h == 4 ? "4" : in_nhwc ? "nhwc" : "nchw";
+    auto ik = lib.getPipelineStateForFunc(fmt::format("winograd_input_{}_{}", input_kind, dtype));
+    conv_metal_launch(ik, "winograd_input", {input}, [&](id<MTLComputeCommandEncoder> encoder) {
+      mtl_setArgs(encoder, input, v, idims, igeom, start);
+      [encoder dispatchThreads:MTLSizeMake(count, C, 1)
+          threadsPerThreadgroup:MTLSizeMake(std::min<int64_t>(count, 256), 1, 1)];
+      if (tile_h == 4) {
+        const int64_t columns = is_apple_family_or_newer(AppleGPUFamily::APPLE_10_PLUS) ? 64 : 32;
+        const Conv2dMppParams gemm_params{
+            .conv = {.N = 24, .C_in = static_cast<int32_t>(C), .C_out = static_cast<int32_t>(O), .H = 1, .W = count}};
+        const auto grid = MTLSizeMake(
+            c10::metal::ceil_div(O, int64_t(64)), c10::metal::ceil_div(int64_t(count), columns), coefficients);
+        const auto products = fmt::format("conv2d_mpp_nchw_nchw_b64x{}_s4_pw2_bfloat", columns);
+        [encoder setComputePipelineState:lib.getPipelineStateForFunc(products)];
+        mtl_setArgs(encoder, v, weights, m, gemm_params, input, m);
+        [encoder dispatchThreadgroups:grid threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
       }
     });
     if (tile_h == 2) {
       conv2d_mpp_forward(v, weights.view({16 * O, C, 1, 1}), std::nullopt, {0, 0}, {1, 1}, {1, 1}, 16, m);
     }
-    auto ok = lib.getPipelineStateForFunc(fmt::format("winograd_output_{}_{}",
-                                                      tile_h == 4    ? "4"
-                                                          : out_nhwc ? "nhwc"
-                                                                     : "nchw",
-                                                      dtype));
+    const char* output_kind = tile_h == 4 ? "4" : out_nhwc ? "nhwc" : "nchw";
+    auto ok = lib.getPipelineStateForFunc(fmt::format("winograd_output_{}_{}", output_kind, dtype));
     conv_metal_launch(ok, "winograd_output", {m}, [&](id<MTLComputeCommandEncoder> encoder) {
       mtl_setArgs(encoder, m, has_bias ? std::optional<Tensor>(bias) : std::nullopt, output_t, odims, ogeom);
       [encoder dispatchThreads:MTLSizeMake(count, O, 1)
@@ -1402,26 +1341,7 @@ static Tensor _mps_convolution_impl(const Tensor& input_t,
     return output_t;
   }
   if (groups > 1 && groups == input_t.size(1) && weight_t.size(1) == 1) {
-    const Conv2DParams params{
-        .N = static_cast<int32_t>(input_t.size(0)),
-        .C_in = static_cast<int32_t>(input_t.size(1)),
-        .C_out = static_cast<int32_t>(output_t.size(1)),
-        .H = static_cast<int32_t>(input_t.size(2)),
-        .W = static_cast<int32_t>(input_t.size(3)),
-        .outH = static_cast<int32_t>(output_t.size(2)),
-        .outW = static_cast<int32_t>(output_t.size(3)),
-        .kH = static_cast<int32_t>(weight_t.size(2)),
-        .kW = static_cast<int32_t>(weight_t.size(3)),
-        .sH = static_cast<int32_t>(stride[0]),
-        .sW = static_cast<int32_t>(stride[1]),
-        .padH = static_cast<int32_t>(padding[0]),
-        .padW = static_cast<int32_t>(padding[1]),
-        .dH = static_cast<int32_t>(dilation[0]),
-        .dW = static_cast<int32_t>(dilation[1]),
-        .C_in_per_group = 1,
-        .C_out_per_group = static_cast<int32_t>(output_t.size(1) / groups),
-        .has_bias = bias_defined,
-    };
+    const auto params = conv2d_params(input_t, weight_t, output_t, padding, stride, dilation, bias_defined);
     conv2d_depthwise_forward(input_t, weight_t, bias_opt, params, output_t);
     return output_t;
   }
@@ -1429,8 +1349,6 @@ static Tensor _mps_convolution_impl(const Tensor& input_t,
     if (input_t.size(1) == 0) {
       bias_defined ? output_t.copy_(bias_opt->reshape({1, -1, 1, 1}).expand_as(output_t)) : output_t.zero_();
     } else {
-      // Winograd wins once both channel counts are large enough to amortize the
-      // transformed-tensor traffic; the tensor-core GPUs need more work per byte.
       const int64_t C_in = input_t.size(1), C_out = weight_t.size(0), channels = std::min(C_in, C_out);
       const bool apple10 = is_apple_family_or_newer(AppleGPUFamily::APPLE_10_PLUS);
       const bool worth = apple10 ? channels >= 160 || (channels >= 128 && input_t.numel() / C_in <= 16384)
@@ -1460,7 +1378,6 @@ static Tensor _mps_convolution_impl(const Tensor& input_t,
     }
     return output_t;
   }
-  // Conv2d is conv3d with unit depth; reuse its generic simdgroup fallback.
   conv3d_metal_forward(input_t.unsqueeze(2),
                        weight_t.unsqueeze(2),
                        bias_opt,

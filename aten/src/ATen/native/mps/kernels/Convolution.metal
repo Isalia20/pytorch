@@ -10,8 +10,8 @@ using namespace metal;
 #define INSTANTIATE_CONV2D(NAME, ...) \
   template [[host_name(NAME)]] [[kernel]] decltype(__VA_ARGS__) __VA_ARGS__
 
-// NCHW -> zero-padded NHWC whose rows are the KH filter rows of each output
-// row; dims = {C, H, W, Wp}, pad = {padH, padW}, rows = {KH, SH, DH, Hout}.
+// Tiled NCDHW -> NDHWC transpose; PyTorch's generic strided copy runs well
+// below memory bandwidth for this permutation.
 template <typename T, int TC, int TX, int NTH, bool VECR, bool VECW>
 kernel void nchw_to_nhwc(
     device const T* src [[buffer(0)]],
@@ -270,17 +270,10 @@ INSTANTIATE_CONV3D_SIMD_ALL(float)
 INSTANTIATE_CONV3D_SIMD_ALL(half)
 INSTANTIATE_CONV3D_SIMD_ALL(bfloat)
 
-#define INSTANTIATE_NCHW_TO_NHWC(DT, TC, TX, VECR, VECW)             \
-  template [[host_name("nchw_to_nhwc_" #DT "_" #TC "_" #TX "_" #VECR \
-                       "_" #VECW)]] kernel void                      \
-  nchw_to_nhwc<DT, TC, TX, 256, VECR, VECW>(                         \
-      device const DT*,                                              \
-      device DT*,                                                    \
-      constant int4&,                                                \
-      constant int2&,                                                \
-      constant int4&,                                                \
-      uint3,                                                         \
-      uint);
+#define INSTANTIATE_NCHW_TO_NHWC(DT, TC, TX, VECR, VECW)       \
+  INSTANTIATE_CONV2D(                                          \
+      "nchw_to_nhwc_" #DT "_" #TC "_" #TX "_" #VECR "_" #VECW, \
+      nchw_to_nhwc<DT, TC, TX, 256, VECR, VECW>);
 
 #define INSTANTIATE_NCHW_TO_NHWC_ALL(DT)             \
   INSTANTIATE_NCHW_TO_NHWC(DT, 4, 256, false, false) \
@@ -1074,11 +1067,8 @@ kernel void conv2d_pointwise(
   res.store(out.slice(x0, o0));
 }
 
-#define INSTANTIATE_CONV2D_POINTWISE_REGISTERS(C) \
-  INSTANTIATE_CONV2D("conv2d_pointwise_" #C, conv2d_pointwise<C>);
-
-INSTANTIATE_CONV2D_POINTWISE_REGISTERS(128)
-INSTANTIATE_CONV2D_POINTWISE_REGISTERS(256)
+INSTANTIATE_CONV2D("conv2d_pointwise_128", conv2d_pointwise<128>);
+INSTANTIATE_CONV2D("conv2d_pointwise_256", conv2d_pointwise<256>);
 
 template <int C>
 kernel void conv2d_narrow(
@@ -1196,15 +1186,10 @@ kernel void conv2d_narrow(
   res.store(out.slice(t0, o0));
 }
 
-#define INSTANTIATE_CONV2D_NARROW(C) \
-  INSTANTIATE_CONV2D("conv2d_narrow_" #C, conv2d_narrow<C>);
+INSTANTIATE_CONV2D("conv2d_narrow_64", conv2d_narrow<64>);
+INSTANTIATE_CONV2D("conv2d_narrow_128", conv2d_narrow<128>);
+INSTANTIATE_CONV2D("conv2d_narrow_176", conv2d_narrow<176>);
 
-INSTANTIATE_CONV2D_NARROW(64)
-INSTANTIATE_CONV2D_NARROW(128)
-INSTANTIATE_CONV2D_NARROW(176)
-
-// conv2d as one matmul2d per filter tap; ROW tiles cover BN positions of one
-// output row, FLAT tiles BN consecutive positions of a plane with pitch Wp.
 template <
     typename T,
     bool IN_NHWC,
@@ -1405,8 +1390,6 @@ kernel void conv2d_mpp(
   if constexpr (!STAGED) {
     res.store(dst_tile(dst_view(positions), x_off));
   } else {
-    // Small-K tiles are store bound: go through threadgroup memory so each
-    // output row leaves as 16-byte vectors.
     using P4 = packed_vec<T, 4>;
     threadgroup T stage[BM * BN];
     tensor<threadgroup T, extents, tensor_inline> st(
@@ -1501,7 +1484,6 @@ kernel void conv2d_patch(
     uint3 gid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]]) {
   constexpr int NSG = 4, taps = KS * KS;
-  // The row tile stages the entire 16-channel reduction in one step.
   const int channels = S == 1 && !FLAT ? 16 : p.C_in;
   threadgroup bfloat stage[CC * taps * BN];
   using extents = dextents<int32_t, 2>;
@@ -1705,10 +1687,6 @@ INSTANTIATE_CONV2D_PATCH(3, 64, 64, 16, 1, false)
 
 INSTANTIATE_CONV2D_PATCH(3, 128, 32, 24, 1, true)
 
-// Stride-2 NCHW conv without a de-interleave pass: per (kh, channel chunk) the
-// contiguous input row segment is split into even/odd columns in threadgroup
-// memory, so the kW taps read unit-stride views; loads of the next chunk are
-// issued before the current chunk's matmuls.
 template <typename T, int BM, int BN, int NSG>
 kernel void conv2d_s2(
     device T* input [[buffer(0)]],
@@ -1867,8 +1845,6 @@ INSTANTIATE_CONV2D_S2(bfloat, 96, 32, 4)
 
 #endif // C10_METAL_HAS_MPP
 
-// Depthwise conv2d, RH x RW outputs per thread; KW = S = 0 is the generic
-// runtime-geometry variant.
 template <typename T, int KW, int S, bool FULL>
 kernel void conv2d_depthwise(
     device const T* input [[buffer(0)]],
@@ -2052,18 +2028,11 @@ kernel void conv2d_tiny(
   }
 }
 
-#define INSTANTIATE_CONV2D_TINY(C, KW, S) \
-  INSTANTIATE_CONV2D(                     \
-      "conv2d_tiny_" #C "_" #KW "_" #S "_bfloat", conv2d_tiny<C, KW, S>);
+INSTANTIATE_CONV2D("conv2d_tiny_4_1_1_bfloat", conv2d_tiny<4, 1, 1>);
+INSTANTIATE_CONV2D("conv2d_tiny_1_3_1_bfloat", conv2d_tiny<1, 3, 1>);
+INSTANTIATE_CONV2D("conv2d_tiny_3_3_1_bfloat", conv2d_tiny<3, 3, 1>);
+INSTANTIATE_CONV2D("conv2d_tiny_3_3_2_bfloat", conv2d_tiny<3, 3, 2>);
 
-INSTANTIATE_CONV2D_TINY(4, 1, 1)
-INSTANTIATE_CONV2D_TINY(1, 3, 1)
-INSTANTIATE_CONV2D_TINY(3, 3, 1)
-INSTANTIATE_CONV2D_TINY(3, 3, 2)
-
-// One output channel per group: a thread computes consecutive outputs in
-// registers instead of a 16-row MPP tile; KW = S = 0 is the generic
-// runtime-geometry variant.
 template <typename T, int KW, int S, int RH, int RW>
 kernel void conv2d_o1(
     device const T* input [[buffer(0)]],
@@ -2121,8 +2090,6 @@ kernel void conv2d_o1(
           if (RH > 1 && (kh < 0 || kh >= KW)) {
             continue;
           }
-          // RH > 1 requires 3x3 filters and at most 128 input channels per
-          // group.
           device const T* w = wt +
               (RH > 1 ? (c * KW + kh) * KW : (int64_t(c) * p.kH + kh) * p.kW);
           for (int kw = 0; kw < KW; ++kw) {
@@ -2161,8 +2128,6 @@ INSTANTIATE_CONV2D_O1(bfloat, 1, 1, 1, 16)
 INSTANTIATE_CONV2D_O1(bfloat, 3, 1, 1, 16)
 INSTANTIATE_CONV2D_O1(bfloat, 3, 1, 2, 4)
 
-// geometry = {C_out, outH, outW, partial row pitch}, counts = {splits, N,
-// has_bias, out_nhwc}.
 template <typename T>
 kernel void conv2d_split_reduce(
     device const float* partial [[buffer(0)]],
@@ -2187,15 +2152,10 @@ kernel void conv2d_split_reduce(
   output[pos.y * int64_t(C) * outH * outW + e] = T(v);
 }
 
-#define INSTANTIATE_CONV2D_SPLIT_REDUCE(DT) \
-  INSTANTIATE_CONV2D("conv2d_split_reduce_" #DT, conv2d_split_reduce<DT>);
+INSTANTIATE_CONV2D("conv2d_split_reduce_float", conv2d_split_reduce<float>);
+INSTANTIATE_CONV2D("conv2d_split_reduce_half", conv2d_split_reduce<half>);
+INSTANTIATE_CONV2D("conv2d_split_reduce_bfloat", conv2d_split_reduce<bfloat>);
 
-INSTANTIATE_CONV2D_SPLIT_REDUCE(float)
-INSTANTIATE_CONV2D_SPLIT_REDUCE(half)
-INSTANTIATE_CONV2D_SPLIT_REDUCE(bfloat)
-
-// im2col into [N][C * taps][outH * outW]: a thread fills 8 consecutive
-// positions of one (c, kh, kw) column.
 template <typename T>
 kernel void conv2d_im2col(
     device const T* input [[buffer(0)]],
@@ -2261,7 +2221,6 @@ kernel void conv2d_winograd_fused(
   const int t0 = int(gid.y) * BN, o0 = int(gid.x) * BM, n = int(gid.z);
   input += int64_t(n) * p.C_in * p.H * p.W;
   output += int64_t(n) * p.C_out * p.outH * p.outW;
-  // Only two elements of each simdgroup matrix belong to a lane.
   float2 acc[TP][TM][TN] = {};
   for (int c0 = 0; c0 < p.C_in; c0 += KC) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2395,7 +2354,6 @@ kernel void conv2d_winograd_fused(
     }
   } else {
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    // Each simdgroup owns one transform column; reduce its four rows first.
 #pragma unroll
     for (int m = 0; m < TM; ++m) {
 #pragma unroll
@@ -2459,8 +2417,6 @@ INSTANTIATE_CONV2D_WINOGRAD_FUSED(16, 16, long)
 INSTANTIATE_CONV2D_WINOGRAD_FUSED(32, 16, int)
 INSTANTIATE_CONV2D_WINOGRAD_FUSED(32, 16, long)
 
-// Winograd F(TILE_H x 2, 3x3), with 4 * (TILE_H + 2) coefficients.
-// Transforms are channel-major and chunked along the tile dimension.
 template <typename T, int TILE_H = 2>
 kernel void winograd_weights(
     device const T* weight [[buffer(0)]],
@@ -2634,15 +2590,10 @@ INSTANTIATE_CONV2D(
     "winograd_output_4_bfloat",
     winograd_output<bfloat, false, 4>);
 
-#define INSTANTIATE_CONV2D_IM2COL(DT) \
-  INSTANTIATE_CONV2D("conv2d_im2col_" #DT, conv2d_im2col<DT>);
+INSTANTIATE_CONV2D("conv2d_im2col_float", conv2d_im2col<float>);
+INSTANTIATE_CONV2D("conv2d_im2col_half", conv2d_im2col<half>);
+INSTANTIATE_CONV2D("conv2d_im2col_bfloat", conv2d_im2col<bfloat>);
 
-INSTANTIATE_CONV2D_IM2COL(float)
-INSTANTIATE_CONV2D_IM2COL(half)
-INSTANTIATE_CONV2D_IM2COL(bfloat)
-
-// Each row of dims.x columns becomes [even columns, 0, odd columns] with the
-// odd columns starting at dims.y.
 template <typename T>
 kernel void conv2d_deinterleave(
     device const T* input [[buffer(0)]],
@@ -2658,9 +2609,6 @@ kernel void conv2d_deinterleave(
   }
 }
 
-#define INSTANTIATE_CONV2D_DEINTERLEAVE(DT) \
-  INSTANTIATE_CONV2D("conv2d_deinterleave_" #DT, conv2d_deinterleave<DT>);
-
-INSTANTIATE_CONV2D_DEINTERLEAVE(float)
-INSTANTIATE_CONV2D_DEINTERLEAVE(half)
-INSTANTIATE_CONV2D_DEINTERLEAVE(bfloat)
+INSTANTIATE_CONV2D("conv2d_deinterleave_float", conv2d_deinterleave<float>);
+INSTANTIATE_CONV2D("conv2d_deinterleave_half", conv2d_deinterleave<half>);
+INSTANTIATE_CONV2D("conv2d_deinterleave_bfloat", conv2d_deinterleave<bfloat>);
