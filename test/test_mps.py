@@ -16356,7 +16356,7 @@ class TestCommon(TestCase):
         self.assertEqual(torch.fft.irfft(y.to(device), n=176400).cpu(), x, atol=1e-4, rtol=1e-4)
 
     @dtypes(torch.float32, torch.float16)
-    @parametrize("n", [64, 128, 200, 240, 256, 512, 1024, 2048, 4096])
+    @parametrize("n", [64, 128, 200, 240, 256, 512, 1024, 2048, 4096, 4099])
     @parametrize("kind", ["fft", "ifft", "rfft", "irfft"])
     @parametrize("layout", ["contiguous", "transposed", "sliced", "out"])
     def test_fft_strides(self, device, dtype, n, kind, layout):

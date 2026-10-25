@@ -291,8 +291,9 @@ void fft_pass(const Tensor& in, const Tensor& out, int64_t dim, int64_t n, bool 
   DimVector sizes(in.sizes());
   sizes[dim] = M;
   auto tmp = at::empty(sizes, in.options().dtype(c10::toComplexType(in.scalar_type())));
-  fft_pass(in, tmp, dim, M, false, {.n_sig = n, .n_in = x.n_in ? x.n_in : n, .cl = c, .cs = B});
-  fft_pass(tmp, out, dim, M, true, {.n_out = x.n_out ? x.n_out : n, .scale = x.scale / M, .cs = c});
+  // Scaled in the first pass: the unnormalized stage of a four-step inverse pass overflows fp16 temps
+  fft_pass(in, tmp, dim, M, false, {.n_sig = n, .n_in = x.n_in ? x.n_in : n, .scale = x.scale / M, .cl = c, .cs = B});
+  fft_pass(tmp, out, dim, M, true, {.n_out = x.n_out ? x.n_out : n, .cs = c});
 }
 double norm_scale(int64_t normalization, const Tensor& t, IntArrayRef dims) {
   const auto n = std::accumulate(dims.begin(), dims.end(), 1.0, [&](double a, int64_t d) { return a * t.size(d); });
