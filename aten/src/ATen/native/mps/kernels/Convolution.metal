@@ -1286,6 +1286,17 @@ kernel void conv2d_mpp(
       (OUT_NHWC ? int64_t(oh) * p.outW * p.C_out + g * og
                 : (int64_t(g) * og * p.outH + oh) * p.outW);
   const bool partials = gp.splits > 1 || (flat && gp.Wp != p.outW);
+  // The fixed 3x3 kernel seeds the bias into the accumulator; its short K
+  // loop makes the epilogue gather measurable.
+  const bool seeded = FIXED3 && p.has_bias;
+  if (seeded) {
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+      const int o =
+          min(o_off + int(acc.get_multidimensional_index(i)[OUT_NHWC ? 0 : 1]),
+              og - 1);
+      acc[i] = float(bias[g * og + o]);
+    }
+  }
   const int out_pitch = flat ? gp.Wp : p.outW;
   device float* part = partial +
       (int64_t(split) * p.N + nb) * p.C_out * p.outH * out_pitch +
@@ -1338,7 +1349,10 @@ kernel void conv2d_mpp(
         res.store(
             dst_tile(dst_view(min(positions, x_off + BN)), x_off + delta));
         for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
-          res[i] = T(0);
+          const int o = min(
+              o_off + int(acc.get_multidimensional_index(i)[OUT_NHWC ? 0 : 1]),
+              og - 1);
+          res[i] = T(seeded ? float(bias[g * og + o]) : 0.0f);
         }
         res.store(dst_tile(dst_view(x_off + delta), x_off));
         threadgroup_barrier(mem_flags::mem_device);
@@ -1385,7 +1399,8 @@ kernel void conv2d_mpp(
     const int o =
         min(o_off + int(acc.get_multidimensional_index(i)[OUT_NHWC ? 0 : 1]),
             og - 1);
-    res[i] = T(acc[i] + (p.has_bias ? float(bias[g * og + o]) : 0.0f));
+    res[i] =
+        T(acc[i] + (p.has_bias && !seeded ? float(bias[g * og + o]) : 0.0f));
   }
   if constexpr (!STAGED) {
     res.store(dst_tile(dst_view(positions), x_off));

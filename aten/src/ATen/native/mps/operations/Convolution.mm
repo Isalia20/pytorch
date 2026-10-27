@@ -860,7 +860,7 @@ static void conv2d_mpp_forward(const Tensor& input_t,
   if (!apple10 && bfloat_nchw && kH == 3 && kW == 3 && stride[0] == 1 && stride[1] == 1 && dilation[0] == 1 &&
       dilation[1] == 1 && Cg >= 8 &&
       (fused_mid || small_wino ||
-       (Og > 1 && Og <= 16 && int64_t(params.H) * params.W * (Og <= 8 ? 1 : params.N) >= (Og <= 8 ? 131072 : 65536)))) {
+       (Og > 1 && Og <= 16 && int64_t(params.H) * params.W * (Og <= 8 ? 1 : params.N) >= 65536))) {
     const int64_t rows = fused_mid ? 32 : Og <= 8 ? 8 : 16, columns = small_wino ? 8 : rows == 8 ? 32 : 16;
     const int64_t tiles = ((int64_t(params.outH) + 1) / 2) * ((int64_t(params.outW) + 1) / 2);
     constexpr int64_t max_int = std::numeric_limits<int32_t>::max();
@@ -1112,10 +1112,11 @@ static void conv2d_mpp_forward(const Tensor& input_t,
       : width == kTile && (!apple10 || unfolded || (K > 16 && K <= 96)) ? 4
                                                                         : 2;
   const int64_t tiles = tiles_for(width), threadgroups = threadgroups_for(width);
+  const int64_t k_cap = K / (block == 16 ? 128 : 256);
   const int64_t k_split = fast_pointwise || fixed3x3
       ? K
       : c10::metal::round_up(
-            c10::metal::ceil_div(int64_t(K), std::max<int64_t>(std::min<int64_t>(target / threadgroups, K / 256), 1)),
+            c10::metal::ceil_div(int64_t(K), std::max<int64_t>(std::min<int64_t>(target / threadgroups, k_cap), 1)),
             int64_t(32));
   const int64_t splits = c10::metal::ceil_div(int64_t(K), k_split);
   const Conv2dMppParams mpp_params{.conv = params,
@@ -1359,7 +1360,8 @@ static Tensor _mps_convolution_impl(const Tensor& input_t,
           ((C_in <= 192 && C_out >= 32 && channels < 128) || (C_in >= 256 && C_in <= 512 && C_out == 32));
       const int64_t plane = input_t.size(2) * input_t.size(3);
       const bool single_tall = input_t.size(0) == 1 &&
-          ((C_out == 128 && plane >= (apple10 ? 512 : 4096) && (plane <= 32768 || (!apple10 && C_in <= 192))) ||
+          ((C_out == 128 && plane >= (apple10 ? 512 : 4096) &&
+            (plane <= 32768 || (apple10 ? C_in >= 256 : C_in <= 192))) ||
            (!apple10 && C_in <= 192 && C_out == 64 && plane >= 16384) ||
            (apple10 && C_in <= 128 && C_out > 128 && C_out <= 256 && plane >= 32768 && plane < 262144));
       const bool tall_wino = is_apple_family_or_newer(AppleGPUFamily::APPLE_9_PLUS) &&
