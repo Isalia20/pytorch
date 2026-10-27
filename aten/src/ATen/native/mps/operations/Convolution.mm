@@ -788,225 +788,58 @@ static Tensor conv2d_deinterleave(const Tensor& input) {
   return output;
 }
 
-static void conv2d_mpp_forward(const Tensor& input_t,
+// conv2d_mpp over the input prepared per plan.input; split-K partials are summed by conv2d_split_reduce.
+static void conv2d_mpp_forward(Tensor input,
                                const Tensor& weight_t,
                                const std::optional<Tensor>& bias_opt,
-                               IntArrayRef padding,
-                               IntArrayRef stride,
-                               IntArrayRef dilation,
+                               Conv2DParams params,
+                               const mps::Conv2dPlan& plan,
                                int64_t groups,
-                               const Tensor& output_t,
-                               bool fused_mid = false) {
+                               const Tensor& output_t) {
   using namespace mps;
-  constexpr int64_t kTile = 64;
-  const int64_t kH = weight_t.size(2), kW = weight_t.size(3), Cg = weight_t.size(1), Og = output_t.size(1) / groups;
-  const auto dtype = mps::scalarToMetalTypeString(input_t);
-  const bool out_nhwc = !output_t.is_contiguous();
-  const bool has_bias = bias_opt && bias_opt->defined();
-  const auto bias = has_bias ? bias_opt->to(input_t.scalar_type()).contiguous() : input_t;
-  auto input = input_t;
-  bool in_nhwc = !input.is_contiguous() && input.is_contiguous(MemoryFormat::ChannelsLast);
-  input = input.contiguous(in_nhwc ? MemoryFormat::ChannelsLast : MemoryFormat::Contiguous);
-  auto params = conv2d_params(input, weight_t, output_t, padding, stride, dilation, has_bias);
-  const auto launch = [&](const std::string& name, const Tensor& w, MTLSize grid, int64_t tg, bool threads = false) {
-    auto pipeline = lib.getPipelineStateForFunc(name);
-    conv_metal_launch(pipeline, name.c_str(), {input, w}, [&](id<MTLComputeCommandEncoder> encoder) {
-      mtl_setArgs(encoder, input, w, output_t, params, bias);
-      const auto block = MTLSizeMake(threads ? std::min<int64_t>(grid.width, tg) : tg, 1, 1);
-      if (threads) {
-        [encoder dispatchThreads:grid threadsPerThreadgroup:block];
-      } else {
-        [encoder dispatchThreadgroups:grid threadsPerThreadgroup:block];
-      }
-    });
-  };
-  const bool pointwise = kH == 1 && kW == 1 && padding[0] == 0 && padding[1] == 0;
-  const bool patch_embed =
-      kH == stride[0] && kW == stride[1] && padding[0] == 0 && padding[1] == 0 && dilation[0] == 1 && dilation[1] == 1;
-  const bool strided = stride[0] > 1 || stride[1] > 1;
-  const bool apple10 = is_apple_family_or_newer(AppleGPUFamily::APPLE_10_PLUS);
-  const bool bfloat_simd = is_apple_family_or_newer(AppleGPUFamily::APPLE_9_PLUS) && input.scalar_type() == kBFloat16;
-  const bool bfloat_nchw = bfloat_simd && groups == 1 && !in_nhwc && !out_nhwc;
-  static const int64_t cores = std::max<int64_t>(at::mps::MPSDevice::getInstance()->getCoreCount(), 8);
-  const int64_t target = (apple10 ? 8 : 16) * cores;
-  const bool tiny_s2 = Cg == 3 && stride[0] == 2 && stride[1] == 2 && params.W % 16 == 0 && Og <= (apple10 ? 16 : 32);
-  const bool tiny_3x3 = kH == 3 && kW == 3 && padding[0] == 1 && padding[1] == 1 && dilation[0] == 1 &&
-      dilation[1] == 1 && params.W % 8 == 0 &&
-      ((!strided && (Cg == 1 || (Cg == 3 && (!apple10 || Og <= 32)))) || tiny_s2);
-  if (bfloat_nchw && Og % 4 == 0 && input.storage_offset() % 2 == 0 && output_t.storage_offset() % 2 == 0 &&
-      ((pointwise && !strided && Cg == 4 && int64_t(params.H) * params.W % 8 == 0) || tiny_3x3)) {
-    const int64_t columns = pointwise ? int64_t(params.H) * params.W / 8 : params.outW / 8;
-    const auto grid = MTLSizeMake(columns, pointwise ? Og / 4 : params.outH, pointwise ? params.N : params.N * Og / 4);
-    launch(fmt::format("conv2d_tiny_{}_{}_{}_bfloat", Cg, kW, stride[1]), weight_t.contiguous(), grid, 256, true);
-    return;
-  }
-  const int64_t o1_threads = c10::metal::ceil_div(int64_t(params.outW), int64_t(8)) * params.outH;
-  if (Og == 1 && !in_nhwc && !out_nhwc && o1_threads * params.N * params.C_out >= 4096) {
-    const bool wide = bfloat_simd && stride[1] == 1 && dilation[1] == 1 &&
-        ((kW == 1 && Cg <= 32) || (kW == 3 && Cg <= 16 && o1_threads * params.N * params.C_out >= 65536));
-    const bool paired = bfloat_simd && kH == 3 && kW == 3 && stride[0] == 1 && stride[1] == 1 && dilation[0] == 1 &&
-        dilation[1] == 1 && Cg <= 128 && o1_threads * params.N * params.C_out >= 16384 &&
-        (apple10 || (Cg <= 16 && o1_threads >= 4096));
-    const bool fixed = (kW == 3 || wide) && stride[1] == 1 && dilation[1] == 1;
-    const int64_t width = paired ? 4 : wide ? 16 : 8, height = paired ? 2 : 1;
-    const int64_t threads =
-        c10::metal::ceil_div(int64_t(params.outW), width) * c10::metal::ceil_div(int64_t(params.outH), height);
-    const auto name = fmt::format("conv2d_o1_{}_{}_{}_{}_{}", fixed ? kW : 0, fixed ? 1 : 0, height, width, dtype);
-    launch(name, weight_t.contiguous(), MTLSizeMake(threads, params.N * params.C_out, 1), 256, true);
-    return;
-  }
-  const bool small_wino = Og > 1 && Og <= 4 && Cg >= 256 && Cg <= 384 && int64_t(params.H) * params.W < 131072 &&
-      int64_t(params.N) * params.H * params.W >= 16384;
-  if (!apple10 && bfloat_nchw && kH == 3 && kW == 3 && stride[0] == 1 && stride[1] == 1 && dilation[0] == 1 &&
-      dilation[1] == 1 && Cg >= 8 &&
-      (fused_mid || small_wino ||
-       (Og > 1 && Og <= 16 && int64_t(params.H) * params.W * (Og <= 8 ? 1 : params.N) >= 65536))) {
-    const int64_t rows = fused_mid ? 32 : Og <= 8 ? 8 : 16, columns = small_wino ? 8 : rows == 8 ? 32 : 16;
-    const int64_t tiles = ((int64_t(params.outH) + 1) / 2) * ((int64_t(params.outW) + 1) / 2);
-    constexpr int64_t max_int = std::numeric_limits<int32_t>::max();
-    const bool index32 = int64_t(params.C_in) * params.H * params.W <= max_int &&
-        int64_t(params.C_out) * params.outH * params.outW <= max_int && weight_t.numel() <= max_int;
-    const auto grid = MTLSizeMake(c10::metal::ceil_div(Og, rows), c10::metal::ceil_div(tiles, columns), params.N);
-    const auto name = fmt::format("conv2d_winograd_fused_{}x{}_bfloat_{}", rows, columns, index32 ? "int" : "long");
-    launch(name, weight_t.contiguous(), grid, fused_mid ? 256 : 128);
-    return;
-  }
-  const bool single_pointwise = apple10 && params.N == 1 && input.scalar_type() == kBFloat16 &&
-      int64_t(params.C_out) * params.C_in * params.outH * params.outW >= (int64_t(1) << 29) &&
-      ((Cg > 16 && Cg < 128 && Og >= 256) || (Cg > 128 && Cg <= 192 && Og > 32 && Og <= 64));
-  const int64_t pointwise_plane = int64_t(params.H) * params.W;
-  if (pointwise && apple10 && groups == 1 && params.N == 1 && input.scalar_type() == kBFloat16 && !out_nhwc &&
-      !in_nhwc && !strided && (Cg == 128 || Cg == 256) && Og >= 128 && Og <= 256 && pointwise_plane >= 262144 &&
-      pointwise_plane <= std::numeric_limits<int32_t>::max() / std::max(Cg, Og)) {
-    const auto grid =
-        MTLSizeMake(c10::metal::ceil_div(pointwise_plane, int64_t(128)), c10::metal::ceil_div(Og, int64_t(64)), 1);
-    launch(fmt::format("conv2d_pointwise_{}", Cg), weight_t.contiguous(), grid, 128);
-    return;
-  }
-  if (pointwise && apple10 && groups == 1 && params.N == 1 && !out_nhwc && !in_nhwc && !strided && !single_pointwise &&
-      (Cg <= 16 || int64_t(params.C_out) * params.C_in * params.outH * params.outW >= (int64_t(1) << 29))) {
-    auto out = output_t.view({params.C_out, int64_t(params.outH) * params.outW});
-    const auto x = input.view({params.C_in, int64_t(params.H) * params.W});
-    const auto w = weight_t.reshape({params.C_out, params.C_in});
-    has_bias ? at::addmm_out(out, bias.view({params.C_out, 1}), w, x) : at::mm_out(out, w, x);
-    return;
-  }
-  const bool sample_s2 = pointwise && stride[0] == 2 && stride[1] == 2 && Cg >= 128 && Cg <= 256 && params.outW >= 24 &&
-      c10::metal::ceil_div(Og, int64_t(128)) * params.outH * c10::metal::ceil_div(int64_t(params.outW), int64_t(32)) *
-              params.N >=
-          target;
-  const bool patch2 =
-      patch_embed && kH == 2 && kW == 2 && params.N > 1 && Cg >= 96 && Cg <= 192 && Og % 192 == 0 && params.H % 2 == 0;
-  const bool packed3 =
-      apple10 && kH == 3 && kW == 3 && dilation[0] == 1 && dilation[1] == 1 && padding[0] == 1 && padding[1] == 1;
+  using Input = Conv2dMppInput;
+  const int64_t kH = params.kH, kW = params.kW, Cg = params.C_in_per_group, Og = params.C_out_per_group;
   const int64_t positions = int64_t(params.outH) * params.outW;
-  const bool narrow_batch = params.N >= 8 && (Cg == 64 || Cg == 128) && params.W >= 32 && params.W <= 96 &&
-      positions >= 1024 && positions <= 16384;
-  const bool narrow_large =
-      params.N == 1 && Cg == 176 && params.W >= 128 && params.W <= 512 && positions >= 16384 && positions <= 131072;
-  const int64_t narrow_columns = Cg == 64 ? 64 : 128;
-  if (packed3 && !strided && bfloat_nchw && (narrow_batch || narrow_large) && Og > 32 && Og <= 64 &&
-      params.N * c10::metal::ceil_div(positions, narrow_columns) >= target) {
-    const auto w = conv3d_weights_to_dhwio((Cg == 128 ? weight_t : weight_t.transpose(0, 1)).unsqueeze(2));
-    const auto grid = MTLSizeMake(1, c10::metal::ceil_div(positions, narrow_columns), params.N);
-    launch(fmt::format("conv2d_narrow_{}", Cg), w, grid, Cg == 128 ? 256 : 128);
-    return;
-  }
-  const bool patch_flat = packed3 && !strided && Cg > 32 && Cg < 128 && Og > 128 && Og <= 256 && params.W >= 32 &&
-      params.W % 2 == 0 && positions >= 4096 && positions <= 32768;
-  const bool patch_s1 = packed3 && !strided && ((Cg == 16 && Og >= 256 && params.W % 8 == 0) || patch_flat) &&
-      input.storage_offset() % 2 == 0 &&
-      int64_t(params.C_in) * params.H * params.W <= std::numeric_limits<int32_t>::max() &&
-      int64_t(params.C_out) * params.outH * params.outW <= std::numeric_limits<int32_t>::max();
-  const bool patch_s2 = packed3 && stride[0] == 2 && stride[1] == 2 &&
-      ((Cg > 8 && Cg <= 16 && Og > 16 && Og <= 32) ||
-       (Cg >= 128 && Og > 128 && Og <= 256 && params.outW > 8 && params.outW <= 16 &&
-        int64_t(params.N) * params.outH >= target));
-  const bool packed_patch = (params.W % 2 == 0 || (sample_s2 && params.H % 2 == 0)) && input.storage_offset() % 2 == 0;
-  if (bfloat_nchw && (patch_s1 || patch_s2 || (packed_patch && (sample_s2 || patch2)))) {
-    const int64_t rows = patch_flat ? 128 : patch_s1 ? 64 : patch_s2 ? (Cg <= 16 ? 32 : 256) : sample_s2 ? 128 : 192;
-    const int64_t columns = patch_flat ? 32 : patch_s1 || (patch_s2 && Cg <= 16) ? 64 : sample_s2 ? 32 : 16;
-    const int64_t row_tiles = c10::metal::ceil_div(int64_t(params.outW), columns);
-    const int64_t tiles = patch_flat ? c10::metal::ceil_div(positions, columns) : params.outH * row_tiles;
-    const auto grid = MTLSizeMake(c10::metal::ceil_div(Og, rows), tiles, params.N);
-    launch(fmt::format("conv2d_patch_{}_{}_s{}_bfloat", kH, rows, params.sH), weight_t.contiguous(), grid, 128);
-    return;
-  }
-  const int64_t im2col_bytes = output_t.numel() / output_t.size(1) * Cg * kH * kW * groups * input.element_size();
-  const bool direct_columns = bfloat_nchw && stride[0] == 2 && stride[1] == 2 && dilation[0] == 1 && dilation[1] == 1 &&
-      kH == kW && (kH == 2 || kH == 3) && Og >= 512 && im2col_bytes <= (int64_t(128) << 20) &&
-      (apple10 ? (params.N > 1 && Cg >= 384 && positions <= 256) ||
-               (params.N == 1 && Cg >= 512 && positions >= 512 &&
-                (padding[0] > 0 || padding[1] > 0 || positions >= 8192))
-               : params.N == 1 && Cg >= 512 && Og >= 2 * Cg && positions >= 512 && positions <= 4096);
-  const int64_t padded_h = params.H + 2 * padding[0], padded_w = params.W + 2 * padding[1];
-  const int64_t row_tiles = c10::metal::ceil_div(int64_t(params.outW), kTile);
-  const float tile_waste = 1.0f - float(params.outW) / float(row_tiles * kTile);
-  const bool flat = !strided && tile_waste > 11.0f / float(Og) + 0.08f && tile_waste * float(Cg * kH * kW) > 1000.0f;
-  const float waste32 = 1.0f - float(params.outW) / float(c10::metal::ceil_div(int64_t(params.outW), int64_t(32)) * 32);
-  const bool narrow_better = tile_waste - waste32 >= 0.14f;
-  const bool s2_mid = Og > 64 && Og <= 96 && bfloat_simd;
-  const int64_t bm = Og <= 16 ? 16 : Og <= 32 ? 32 : Og <= 64 ? 64 : s2_mid ? 96 : 128;
-  const auto s2_threadgroups = [&](int64_t bn) {
-    return c10::metal::ceil_div(Og, bm) * groups * params.outH * c10::metal::ceil_div(int64_t(params.outW), bn) *
-        params.N;
-  };
-  const int64_t bn = bm == 96 || params.outW < kTile || narrow_better || s2_threadgroups(kTile) < target ? 32
-      : Cg <= 16 && Og <= 32 && params.outW >= 128 && s2_threadgroups(128) >= target                     ? 128
-                                                                                                         : kTile;
-  if (!pointwise && !patch_embed && !in_nhwc && !out_nhwc && stride[1] == 2 && (kW - 1) * dilation[1] <= 6 && Cg > 8 &&
-      Cg <= 128 && params.outW >= 24 && std::min(tile_waste, waste32) < 0.35f && s2_threadgroups(bn) >= 4 * cores) {
-    const int64_t simdgroups = bm == 128 ? 8 : 4;
-    const auto w = conv3d_weights_to_dhwio(weight_t.transpose(0, 1).unsqueeze(2));
-    const int64_t row_tiles = c10::metal::ceil_div(int64_t(params.outW), bn);
-    const auto grid = MTLSizeMake(c10::metal::ceil_div(Og, bm) * groups, params.outH * row_tiles, params.N);
-    launch(fmt::format("conv2d_s2_b{}x{}_s{}_{}", bm, bn, simdgroups, dtype), w, grid, simdgroups * 32);
-    return;
-  }
-  const bool tiny = groups == 1 && dilation[1] == 1 && Cg <= 8;
-  const bool unfolded = tiny && Og >= 64 && 5 * kH * Cg * padded_w <= 3 * Og * params.outW;
-  const bool parity = !direct_columns && !in_nhwc && !tiny && !(groups > 1 && Cg <= 8) && stride[1] == 2 &&
-      dilation[1] == 1 && padding[1] <= 2 && params.outW > 32;
-  const bool narrow = strided && !tiny && im2col_bytes <= (int64_t(64) << 20) &&
-      (params.outW <= 8 || (params.outW <= 20 && int64_t(params.N) * params.outH * params.outW <= 1024));
-  const bool merged = !unfolded && !narrow && groups == 1 && dilation[1] == 1 &&
-      (tiny || (flat && params.outH * params.outW <= 1024) || (stride[1] > 1 && !in_nhwc && !parity) ||
-       (Cg <= 16 && 2 * Cg * padded_h * padded_w <= Og * params.outH * params.outW));
-  const bool im2col = direct_columns || (patch_embed && !parity) || narrow ||
-      (im2col_bytes <= (int64_t(64) << 20) &&
-       ((groups > 1 && Cg <= 8) || (stride[1] > 1 && !merged && !unfolded && !parity && Cg * kH * kW <= 1024)));
+  const int64_t padded_h = params.H + 2 * params.padH, padded_w = params.W + 2 * params.padW;
+  const std::array<int64_t, 2> padding{params.padH, params.padW};
+  const auto bias = params.has_bias ? bias_opt->to(input.scalar_type()).contiguous() : input;
+  bool in_nhwc = !input.is_contiguous();
+  const bool out_nhwc = !output_t.is_contiguous();
   Tensor weight;
   int32_t K = params.C_in_per_group, Wp = 0;
-  if (pointwise) {
-    if (stride[0] > 1 || stride[1] > 1) {
-      input = input.slice(2, 0, std::nullopt, stride[0]).slice(3, 0, std::nullopt, stride[1]);
-      input = input.contiguous(in_nhwc ? MemoryFormat::ChannelsLast : MemoryFormat::Contiguous);
-    }
-    params.H = params.outH = 1;
-    params.W = params.outW = static_cast<int32_t>(output_t.size(2) * output_t.size(3));
-    params.sH = params.sW = 1;
-    weight = weight_t.contiguous();
-  } else if (im2col) {
-    input = conv2d_im2col(input, params);
-    in_nhwc = false;
-    K = static_cast<int32_t>(Cg * kH * kW);
-    params.C_in = static_cast<int32_t>(groups * K);
-    params.C_in_per_group = K;
-    params.H = params.outH;
-    params.W = Wp = params.outW;
-    params.kH = params.kW = params.sH = params.sW = params.dH = params.dW = 1;
-    params.padH = params.padW = 0;
-    if (direct_columns) {
+  switch (plan.input) {
+    case Input::Pointwise:
+      if (params.sH > 1 || params.sW > 1) {
+        input = input.slice(2, 0, std::nullopt, params.sH).slice(3, 0, std::nullopt, params.sW);
+        input = input.contiguous(in_nhwc ? MemoryFormat::ChannelsLast : MemoryFormat::Contiguous);
+      }
       params.H = params.outH = 1;
       params.W = params.outW = static_cast<int32_t>(positions);
-      Wp = 0;
-    }
-    weight = weight_t.contiguous();
-  } else {
-    if (unfolded) {
+      params.sH = params.sW = 1;
+      weight = weight_t.contiguous();
+      break;
+    case Input::Im2col:
+    case Input::Columns:
+      input = conv2d_im2col(input, params);
+      in_nhwc = false;
+      K = static_cast<int32_t>(Cg * kH * kW);
+      params.C_in = static_cast<int32_t>(groups * K);
+      params.C_in_per_group = K;
+      params.kH = params.kW = params.sH = params.sW = params.dH = params.dW = 1;
+      params.padH = params.padW = 0;
+      if (plan.input == Input::Columns) {
+        params.H = params.outH = 1;
+        params.W = params.outW = static_cast<int32_t>(positions);
+      } else {
+        params.H = params.outH;
+        params.W = Wp = params.outW;
+      }
+      weight = weight_t.contiguous();
+      break;
+    case Input::Unfolded: {
       auto rows =
           at::empty({params.N, kH * params.C_in, params.outH, padded_w}, input.options(), MemoryFormat::ChannelsLast);
-      nchw_to_nhwc(input.contiguous(), rows, params.C_in, params.H, params.W, padding, kH, stride[0], dilation[0]);
+      nchw_to_nhwc(input.contiguous(), rows, params.C_in, params.H, params.W, padding, kH, params.sH, params.dH);
       input = rows;
       in_nhwc = true;
       K = static_cast<int32_t>(kW * kH * Cg);
@@ -1019,7 +852,9 @@ static void conv2d_mpp_forward(const Tensor& input_t,
       weight = conv3d_weights_to_dhwio(
           weight_t.as_strided({Cg, 1, weight_t.size(0), kW, kH},
                               {weight_t.stride(1), 0, weight_t.stride(0), weight_t.stride(3), weight_t.stride(2)}));
-    } else if (merged) {
+      break;
+    }
+    case Input::Merged: {
       if (in_nhwc) {
         input = at::constant_pad_nd(input, {padding[1], padding[1], padding[0], padding[0]});
       } else {
@@ -1038,116 +873,62 @@ static void conv2d_mpp_forward(const Tensor& input_t,
       weight = conv3d_weights_to_dhwio(
           weight_t.as_strided({Cg, 1, kH, weight_t.size(0), kW},
                               {weight_t.stride(1), 0, weight_t.stride(2), weight_t.stride(0), weight_t.stride(3)}));
-    } else {
-      weight = conv3d_weights_to_dhwio(weight_t.transpose(0, 1).unsqueeze(2));
+      break;
     }
-    if (parity) {
-      input = conv2d_deinterleave(input);
-      params.W = static_cast<int32_t>(input.size(3));
-      params.sW = 1;
-    } else if (stride[1] > 1 && !in_nhwc) {
-      input = conv3d_to_ndhwc(input.unsqueeze(2)).squeeze(2);
-      in_nhwc = true;
-    }
-    if (flat && !unfolded) {
-      if (!merged && (padding[0] > 0 || padding[1] > 0)) {
+    case Input::Direct:
+      if (plan.parity) {
+        input = conv2d_deinterleave(input);
+        params.W = static_cast<int32_t>(input.size(3));
+        params.sW = 1;
+      } else if (params.sW > 1 && !in_nhwc) {
+        input = conv3d_to_ndhwc(input.unsqueeze(2)).squeeze(2);
+        in_nhwc = true;
+      }
+      if (plan.flat && (params.padH > 0 || params.padW > 0)) {
         input = at::constant_pad_nd(input, {padding[1], padding[1], padding[0], padding[0]});
         params.H = static_cast<int32_t>(input.size(2));
         params.W = static_cast<int32_t>(input.size(3));
         params.padH = params.padW = 0;
       }
-      Wp = params.W;
-    }
+      weight = conv3d_weights_to_dhwio(weight_t.transpose(0, 1).unsqueeze(2));
+      break;
   }
-  const bool wide_pointwise = apple10 && params.N > 1 && Cg >= 160 && Cg <= 960 && Cg % 32 == 0 && Og <= 640 &&
-      Og % 160 == 0 && params.W >= 4096;
-  const bool compact_pointwise = params.N > 1 && Cg >= 256 && Og >= 128 && Og <= 256 && params.W >= 512 &&
-      params.W <= 1024 &&
-      c10::metal::ceil_div(Og, int64_t(128)) * c10::metal::ceil_div(int64_t(params.W), int64_t(32)) * params.N >=
-          target;
-  const bool long_pointwise = apple10 && params.N > 1 && Cg >= 256 && Og > 32 && Og <= 64 && params.W >= 4096;
-  const bool fast_pointwise = direct_columns ||
-      (bfloat_nchw && pointwise && !strided &&
-       (wide_pointwise || compact_pointwise || long_pointwise || single_pointwise ||
-        (apple10 && params.N > 1 && Cg > 16 && Cg <= 128 && Og >= 512 && params.W >= 512)));
-  const bool fixed3x3 = apple10 && bfloat_nchw && Wp == 0 && params.kH == 3 && params.kW == 3 && params.sH == 1 &&
-      params.sW == 1 && params.dH == 1 && params.dW == 1 && params.padH == 1 && params.padW == 1 &&
-      ((params.N == 1 && Cg > 32 && Cg <= 64 && Og > 32 && Og <= 64 && positions >= 131072) ||
-       (Cg > 16 && Og > 64 && Og <= 96 && params.outW >= 64 &&
-        params.N * params.outH * c10::metal::ceil_div(int64_t(params.outW), int64_t(64)) >= target));
-  const int64_t block = Og <= 16 ? 16 : Og <= 32 ? 32 : 64;
-  const auto tiles_for = [&](int64_t width) {
-    return Wp > 0 ? c10::metal::ceil_div(int64_t(params.outH - 1) * Wp + params.outW, width)
-                  : params.outH * c10::metal::ceil_div(int64_t(params.outW), width);
-  };
-  const auto threadgroups_for = [&](int64_t width) {
-    return c10::metal::ceil_div(Og, width >= kTile || (block == 32 && width == 32) ? block : kTile) * groups *
-        tiles_for(width) * params.N;
-  };
-  int64_t width = kTile;
-  if (block == kTile) {
-    if (!flat && !pointwise && params.outW <= 32) {
-      width = params.outW <= 16 ? 16 : 32;
-    }
-    while (width > 16 && threadgroups_for(width) < target) {
-      width /= 2;
-    }
-  } else if (block == 16 && K <= 64 && (Wp > 0 ? tiles_for(1) : params.outW) >= 128) {
-    width = 128;
+  if (plan.flat && (plan.input == Input::Direct || plan.input == Input::Merged)) {
+    Wp = params.W;
   }
-  if (!flat && !pointwise && block >= 32 && width == kTile && params.outW > 32 && narrow_better) {
-    width = 32;
-  }
-  const int64_t pointwise_width = long_pointwise                            ? 128
-      : wide_pointwise || compact_pointwise || (direct_columns && !apple10) ? 32
-                                                                            : 64;
-  const int64_t pointwise_simdgroups = long_pointwise ? 8 : direct_columns && apple10 ? 2 : 4;
-  if (fast_pointwise) {
-    width = pointwise_width;
-  } else if (fixed3x3) {
-    width = 64;
-  }
-  const int64_t simdgroups = fixed3x3                                   ? (Og > 64 ? 4 : 2)
-      : fast_pointwise                                                  ? pointwise_simdgroups
-      : width == kTile && (!apple10 || unfolded || (K > 16 && K <= 96)) ? 4
-                                                                        : 2;
-  const int64_t tiles = tiles_for(width), threadgroups = threadgroups_for(width);
-  const int64_t k_cap = K / (block == 16 ? 128 : 256);
-  const int64_t k_split = fast_pointwise || fixed3x3
-      ? K
-      : c10::metal::round_up(
-            c10::metal::ceil_div(int64_t(K), std::max<int64_t>(std::min<int64_t>(target / threadgroups, k_cap), 1)),
-            int64_t(32));
-  const int64_t splits = c10::metal::ceil_div(int64_t(K), k_split);
-  const Conv2dMppParams mpp_params{.conv = params,
-                                   .K = K,
-                                   .K_split = static_cast<int32_t>(k_split),
-                                   .splits = static_cast<int32_t>(splits),
-                                   .Wp = Wp,
-                                   .parity = parity ? static_cast<int32_t>(input.size(3) / 2 + 1) : 0};
+  Conv2dMppParams mpp{
+      .conv = params, .K = K, .Wp = Wp, .parity = plan.parity ? static_cast<int32_t>(input.size(3) / 2 + 1) : 0};
+  const auto tile = select_conv2d_mpp_tile(mpp, plan, groups, in_nhwc, out_nhwc, conv2d_device());
+  mpp.K_split = static_cast<int32_t>(tile.k_split);
+  mpp.splits = static_cast<int32_t>(tile.splits);
   const int64_t pitch = Wp > 0 ? Wp : params.outW;
-  const bool partials = splits > 1 || pitch != params.outW;
+  const bool partials = tile.splits > 1 || pitch != params.outW;
   const auto partial = partials
-      ? at::empty({splits * params.N * params.C_out * params.outH * pitch}, output_t.options().dtype(kFloat))
+      ? at::empty({tile.splits * params.N * params.C_out * params.outH * pitch}, output_t.options().dtype(kFloat))
       : output_t;
-  const int64_t pointwise_rows = wide_pointwise ? 160 : compact_pointwise ? 128 : 64;
-  const int64_t rows = fixed3x3 && Og > 64             ? 96
-      : fast_pointwise                                 ? pointwise_rows
-      : width >= kTile || (block == 32 && width == 32) ? block
-                                                       : kTile;
-  const bool staged = unfolded && in_nhwc && !apple10 && !out_nhwc && rows == kTile && width == kTile && !partials;
-  const auto layout = fmt::format("{}_{}", in_nhwc ? "nhwc" : "nchw", out_nhwc ? "nhwc" : "nchw");
-  const char* variant = fixed3x3 ? "k3_" : fast_pointwise ? "pw1_" : staged ? "st_" : "";
-  const auto name = fmt::format("conv2d_mpp_{}_b{}x{}_s{}_{}{}", layout, rows, width, simdgroups, variant, dtype);
+  const char* variant = tile.variant == Conv2dMppVariant::Fixed3x3 ? "k3_"
+      : tile.variant == Conv2dMppVariant::Pointwise                ? "pw1_"
+      : tile.variant == Conv2dMppVariant::Staged                   ? "st_"
+                                                                   : "";
+  const auto dtype = scalarToMetalTypeString(input);
+  const auto name = fmt::format("conv2d_mpp_{}_{}_b{}x{}_s{}_{}{}",
+                                in_nhwc ? "nhwc" : "nchw",
+                                out_nhwc ? "nhwc" : "nchw",
+                                tile.rows,
+                                tile.columns,
+                                tile.simdgroups,
+                                variant,
+                                dtype);
   auto pipeline = lib.getPipelineStateForFunc(name);
   conv_metal_launch(pipeline, "conv2d_mpp", {input, weight}, [&](id<MTLComputeCommandEncoder> encoder) {
-    mtl_setArgs(encoder, input, weight, output_t, mpp_params, bias, partial);
-    [encoder dispatchThreadgroups:MTLSizeMake(c10::metal::ceil_div(Og, rows) * groups, tiles, params.N * splits)
-            threadsPerThreadgroup:MTLSizeMake(simdgroups * 32, 1, 1)];
+    mtl_setArgs(encoder, input, weight, output_t, mpp, bias, partial);
+    [encoder dispatchThreadgroups:MTLSizeMake(
+                                      c10::metal::ceil_div(Og, tile.rows) * groups, tile.tiles, params.N * tile.splits)
+            threadsPerThreadgroup:MTLSizeMake(tile.simdgroups * 32, 1, 1)];
     if (partials) {
       const auto image = int64_t(params.C_out) * params.outH * params.outW;
       const std::array<int32_t, 4> geometry{params.C_out, params.outH, params.outW, static_cast<int32_t>(pitch)};
-      const std::array<int32_t, 4> counts{static_cast<int32_t>(splits), params.N, has_bias, out_nhwc};
+      const std::array<int32_t, 4> counts{mpp.splits, params.N, params.has_bias, out_nhwc};
       [encoder setComputePipelineState:lib.getPipelineStateForFunc("conv2d_split_reduce_" + dtype)];
       mtl_setArgs(encoder, partial, bias, output_t, geometry, counts);
       [encoder dispatchThreads:MTLSizeMake(image, params.N, 1)
@@ -1206,7 +987,7 @@ static void conv2d_winograd_forward(const Tensor& input_t,
       [encoder dispatchThreads:MTLSizeMake(count, C, 1)
           threadsPerThreadgroup:MTLSizeMake(std::min<int64_t>(count, 256), 1, 1)];
       if (tile_h == 4) {
-        const int64_t columns = is_apple_family_or_newer(AppleGPUFamily::APPLE_10_PLUS) ? 64 : 32;
+        const int64_t columns = conv2d_device().apple10 ? 64 : 32;
         const Conv2dMppParams gemm_params{
             .conv = {.N = 24, .C_in = static_cast<int32_t>(C), .C_out = static_cast<int32_t>(O), .H = 1, .W = count}};
         const auto grid = MTLSizeMake(
@@ -1218,7 +999,9 @@ static void conv2d_winograd_forward(const Tensor& input_t,
       }
     });
     if (tile_h == 2) {
-      conv2d_mpp_forward(v, weights.view({16 * O, C, 1, 1}), std::nullopt, {0, 0}, {1, 1}, {1, 1}, 16, m);
+      const auto w16 = weights.view({16 * O, C, 1, 1});
+      const Conv2dPlan plan{.kernel = Conv2dKernel::Mpp, .input = Conv2dMppInput::Pointwise};
+      conv2d_mpp_forward(v, w16, std::nullopt, conv2d_params(v, w16, m, {0, 0}, {1, 1}, {1, 1}, false), plan, 16, m);
     }
     const char* output_kind = tile_h == 4 ? "4" : out_nhwc ? "nhwc" : "nchw";
     auto ok = lib.getPipelineStateForFunc(fmt::format("winograd_output_{}_{}", output_kind, dtype));
@@ -1228,6 +1011,106 @@ static void conv2d_winograd_forward(const Tensor& input_t,
           threadsPerThreadgroup:MTLSizeMake(std::min<int64_t>(count, 256), 1, 1)];
     });
   }
+}
+
+// conv2d forward on the Metal kernels (macOS 26.2+): one dispatch per plan.kernel.
+static void conv2d_metal_forward(const Tensor& input_t,
+                                 const Tensor& weight_t,
+                                 const std::optional<Tensor>& bias_opt,
+                                 IntArrayRef padding,
+                                 IntArrayRef stride,
+                                 IntArrayRef dilation,
+                                 int64_t groups,
+                                 const Tensor& output_t) {
+  using namespace mps;
+  using c10::metal::ceil_div;
+  const bool in_nhwc = !input_t.is_contiguous() && input_t.is_contiguous(MemoryFormat::ChannelsLast);
+  const auto input = input_t.contiguous(in_nhwc ? MemoryFormat::ChannelsLast : MemoryFormat::Contiguous);
+  const bool has_bias = bias_opt && bias_opt->defined();
+  const auto params = conv2d_params(input, weight_t, output_t, padding, stride, dilation, has_bias);
+  const auto plan = select_conv2d_kernel(params, input, weight_t, output_t, groups, conv2d_device());
+  const int64_t N = params.N, Cg = params.C_in_per_group, Og = params.C_out_per_group;
+  const int64_t outH = params.outH, outW = params.outW, positions = outH * outW;
+  const auto bias = has_bias ? bias_opt->to(input.scalar_type()).contiguous() : input;
+  const auto dtype = scalarToMetalTypeString(input);
+  Tensor weight = weight_t.contiguous();
+  std::string name;
+  MTLSize grid = MTLSizeMake(0, 0, 0);
+  switch (plan.kernel) {
+    case Conv2dKernel::Winograd2x2:
+    case Conv2dKernel::Winograd4x2:
+      conv2d_winograd_forward(
+          input, weight_t, bias_opt, padding, output_t, plan.kernel == Conv2dKernel::Winograd4x2 ? 4 : 2);
+      return;
+    case Conv2dKernel::PointwiseMatmul: {
+      auto out = output_t.view({params.C_out, positions});
+      const auto x = input.view({params.C_in, positions});
+      const auto w = weight_t.reshape({params.C_out, params.C_in});
+      has_bias ? at::addmm_out(out, bias.view({params.C_out, 1}), w, x) : at::mm_out(out, w, x);
+      return;
+    }
+    case Conv2dKernel::Mpp:
+      conv2d_mpp_forward(input, weight_t, bias_opt, params, plan, groups, output_t);
+      return;
+    case Conv2dKernel::Tiny: {
+      const bool pointwise = params.kW == 1;
+      const int64_t columns = (pointwise ? int64_t(params.H) * params.W : outW) / 8;
+      name = fmt::format("conv2d_tiny_{}_{}_{}_bfloat", Cg, params.kW, params.sW);
+      grid = MTLSizeMake(columns, pointwise ? Og / 4 : outH, pointwise ? N : N * Og / 4);
+      break;
+    }
+    case Conv2dKernel::SingleOutput:
+      name = fmt::format("conv2d_o1_{}_{}_{}_{}_{}",
+                         plan.fixed_taps ? params.kW : 0,
+                         plan.fixed_taps ? 1 : 0,
+                         plan.rows,
+                         plan.columns,
+                         dtype);
+      grid = MTLSizeMake(ceil_div(outW, plan.columns) * ceil_div(outH, plan.rows), N * params.C_out, 1);
+      break;
+    case Conv2dKernel::WinogradFused: {
+      constexpr int64_t kInt32Max = std::numeric_limits<int32_t>::max();
+      const bool index32 = int64_t(params.C_in) * params.H * params.W <= kInt32Max &&
+          int64_t(params.C_out) * positions <= kInt32Max && weight_t.numel() <= kInt32Max;
+      const int64_t tiles = ceil_div(outH, int64_t(2)) * ceil_div(outW, int64_t(2));
+      name = fmt::format("conv2d_winograd_fused_{}x{}_bfloat_{}", plan.rows, plan.columns, index32 ? "int" : "long");
+      grid = MTLSizeMake(ceil_div(Og, plan.rows), ceil_div(tiles, plan.columns), N);
+      break;
+    }
+    case Conv2dKernel::PointwisePlane:
+      name = fmt::format("conv2d_pointwise_{}", Cg);
+      grid = MTLSizeMake(ceil_div(int64_t(params.H) * params.W, plan.columns), ceil_div(Og, plan.rows), 1);
+      break;
+    case Conv2dKernel::Narrow:
+      weight = conv3d_weights_to_dhwio((Cg == 128 ? weight_t : weight_t.transpose(0, 1)).unsqueeze(2));
+      name = fmt::format("conv2d_narrow_{}", Cg);
+      grid = MTLSizeMake(1, ceil_div(positions, plan.columns), N);
+      break;
+    case Conv2dKernel::Patch: {
+      const int64_t tiles = plan.flat ? ceil_div(positions, plan.columns) : outH * ceil_div(outW, plan.columns);
+      name = fmt::format("conv2d_patch_{}_{}_s{}_bfloat", params.kH, plan.rows, params.sH);
+      grid = MTLSizeMake(ceil_div(Og, plan.rows), tiles, N);
+      break;
+    }
+    case Conv2dKernel::Stride2:
+      weight = conv3d_weights_to_dhwio(weight_t.transpose(0, 1).unsqueeze(2));
+      name = fmt::format("conv2d_s2_b{}x{}_s{}_{}", plan.rows, plan.columns, plan.simdgroups, dtype);
+      grid = MTLSizeMake(ceil_div(Og, plan.rows) * groups, outH * ceil_div(outW, plan.columns), N);
+      break;
+  }
+  // Tiny and SingleOutput size their grid in threads, the tiled kernels in threadgroups.
+  const bool threads = plan.kernel == Conv2dKernel::Tiny || plan.kernel == Conv2dKernel::SingleOutput;
+  const int64_t threadgroup = plan.simdgroups * 32;
+  auto pipeline = lib.getPipelineStateForFunc(name);
+  conv_metal_launch(pipeline, name.c_str(), {input, weight}, [&](id<MTLComputeCommandEncoder> encoder) {
+    mtl_setArgs(encoder, input, weight, output_t, params, bias);
+    const auto block = MTLSizeMake(threads ? std::min<int64_t>(grid.width, threadgroup) : threadgroup, 1, 1);
+    if (threads) {
+      [encoder dispatchThreads:grid threadsPerThreadgroup:block];
+    } else {
+      [encoder dispatchThreadgroups:grid threadsPerThreadgroup:block];
+    }
+  });
 }
 
 static void fill_depthwise_conv_desc(MPSGraphDepthwiseConvolution3DOpDescriptor* descriptor_,
@@ -1350,33 +1233,7 @@ static Tensor _mps_convolution_impl(const Tensor& input_t,
     if (input_t.size(1) == 0) {
       bias_defined ? output_t.copy_(bias_opt->reshape({1, -1, 1, 1}).expand_as(output_t)) : output_t.zero_();
     } else {
-      const int64_t C_in = input_t.size(1), C_out = weight_t.size(0), channels = std::min(C_in, C_out);
-      const bool apple10 = is_apple_family_or_newer(AppleGPUFamily::APPLE_10_PLUS);
-      const bool worth = apple10 ? channels >= 160 || (channels >= 128 && input_t.numel() / C_in <= 16384)
-                                 : channels >= 96 || (channels >= 48 && C_in * C_out >= 11000);
-      const bool fused_mid = !apple10 && is_apple_family_or_newer(AppleGPUFamily::APPLE_9_PLUS) &&
-          input_t.scalar_type() == kBFloat16 && input_t.is_contiguous() && output_t.is_contiguous() && C_in >= 16 &&
-          input_t.numel() / C_in >= 16384 &&
-          ((C_in <= 192 && C_out >= 32 && channels < 128) || (C_in >= 256 && C_in <= 512 && C_out == 32));
-      const int64_t plane = input_t.size(2) * input_t.size(3);
-      const bool single_tall = input_t.size(0) == 1 &&
-          ((C_out == 128 && plane >= (apple10 ? 512 : 4096) &&
-            (plane <= 32768 || (apple10 ? C_in >= 256 : C_in <= 192))) ||
-           (!apple10 && C_in <= 192 && C_out == 64 && plane >= 16384) ||
-           (apple10 && C_in <= 128 && C_out > 128 && C_out <= 256 && plane >= 32768 && plane < 262144));
-      const bool tall_wino = is_apple_family_or_newer(AppleGPUFamily::APPLE_9_PLUS) &&
-          input_t.scalar_type() == kBFloat16 && input_t.is_contiguous() && output_t.is_contiguous() && C_in >= 128 &&
-          (single_tall ||
-           (input_t.size(0) >= 8 && C_out >= (apple10 ? 128 : 32) && C_out <= 128 &&
-            std::max(input_t.size(2), input_t.size(3)) <= 80));
-      const bool winograd = groups == 1 && weight_t.size(2) == 3 && weight_t.size(3) == 3 && stride[0] == 1 &&
-          stride[1] == 1 && dilation[0] == 1 && dilation[1] == 1 && input_t.scalar_type() != kHalf &&
-          (worth || tall_wino);
-      if (winograd && (!fused_mid || tall_wino)) {
-        conv2d_winograd_forward(input_t, weight_t, bias_opt, padding, output_t, tall_wino ? 4 : 2);
-      } else {
-        conv2d_mpp_forward(input_t, weight_t, bias_opt, padding, stride, dilation, groups, output_t, fused_mid);
-      }
+      conv2d_metal_forward(input_t, weight_t, bias_opt, padding, stride, dilation, groups, output_t);
     }
     return output_t;
   }
