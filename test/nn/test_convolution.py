@@ -28,6 +28,7 @@ from torch.testing._internal.common_device_type import (
     onlyAccelerator,
     onlyCPU,
     onlyCUDA,
+    onlyMPS,
     onlyNativeDeviceTypes,
     precisionOverride,
     skipCPUIfNoMkldnn,
@@ -85,6 +86,14 @@ if TEST_WITH_ROCM:
 if TEST_SCIPY:
     import scipy.ndimage
     import scipy.signal
+
+
+# Operands overwritten with a nonfinite value; finite cases keep every value.
+_NONFINITE_OPERANDS = [("no_bias", 0), ("finite", 0)] + [
+    (operand, value)
+    for operand in ("input", "weight", "bias")
+    for value in (float("nan"), float("inf"), -float("inf"))
+]
 
 
 class TestConvolutionNN(NNTestCase):
@@ -1175,6 +1184,186 @@ class TestConvolutionNN(NNTestCase):
 
 class TestConvolutionNNDevice(NNTestCase):
     hw_classification = HardwareClassification.ACCELERATOR
+
+    def _assert_nonfinite_equal(self, actual, expected):
+        # Exact results with the same NaN and infinity positions.
+        self.assertEqual(torch.isnan(actual), torch.isnan(expected))
+        self.assertEqual(torch.isposinf(actual), torch.isposinf(expected))
+        self.assertEqual(torch.isneginf(actual), torch.isneginf(expected))
+        finite = torch.isfinite(expected)
+        self.assertEqual(actual[finite], expected[finite], atol=0, rtol=0)
+
+    @dtypes(torch.float32, torch.float16)
+    @disablecuDNN
+    @disableMkldnn
+    @parametrize_test("shape", [(2, 4, 3, 8), (3, 4, 5, 65), (2, 3, 1, 7)])
+    @parametrize_test("input_fmt", [torch.contiguous_format, torch.channels_last])
+    @parametrize_test("weight_fmt", [torch.contiguous_format, torch.channels_last])
+    @parametrize_test("operand,value", _NONFINITE_OPERANDS)
+    def test_conv2d_small_channels_layout_padding(
+        self, device, dtype, shape, input_fmt, weight_fmt, operand, value
+    ):
+        channels, kernel, height, width = shape
+        # Small integers in [-2, 2] keep every product and sum exact.
+        x = torch.arange(2 * channels * height * width) % 5 - 2
+        x = x.reshape(2, channels, height, width).to(dtype) / 4
+        weight = torch.arange(8 * channels * kernel * kernel) % 5 - 2
+        weight = weight.reshape(8, channels, kernel, kernel).to(dtype) / 16
+        bias = torch.arange(8).remainder(3).to(dtype) / 8
+        if operand in ("input", "weight", "bias"):
+            target = {"input": x, "weight": weight, "bias": bias}[operand].view(-1)
+            target[0] = target[-1] = value
+        bias = None if operand == "no_bias" else bias
+        padding = kernel // 2
+        ref_bias = None if bias is None else bias.double()
+        expected = torch.ops.aten._slow_conv2d_forward(
+            x.double(), weight.double(), [kernel] * 2, ref_bias, [1, 1], [padding] * 2
+        ).to(dtype)
+        x = x.to(device=device, memory_format=input_fmt)
+        weight = weight.to(device=device, memory_format=weight_fmt)
+        bias = None if bias is None else bias.to(device)
+        actual = F.conv2d(x, weight, bias, padding=padding)
+        channels_last = torch.channels_last in (input_fmt, weight_fmt)
+        output_fmt = torch.channels_last if channels_last else torch.contiguous_format
+        self.assertTrue(actual.is_contiguous(memory_format=output_fmt))
+        self._assert_nonfinite_equal(actual.cpu(), expected)
+
+    @dtypes(torch.float32, torch.float16, torch.bfloat16)
+    @disablecuDNN
+    @disableMkldnn
+    @parametrize_test("shape", [(1, 33, 32), (1, 160, 160), (8, 128, 128)])
+    @parametrize_test("fmt", [torch.contiguous_format, torch.channels_last])
+    @parametrize_test("operand", ["input", "weight", "bias"])
+    @parametrize_test("value", [float("nan"), float("inf"), -float("inf")])
+    def test_conv2d_nonfinite_padding(self, device, dtype, shape, fmt, operand, value):
+        # Cover direct padding and both Winograd tile heights; the reference
+        # applies no transforms.
+        batch, channels, outputs = shape
+        x = torch.ones(batch, channels, 5, 7, dtype=dtype)
+        weight = torch.full((outputs, channels, 3, 3), 1 / 16, dtype=dtype)
+        bias = torch.zeros(outputs, dtype=dtype)
+        {"input": x, "weight": weight, "bias": bias}[operand].view(-1)[0] = value
+        expected = torch.ops.aten._slow_conv2d_forward(
+            x.double(), weight.double(), [3, 3], bias.double(), [1, 1], [1, 1]
+        ).to(dtype)
+        x = x.to(device=device, memory_format=fmt)
+        actual = F.conv2d(x, weight.to(device), bias.to(device), padding=1)
+        self._assert_nonfinite_equal(actual.cpu(), expected)
+
+    @dtypes(torch.bfloat16)
+    @disablecuDNN
+    @disableMkldnn
+    @parametrize_test(
+        "pattern",
+        [
+            subtest("overflow", decorators=[onlyMPS]),
+            "partition_overflow",
+            "positive_seed",
+            "negative_seed",
+        ],
+    )
+    def test_conv2d_channel_reduction_range(self, device, dtype, pattern):
+        # Channel partitions can overflow or flush small terms before merging.
+        x = torch.full((1, 128, 129, 129), 2.0**-70, dtype=dtype)
+        weight = torch.zeros(1, 128, 3, 3, dtype=dtype)
+        weight[:, :, 1, 1] = 2.0**-70
+        weight[:, 0, 1, 1] = 2.0**-56
+        if pattern in ("overflow", "partition_overflow"):
+            x.fill_(2.0**120)
+            if pattern == "overflow":
+                # CPU BF16 convolution also overflows for this serial-safe order.
+                x[:, 1::2].neg_()
+                weight[:, :, 1, 1] = 128
+            else:
+                # Serial sums stay finite; each channel residue overflows.
+                x.reshape(1, 16, 8, 129, 129)[:, :, 4:].neg_()
+                weight[:, :, 1, 1] = 16
+        elif pattern == "negative_seed":
+            x.neg_()
+        # Only the center tap is nonzero, so every spatial result is identical.
+        corner = x[:, :, :1, :1].double()
+        expected = torch.ops.aten._slow_conv2d_forward(
+            corner, weight.double(), [3, 3], None, [1, 1], [1, 1]
+        ).to(dtype)
+        actual = F.conv2d(x.to(device), weight.to(device), padding=1).cpu()
+        self.assertEqual(actual, expected.expand_as(actual), atol=0, rtol=0)
+
+    @dtypes(torch.bfloat16)
+    @disablecuDNN
+    @disableMkldnn
+    def test_conv2d_single_output_grouped_tail(self, device, dtype):
+        # Small integers keep every product and sum exact.
+        x = torch.arange(2 * 66 * 65 * 67).reshape(2, 66, 65, 67) % 5 - 2
+        x = x.to(dtype) / 8
+        weight = torch.arange(2 * 33 * 3 * 3).reshape(2, 33, 3, 3) % 3 - 1
+        weight = weight.to(dtype) / 16
+        bias = torch.tensor([0.25, -0.5], dtype=dtype)
+        expected = F.conv2d(
+            x.double(), weight.double(), bias.double(), padding=1, groups=2
+        ).to(dtype)
+        x, weight, bias = x.to(device), weight.to(device), bias.to(device)
+        actual = F.conv2d(x, weight, bias, padding=1, groups=2)
+        self.assertTrue(actual.is_contiguous())
+        self.assertEqual(actual.cpu(), expected, atol=0, rtol=0)
+
+    @dtypes(torch.float32, torch.float16, torch.bfloat16)
+    @parametrize_test("fmt", [torch.contiguous_format, torch.channels_last])
+    def test_conv2d_partial_sum_precision(self, device, dtype, fmt):
+        # The first tap sums to 32.125, between adjacent bfloat16 values.
+        x = torch.ones(1, 33, 4, 64, device=device, dtype=dtype).to(memory_format=fmt)
+        w = torch.zeros(32, 33, 3, 3, device=device, dtype=dtype)
+        w[:, :32, 1, 0] = 1
+        w[:, 32, 1, 0] = 0.125
+        w[:, :, 1, 1] = -w[:, :, 1, 0]
+        out = F.conv2d(x, w, padding=1)
+        self.assertEqual(out[..., 1:], torch.zeros_like(out[..., 1:]), atol=0, rtol=0)
+
+    @dtypes(torch.float16)
+    @parametrize_test("fmt", [torch.contiguous_format, torch.channels_last])
+    def test_conv2d_partial_sum_overflow(self, device, dtype, fmt):
+        # A 65536 partial sum must remain float32 until the next tap cancels it.
+        x = torch.ones(1, 32, 4, 64, device=device, dtype=dtype).to(memory_format=fmt)
+        w = torch.zeros(32, 32, 3, 3, device=device, dtype=dtype)
+        w[:, :, 1, 0] = 2048
+        w[:, :, 1, 1] = -2048
+        out = F.conv2d(x, w, padding=1)
+        self.assertEqual(out[..., 1:], torch.zeros_like(out[..., 1:]), atol=0, rtol=0)
+
+    @dtypes(torch.float32, torch.float16, torch.bfloat16)
+    @parametrize_test("fmt", [torch.contiguous_format, torch.channels_last])
+    @parametrize_test("size,outputs", [(66, 256), (70, 512)])
+    def test_conv2d_stride_two_channel_expansion(
+        self, device, dtype, fmt, size, outputs
+    ):
+        # These channel ratios can select both merged taps and deinterleaved rows.
+        x = torch.randn(1, 16, size, size, device=device, dtype=dtype)
+        x = x.to(memory_format=fmt)
+        w = torch.randn(outputs, 16, 3, 3, device=device, dtype=dtype)
+        w *= (16 * 3 * 3) ** -0.5
+        expected = F.conv2d(x.cpu().float(), w.cpu().float(), stride=2, padding=1)
+        out = F.conv2d(x, w, stride=2, padding=1)
+        self.assertEqual(out.cpu(), expected.to(dtype))
+        self.assertTrue(out.is_contiguous(memory_format=fmt))
+
+    @dtypes(torch.float32, torch.float16, torch.bfloat16)
+    @parametrize_test("channels,outputs,size", [(32, 32, 3), (160, 160, 3), (64, 1, 8)])
+    def test_conv2d_channels_last_degenerate_output(
+        self, device, dtype, channels, outputs, size
+    ):
+        # A 1x1 or single-channel output is contiguous in both memory formats,
+        # so it cannot tell kernels that the input is channels last.
+        x = torch.randn(2, channels, size, size, device=device, dtype=dtype)
+        x = x.to(memory_format=torch.channels_last)
+        reduction = channels * 3 * 3
+        w = torch.randn(outputs, channels, 3, 3, device=device, dtype=dtype)
+        w *= reduction**-0.5
+        expected = F.conv2d(x.cpu().double(), w.cpu().double())
+        out = F.conv2d(x, w)
+        # Unit-scale outputs: one rounding of each (transformed) operand to dtype
+        # plus float32 accumulation over the reduction.
+        accumulation = torch.finfo(torch.float32).eps * math.sqrt(reduction)
+        unit = torch.finfo(dtype).eps + accumulation
+        self.assertEqual(out.cpu().double(), expected, atol=8 * unit, rtol=0)
 
     @skipMPS
     @expectedFailureXPU

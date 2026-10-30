@@ -13698,7 +13698,327 @@ class TestViewOpsMPS(TestCaseMPS):
             res[device] = dst.resolve_conj().resolve_neg().cpu()
         self.assertEqual(res["cpu"], res["mps"])
 
+def _conv2d_check_close(test, actual, x, weight, bias, *args):
+    # Independent roundings add in quadrature: each operand or Winograd
+    # transform is rounded once to the input dtype, and float32 accumulates
+    # over the reduction. Scale by the L2 norm of each output's products.
+    dtype = x.dtype
+    expected = F.conv2d(x.double(), weight.double(), None if bias is None else bias.double(), *args)
+    test.assertEqual(actual.shape, expected.shape)
+    norm = F.conv2d(x.double().square(), weight.double().square(),
+                    None if bias is None else bias.double().square(), *args).sqrt()
+    reduction = weight[0].numel()
+    unit = torch.finfo(dtype).eps + torch.finfo(torch.float32).eps * math.sqrt(reduction)
+    error = (actual.cpu().double() - expected).abs() / (unit * norm).clamp_min(torch.finfo(dtype).tiny)
+    # F(4x2) Winograd, used only for bfloat16, amplifies that rounding through
+    # transform coefficients of up to 8.
+    test.assertLessEqual(error.max().item(), 32 if dtype == torch.bfloat16 else 8)
+
+
 class TestConvolutionMetal(TestCaseMPS):
+    @dtypes(torch.float32, torch.float16, torch.bfloat16)
+    @parametrize("input_cl,weight_cl", [(False, True), (True, False), (True, True)])
+    @parametrize("has_bias", [False, True])
+    def test_conv2d_fused_layout(self, device, dtype, input_cl, weight_cl, has_bias):
+        # Odd channels and spatial tails exercise the layout-fused window.
+        x = torch.randn(1, 31, 55, 57).to(dtype)
+        weight = (torch.randn(65, 31, 3, 3) / math.sqrt(31 * 9)).to(dtype)
+        bias = torch.randn(65).to(dtype) if has_bias else None
+
+        def to_layout(value, channels_last):
+            value = value.to(memory_format=torch.channels_last if channels_last else torch.contiguous_format)
+            storage = torch.empty(value.numel() + 1, device=device, dtype=dtype)
+            result = storage.as_strided(value.shape, value.stride(), 1)
+            result.copy_(value)
+            return result
+
+        actual = F.conv2d(to_layout(x, input_cl), to_layout(weight, weight_cl),
+                          None if bias is None else bias.to(device), padding=1)
+        self.assertEqual(actual.shape, (1, 65, 55, 57))
+        self.assertEqual(actual.dtype, dtype)
+        self.assertTrue(actual.is_contiguous(memory_format=torch.channels_last))
+        _conv2d_check_close(self, actual, x, weight, bias, 1, 1)
+
+    @dtypes(torch.float32, torch.float16, torch.bfloat16)
+    @parametrize("input_cl,weight_cl", [(False, True), (True, False), (True, True)])
+    @parametrize("operand", ["input", "weight"])
+    def test_conv2d_fused_layout_nonfinite(self, device, dtype, input_cl, weight_cl, operand):
+        x = torch.ones(1, 31, 55, 57, dtype=dtype)
+        weight = torch.full((65, 31, 3, 3), 1 / 16, dtype=dtype)
+        bias = (torch.arange(65) / 16).to(dtype)
+        if operand == "input":
+            x[0, 0, 0, 0] = float("inf")
+        else:
+            weight[0, 0, 0, 0] = float("inf")
+        expected = torch.ops.aten._slow_conv2d_forward(
+            x.double(), weight.double(), [3, 3], bias.double(), [1, 1], [1, 1]
+        ).to(dtype)
+        actual = F.conv2d(
+            x.to(device=device, memory_format=torch.channels_last if input_cl else torch.contiguous_format),
+            weight.to(device=device, memory_format=torch.channels_last if weight_cl else torch.contiguous_format),
+            bias.to(device), padding=1)
+        self.assertEqual(actual.shape, expected.shape)
+        self.assertEqual(actual.dtype, dtype)
+        self.assertTrue(actual.is_contiguous(memory_format=torch.channels_last))
+        actual = actual.cpu()
+        self.assertEqual(torch.isnan(actual), torch.isnan(expected))
+        self.assertEqual(torch.isposinf(actual), torch.isposinf(expected))
+        self.assertEqual(torch.isneginf(actual), torch.isneginf(expected))
+        finite = torch.isfinite(expected)
+        self.assertEqual(actual[finite], expected[finite], atol=0, rtol=0)
+
+    @dtypes(torch.float16, torch.bfloat16)
+    @parametrize("input_cl,weight_cl", [(False, True), (True, False), (True, True)])
+    def test_conv2d_fused_layout_tiny_weight(self, device, dtype, input_cl, weight_cl):
+        x = torch.full((1, 31, 55, 57), 4096 if dtype == torch.float16 else 2.0 ** 100, dtype=dtype)
+        weight = torch.zeros(65, 31, 3, 3, dtype=dtype)
+        # F2 divides normal BF16 weights by four, creating subnormal coefficients.
+        weight[:, :, 0, 0] = 2.0 ** -24 if dtype == torch.float16 else torch.finfo(dtype).tiny
+        expected = torch.ops.aten._slow_conv2d_forward(
+            x.double(), weight.double(), [3, 3], None, [1, 1], [1, 1]
+        ).to(dtype)
+        actual = F.conv2d(
+            x.to(device=device, memory_format=torch.channels_last if input_cl else torch.contiguous_format),
+            weight.to(device=device, memory_format=torch.channels_last if weight_cl else torch.contiguous_format),
+            padding=1)
+        self.assertEqual(actual.shape, expected.shape)
+        self.assertEqual(actual.dtype, dtype)
+        self.assertTrue(actual.is_contiguous(memory_format=torch.channels_last))
+        self.assertEqual(actual.cpu(), expected, atol=0, rtol=0)
+
+    @dtypes(torch.float16)
+    @parametrize("channels,outputs", [(32, 32), (256, 128)])
+    @parametrize("case", ["tiny_weight", "normal_cancellation", "weight_overflow", "input_overflow", "product_overflow"])
+    def test_conv2d_half_winograd_range(self, device, dtype, channels, outputs, case):
+        # These NCHW maps select fused F2 and separate F2 before Apple10.
+        x = torch.full((1, channels, 64, 64), 4096, dtype=dtype)
+        weight = torch.zeros(outputs, channels, 3, 3, dtype=dtype)
+        weight[:, :, 0, 0] = 2.0 ** -24
+        bias = torch.zeros(outputs, dtype=dtype)
+        bias[-1] = 0.5
+        if case == "normal_cancellation":
+            # Normal half weights leave one subnormal unit after cancellation.
+            weight[:, :, 0, 0] = weight[:, :, 1, 1] = 2.0 ** -14
+            weight[:, :, 0, 1] = weight[:, :, 1, 0] = -(2.0 ** -14)
+            weight[:, :, 1, 1] = 2.0 ** -14 + 2.0 ** -24
+        elif case == "weight_overflow":
+            x.fill_(1)
+            weight.zero_()
+            weight[:, :, 0, 0], weight[:, :, 0, 1] = 32768, -32768
+        elif case == "input_overflow":
+            x.fill_(40000)
+            weight.zero_()
+            weight[:, :, 1, 0], weight[:, :, 1, 2] = 1 / 512, -1 / 512
+        elif case == "product_overflow":
+            x.fill_(128)
+            weight.zero_()
+            weight[:, :, 1, 1] = 0.5
+        expected = torch.ops.aten._slow_conv2d_forward(
+            x.double(), weight.double(), [3, 3], bias.double(), [1, 1], [1, 1]
+        ).to(dtype)
+        actual = F.conv2d(x.to(device), weight.to(device), bias.to(device), padding=1)
+        self.assertEqual(actual.shape, expected.shape)
+        self.assertEqual(actual.dtype, dtype)
+        self.assertTrue(actual.is_contiguous())
+        actual = actual.cpu()
+        self.assertEqual(torch.isnan(actual), torch.isnan(expected))
+        self.assertEqual(torch.isposinf(actual), torch.isposinf(expected))
+        self.assertEqual(torch.isneginf(actual), torch.isneginf(expected))
+        finite = torch.isfinite(expected)
+        self.assertEqual(actual[finite], expected[finite], atol=0, rtol=0)
+
+
+    @dtypes(torch.bfloat16)
+    @parametrize("channels_last", [False, True])
+    @parametrize("with_bias", [False, True])
+    @parametrize("case", [
+        (1, 192, 5, 7, 192),  # Separate F2 on both GPU families.
+        (8, 128, 5, 7, 128),  # F4 with NCHW, F2 with channels-last.
+        (1, 16, 129, 129, 32),  # Fused F2 before Apple10.
+    ])
+    def test_conv2d_winograd_normal_cancellation(self, device, dtype, channels_last, with_bias, case):
+        batch, channels, height, width, outputs = case
+        x = torch.full((batch, channels, height, width), 2.0 ** 120, dtype=dtype)
+        weight = torch.zeros((outputs, channels, 3, 3), dtype=dtype)
+        # All nonzero operands are normal BF16; dividing their residual during the
+        # weight transform can still underflow before the large input rescales it.
+        weight[:, :, 0, 0] = weight[:, :, 1, 1] = 2.0 ** -126
+        weight[:, :, 0, 1] = weight[:, :, 1, 0] = -(2.0 ** -126)
+        weight[:, :, 1, 1] = 2.0 ** -126 + 2.0 ** -133
+        bias = torch.full((outputs,), 0.5, dtype=dtype) if with_bias else None
+        expected = F.conv2d(x.double(), weight.double(), None if bias is None else bias.double(), padding=1).to(dtype)
+        memory_format = torch.channels_last if channels_last else torch.contiguous_format
+        actual = F.conv2d(x.to(device=device, memory_format=memory_format), weight.to(device),
+                          None if bias is None else bias.to(device), padding=1)
+        self.assertEqual(actual.cpu(), expected, atol=0, rtol=0)
+        self.assertTrue(actual.is_contiguous(memory_format=memory_format))
+
+    @dtypes(torch.bfloat16)
+    @parametrize("swap", [False, True])
+    def test_conv2d_winograd_subnormal_infinity(self, device, dtype, swap):
+        path = os.path.join(_CONFORMANCE_REPO_ROOT, "aten/src/ATen/native/mps/kernels/Convolution.metal")
+        lib = torch.mps.compile_shader(embed_headers(path) + """
+            kernel void cold_products(device const bfloat* x,
+                                      device const bfloat* weight,
+                                      device bfloat* output,
+                                      uint index [[thread_position_in_grid]]) {
+                output[index] = bfloat(conv2d_winograd_cold_fma(x[index], weight[index], 0.0f));
+            }
+        """)
+        # Signed zero and the smallest/largest BF16 subnormals.
+        bits = torch.tensor([0x0000, 0x8000, 0x0001, 0x007F, 0x8001, 0x807F], dtype=torch.uint16)
+        tiny = bits.view(dtype).repeat_interleave(3)
+        special = torch.tensor([float("inf"), -float("inf"), float("nan")], dtype=dtype).repeat(6)
+        x, weight = (special, tiny) if swap else (tiny, special)
+        expected = (x.double() * weight.double()).to(dtype)
+        output = torch.empty_like(x, device=device)
+        lib.cold_products(x.to(device), weight.to(device), output)
+        actual = output.cpu()
+        self.assertEqual(torch.isnan(actual), torch.isnan(expected))
+        self.assertEqual(torch.isposinf(actual), torch.isposinf(expected))
+        self.assertEqual(torch.isneginf(actual), torch.isneginf(expected))
+
+    @dtypes(torch.float32, torch.float16, torch.bfloat16)
+    @parametrize("channels_last", [False, True])
+    @parametrize("with_bias", [False, True])
+    @parametrize("case", [(1, 1, 9, 1), (1, 1, 8, 2), (2, 1, 9, 1), (1, 2, 9, 1)])
+    def test_conv2d_single_patch(self, device, dtype, channels_last, with_bias, case):
+        # Only N1/groups1 with a full 9x9 filter takes the native GEMV route.
+        # The partial filter, extra batch, and groups retain convolution dispatch.
+        batch, groups, kernel, stride = case
+        x = torch.randn(batch, 32, 9, 9, dtype=dtype)
+        w = torch.randn(64, 32 // groups, kernel, kernel, dtype=dtype) * (32 // groups * kernel * kernel) ** -0.5
+        bias = torch.randn(64, dtype=dtype) if with_bias else None
+        memory_format = torch.channels_last if channels_last else torch.contiguous_format
+        actual = F.conv2d(x.to(device=device, memory_format=memory_format),
+                          w.to(device=device, memory_format=memory_format),
+                          None if bias is None else bias.to(device), stride=stride, groups=groups)
+        self.assertEqual(actual.dtype, dtype)
+        self.assertTrue(actual.is_contiguous(memory_format=memory_format))
+        _conv2d_check_close(self, actual, x, w, bias, stride, 0, 1, groups)
+
+    @dtypes(torch.float32, torch.float16, torch.bfloat16)
+    @parametrize("case", [
+        ("tiny", (1, 1, 3, 8), 4, (3, 3), (1, 1), 1, 1),
+        ("o1_fixed", (4, 4, 64, 128), 1, (3, 3), (1, 1), 1, 1),
+        ("o1_paired", (16, 4, 64, 128), 1, (3, 3), (1, 1), 1, 1),
+        ("o1_generic", (4, 4, 64, 128), 1, (3, 5), (1, 2), 1, 1),
+        ("o1_stride2", (2, 48, 100, 128), 1, (3, 3), (2, 2), 2, 1),
+        ("depthwise_fixed", (1, 2, 3, 3), 2, (3, 3), (1, 1), 1, 2),
+        ("depthwise_generic", (1, 2, 3, 5), 2, (2, 4), (1, 2), 1, 2),
+        ("narrow", (16, 64, 33, 65), 63, (3, 3), (1, 1), 1, 1),
+        ("patch_stride1", (2, 16, 17, 72), 257, (3, 3), (1, 1), 1, 1),
+        ("patch_compact", (4, 15, 33, 65), 127, (3, 3), (1, 1), 1, 1),
+        ("patch_stride2", (2, 13, 31, 137), 29, (3, 3), (1, 1), 2, 1),
+        ("stride2", (8, 32, 64, 256), 64, (3, 3), (1, 1), 2, 1),
+        ("fixed3_columns", (4, 24, 80, 128), 80, (3, 3), (1, 1), 1, 1),
+        ("fixed3_shift", (4, 72, 80, 128), 80, (3, 3), (1, 1), 1, 1),
+        ("winograd_loop", (1, 16, 128, 128), 64, (3, 3), (1, 1), 1, 1),
+    ], name_fn=lambda case: case[0])
+    @parametrize("side", ["top", "left"])
+    @parametrize("value", [float("inf"), -float("inf"), float("nan")])
+    def test_conv2d_padding_products(self, device, dtype, case, side, value):
+        _, shape, outputs, kernel, padding, stride, groups = case
+        batch, channels, height, width = shape
+        x = torch.ones((1, channels, height, width), dtype=dtype)
+        weight = torch.ones((outputs, channels // groups, *kernel), dtype=dtype)
+        tap = (0, kernel[1] // 2) if side == "top" else (kernel[0] // 2, 0)
+        weight[0, 0, tap[0], tap[1]] = value
+        expected = F.conv2d(x.double(), weight.double(), stride=stride, padding=padding, groups=groups)
+        expected = expected.to(dtype).expand(batch, -1, -1, -1)
+        x = x.expand(batch, -1, -1, -1).to(device).contiguous()
+        actual = F.conv2d(x, weight.to(device), stride=stride, padding=padding, groups=groups).cpu()
+        self.assertEqual(torch.isnan(actual), torch.isnan(expected))
+        self.assertEqual(torch.isposinf(actual), torch.isposinf(expected))
+        self.assertEqual(torch.isneginf(actual), torch.isneginf(expected))
+        finite = torch.isfinite(expected)
+        self.assertEqual(actual[finite], expected[finite], atol=0, rtol=0)
+
+    @dtypes(torch.float32, torch.float16, torch.bfloat16)
+    @parametrize("axis", ["height", "width"])
+    @parametrize("channels_last", [False, True])
+    def test_conv2d_large_padding_dilation(self, device, dtype, axis, channels_last):
+        # Only the middle tap along the huge-dilation axis reaches the input.
+        # Eight batches exercise direct stride-2 dispatch on larger GPUs too.
+        large = torch.iinfo(torch.int32).max
+        padding = (large, 1) if axis == "height" else (1, large)
+        dilation = (large, 1) if axis == "height" else (1, large)
+        stride = (1, 2) if axis == "height" else (2, 1)
+        ref_padding = (0, 1) if axis == "height" else (1, 0)
+        x = torch.ones((8, 16, 64, 64), device=device, dtype=dtype)
+        weight = torch.ones((32, 16, 3, 3), device=device, dtype=dtype)
+        bias = torch.arange(32, device=device, dtype=dtype)
+        memory_format = torch.channels_last if channels_last else torch.contiguous_format
+        x = x.contiguous(memory_format=memory_format)
+        ref_weight = weight[:, :, 1:2, :] if axis == "height" else weight[:, :, :, 1:2]
+        expected = F.conv2d(x.cpu(), ref_weight.cpu(), bias.cpu(), stride=stride, padding=ref_padding)
+        actual = F.conv2d(x, weight, bias, stride=stride, padding=padding, dilation=dilation)
+        self.assertEqual(actual, expected)
+        self.assertTrue(actual.is_contiguous(memory_format=memory_format))
+
+    @dtypes(torch.float32, torch.float16, torch.bfloat16)
+    @parametrize("padding", [500_000_000, 600_000_000])
+    def test_conv2d_large_padding_copy_cost(self, device, dtype, padding):
+        # Padded-copy cost exceeds int64 although the input and output are small.
+        stride = 4_000_000
+        x = torch.ones((1, 9, 2, 2), device=device, dtype=dtype).to(memory_format=torch.channels_last)
+        weight = torch.ones((1, 9, 1, 1), device=device, dtype=dtype)
+        size = (1 + 2 * padding) // stride + 1
+        expected = torch.zeros((1, 1, size, size), dtype=dtype)
+        expected[0, 0, padding // stride, padding // stride] = 9
+        actual = F.conv2d(x, weight, stride=stride, padding=padding)
+        self.assertEqual(actual, expected, atol=0, rtol=0)
+
+    @dtypes(torch.float16, torch.bfloat16)
+    @parametrize("kernel_size", [5, 7])
+    def test_conv2d_padding_shift_deterministic(self, device, dtype, kernel_size):
+        # Multiple left-padding shifts share scratch across the MPP simdgroups.
+        x = torch.randn(1, 256, 64, 64, device=device, dtype=dtype).to(memory_format=torch.channels_last)
+        w = torch.randn(320, 64, kernel_size, kernel_size, device=device, dtype=dtype)
+        w *= (64 * kernel_size * kernel_size) ** -0.5
+        padding = kernel_size // 2
+        expected = F.conv2d(x.cpu().float(), w.cpu().float(), padding=padding, groups=4).to(dtype)
+        first = F.conv2d(x, w, padding=padding, groups=4).cpu()
+        self.assertEqual(first, expected)
+        for _ in range(100):
+            actual = F.conv2d(x, w, padding=padding, groups=4)
+            self.assertEqual(actual.cpu(), first, atol=0, rtol=0)
+
+    @largeTensorTest("20GB")
+    @largeMPSBufferTest("8GB")
+    @serialTest()
+    @dtypes(torch.float16)
+    def test_conv2d_group_offset_over_int32(self, device, dtype):
+        # Public conv2d rejects these planes; exercise the internal Metal index path.
+        # The second group begins at element 2**31, despite each extent fitting int32.
+        x = torch.ones(1, 256, 4096, 4096, device=device, dtype=dtype)
+        x[:, 128:].fill_(2)
+        w = torch.full((4, 128, 3, 3), 1 / 128, device=device, dtype=dtype)
+        out = torch.ops.aten._mps_convolution(x, w, None, [1, 1], [1, 1], [1, 1], 2)
+        indices = torch.tensor([0, 1, 4094, 4095], device=device)
+        sample = out.index_select(2, indices).index_select(3, indices)
+        taps = torch.tensor([2, 3, 3, 2], dtype=dtype)
+        expected = torch.tensor([1, 1, 2, 2], dtype=dtype)[:, None, None]
+        expected = expected * taps[:, None] * taps[None, :]
+        self.assertEqual(sample.cpu(), expected.unsqueeze(0), atol=0, rtol=0)
+
+    @largeTensorTest("12GB")
+    @largeMPSBufferTest("4GB")
+    @serialTest()
+    @dtypes(torch.float16)
+    def test_conv2d_batch_grid_over_int32(self, device, dtype):
+        # The folded batch/channel axis needs two dispatches: 65535 and 1 batches.
+        batches, channels = 65536, 32768
+        x = torch.ones(batches, channels, 1, 1, device=device, dtype=dtype)
+        x[-1].fill_(2)
+        w = torch.ones(channels, 1, 3, 3, device=device, dtype=dtype)
+        out = F.conv2d(x, w, padding=1, groups=channels)
+        indices = torch.tensor([0, batches - 2, batches - 1], device=device)
+        expected = torch.tensor([1, 1, 2], dtype=dtype).view(3, 1, 1, 1).expand(3, channels, 1, 1)
+        self.assertEqual(out.index_select(0, indices).cpu(), expected, atol=0, rtol=0)
+        self.assertEqual(out.shape, x.shape)
+        self.assertTrue(out.is_contiguous())
+
     @dtypes(torch.float32, torch.float16, torch.bfloat16)
     @parametrize("channels_last", [False, True])
     @parametrize("with_bias", [False, True])
@@ -13716,45 +14036,63 @@ class TestConvolutionMetal(TestCaseMPS):
         tol = {torch.float32: 1e-4, torch.float16: 5e-3, torch.bfloat16: 5e-2}[dtype]
         self.assertEqual(actual.cpu().float(), expected, atol=tol, rtol=tol)
 
-    @dtypes(torch.float32, torch.bfloat16)
+    @dtypes(torch.float32, torch.float16, torch.bfloat16)
     @parametrize("layout", ["contiguous", "channels_last"])
     @parametrize("case", [
         # (input, weight, stride, padding, dilation, groups), one per Metal conv2d route
         ((2, 48, 17, 70), (40, 48, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # row tiles, left padding shift
+        ((1, 48, 40, 256), (64, 48, 1, 3), (1, 1), (0, 1), (1, 1), 1),  # one-row kernel, narrow tiles for the left padding shift
+        ((2, 33, 9, 17), (35, 33, 3, 3), (1, 1), (2, 0), (1, 1), 1),  # tensor op, partial tiles and asymmetric padding
+        ((3, 9, 40, 47), (64, 9, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # tensor op, input channel bound for stems
+        ((2, 64, 19, 37), (128, 32, 5, 5), (1, 1), (2, 1), (1, 1), 2),  # tensor op, grouped 5x5 with asymmetric padding
         ((1, 33, 129, 131), (95, 33, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # fixed 3x3, 96-channel output tile
         ((1, 63, 257, 513), (63, 63, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # fixed 3x3, large map with partial tiles
+        ((1, 65, 193, 257), (64, 65, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # fixed 3x3, deep input shifts its first tile
+        ((1, 48, 128, 129), (128, 48, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # fixed 3x3, rows of whole tiles after column 0
         ((1, 48, 9, 130), (40, 48, 3, 5), (1, 1), (2, 3), (2, 2), 1),  # dilation, partial tiles
         ((3, 48, 20, 20), (40, 48, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # flat tiles with junk columns
         ((2, 48, 41, 71), (40, 48, 3, 3), (2, 3), (1, 2), (1, 1), 1),  # strided, merged taps on NHWC copy
+        ((2, 16, 63, 65), (32, 16, 5, 5), (2, 2), (2, 2), (1, 1), 1),  # 5x5 stride 2, merged taps on NHWC copy
+        ((2, 16, 66, 130), (32, 16, 5, 5), (2, 2), (2, 2), (1, 1), 1),  # merged copy, trailing column tiled down the rows
+        ((1, 64, 33, 65), (48, 16, 7, 7), (1, 1), (3, 3), (1, 1), 4),  # grouped merged copy, trailing column down the rows
         ((1, 32, 64, 97), (40, 32, 3, 3), (2, 2), (1, 1), (1, 1), 1),  # stride 2, de-interleaved rows
+        ((16, 16, 256, 256), (16, 16, 3, 3), (2, 2), (1, 1), (1, 1), 1),  # stride 2, wide map with 16-channel tile
         ((2, 48, 50, 130), (40, 48, 3, 5), (2, 2), (1, 2), (1, 1), 1),  # stride 2, taps two columns into the padding
         ((1, 64, 48, 60), (64, 32, 3, 3), (2, 2), (1, 1), (1, 1), 2),  # stride 2, grouped
         ((2, 40, 20, 200), (100, 40, 3, 5), (2, 2), (1, 2), (1, 1), 1),  # stride 2, de-interleaved in threadgroup memory
         ((2, 34, 97, 129), (190, 17, 3, 3), (2, 2), (1, 1), (1, 1), 2),  # stride 2, 96-channel tile and partial groups
         ((2, 16, 17, 72), (257, 16, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # packed 3x3, fixed input channels
         ((2, 49, 65, 66), (137, 49, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # packed flat 3x3, partial chunks and tiles
+        ((1, 32, 64, 66), (128, 32, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # packed flat 3x3, one chunk, odd offsets
+        ((1, 40, 50, 66), (48, 40, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # packed flat 3x3, 64-row tile and partial chunk
+        ((4, 15, 33, 65), (127, 15, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # compact half patch, partial input/output tiles
+        ((4, 33, 33, 65), (97, 33, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # half patch, partial second channel chunk
         ((2, 13, 31, 137), (29, 13, 3, 3), (2, 2), (1, 1), (1, 1), 1),  # stride 2, all taps in one channel chunk
         ((8, 129, 31, 29), (255, 129, 3, 3), (2, 2), (1, 1), (1, 1), 1),  # stride 2, 256-channel tile and partial chunk
         ((2, 64, 30, 31), (96, 64, 1, 1), (2, 2), (0, 0), (1, 1), 1),  # pointwise, strided
         ((32, 129, 55, 50), (257, 129, 1, 1), (2, 2), (0, 0), (1, 1), 1),  # fused sampling, partial channels and row
         ((32, 129, 56, 51), (257, 129, 1, 1), (2, 2), (0, 0), (1, 1), 1),  # fused sampling, odd width with aligned rows
-        ((1, 512, 64, 64), (512, 512, 1, 1), (1, 1), (0, 0), (1, 1), 1),  # pointwise matmul
+        ((1, 512, 64, 64), (512, 512, 1, 1), (1, 1), (0, 0), (1, 1), 1),  # pointwise MPP
+        ((1, 960, 7, 7), (160, 960, 1, 1), (1, 1), (0, 0), (1, 1), 1),  # pointwise, split K on a small single image
         ((1, 128, 513, 513), (129, 128, 1, 1), (1, 1), (0, 0), (1, 1), 1),  # pointwise register input, partial tiles
         ((1, 256, 512, 512), (160, 256, 1, 1), (1, 1), (0, 0), (1, 1), 1),  # pointwise register input, C256
+        ((1, 160, 209, 211), (161, 160, 1, 1), (1, 1), (0, 0), (1, 1), 1),  # pointwise register input, runtime channels and partial tiles
         ((8, 64, 33, 65), (63, 64, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # narrow collective tile, full reduction
         ((8, 128, 33, 65), (63, 128, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # narrow collective tile, transposed weights
         ((1, 176, 129, 131), (63, 176, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # narrow collective tile, compact masks
-        ((1, 96, 150, 150), (257, 96, 1, 1), (1, 1), (0, 0), (1, 1), 1),  # direct pointwise, partial output tile
-        ((32, 257, 27, 31), (255, 257, 1, 1), (1, 1), (0, 0), (1, 1), 1),  # direct pointwise, 128x32 tile
-        ((2, 257, 65, 67), (47, 257, 1, 1), (1, 1), (0, 0), (1, 1), 1),  # direct pointwise, 64x128 tile
-        ((2, 160, 63, 67), (480, 160, 1, 1), (1, 1), (0, 0), (1, 1), 1),  # batched pointwise, 160x32 tile
+        ((1, 96, 150, 150), (257, 96, 1, 1), (1, 1), (0, 0), (1, 1), 1),  # single-tap 160x32 tile, partial output tile
+        ((32, 257, 27, 31), (255, 257, 1, 1), (1, 1), (0, 0), (1, 1), 1),  # batched pointwise, 128x32 tile
+        ((2, 257, 65, 67), (47, 257, 1, 1), (1, 1), (0, 0), (1, 1), 1),  # batched pointwise, 64x64 tile
+        ((2, 160, 63, 67), (320, 160, 1, 1), (1, 1), (0, 0), (1, 1), 1),  # batched pointwise, 160x32 tile
         ((3, 127, 23, 25), (513, 127, 1, 1), (1, 1), (0, 0), (1, 1), 1),  # batched pointwise, partial channels and tiles
         ((1, 256, 16, 16), (256, 32, 1, 1), (1, 1), (0, 0), (1, 1), 8),  # grouped pointwise
         ((2, 32, 33, 37), (48, 32, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # winograd, odd map
         ((2, 160, 120, 120), (176, 160, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # winograd, two tile chunks
+        ((1, 193, 65, 67), (129, 193, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # half F2, partial channels and spatial tiles
         ((40, 257, 25, 33), (128, 257, 3, 3), (1, 1), (2, 2), (1, 1), 1),  # 4x2 winograd, chunk boundary and padding
         ((8, 129, 51, 67), (65, 129, 3, 3), (1, 1), (0, 0), (1, 1), 1),  # 4x2 winograd, partial channels on Apple9
         ((1, 129, 65, 67), (128, 129, 3, 3), (1, 1), (0, 2), (1, 1), 1),  # 4x2 winograd, single image
+        ((1, 160, 130, 132), (200, 160, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # 4x2 winograd, deep single image
         ((1, 128, 183, 185), (255, 128, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # 4x2 winograd, partial output tile on Apple10
         ((2, 13, 257, 257), (15, 13, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # fused winograd, 16x16 tile
         ((4, 17, 129, 129), (15, 17, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # fused winograd, batched small maps
@@ -13763,22 +14101,36 @@ class TestConvolutionMetal(TestCaseMPS):
         ((2, 33, 91, 93), (65, 33, 3, 3), (1, 1), (2, 2), (1, 1), 1),  # fused winograd, register output transform
         ((2, 257, 91, 93), (32, 257, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # fused winograd, many input channels
         ((1, 96, 129, 129), (96, 96, 3, 3), (1, 1), (0, 0), (1, 1), 1),  # fused winograd instead of separate transforms
+        ((1, 31, 127, 129), (95, 31, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # fused float, partial channel and spatial tiles
+        ((1, 12, 192, 200), (88, 12, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # fused float, all output blocks per tile block
         ((2, 3, 100, 100), (64, 3, 7, 7), (2, 2), (3, 3), (1, 1), 1),  # few input channels
-        ((1, 3, 64, 96), (64, 3, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # few input channels, all taps folded
+        ((1, 3, 64, 96), (64, 3, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # three-channel stem, 64 outputs on the tiny kernel
+        ((1, 7, 48, 64), (64, 7, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # few input channels, all taps folded
         ((1, 4, 40, 40), (64, 4, 1, 1), (1, 1), (0, 0), (1, 1), 1),  # few input channels, pointwise
         ((2, 4, 17, 40), (12, 4, 1, 1), (1, 1), (0, 0), (2, 2), 1),  # packed pointwise, partial threadgroup
         ((2, 1, 31, 80), (68, 1, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # packed 3x3, partial threadgroup
         ((2, 3, 33, 72), (16, 3, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # packed 3x3, three input channels
         ((2, 3, 65, 80), (16, 3, 3, 3), (2, 2), (1, 1), (1, 1), 1),  # packed stride 2, odd height
+        ((1, 3, 64, 96), (48, 3, 3, 3), (2, 2), (1, 1), (1, 1), 1),  # packed stride 2, 48 output channels
         ((2, 129, 28, 34), (384, 129, 2, 2), (2, 2), (0, 0), (1, 1), 1),  # fused patch merge, partial channel chunk and row
         ((1, 4, 33, 33), (100, 4, 2, 2), (2, 2), (0, 0), (1, 1), 1),  # patch embedding via im2col
+        ((2, 15, 13, 19), (65, 15, 3, 3), (2, 2), (1, 1), (1, 1), 1),  # float columns, 32-row product and partial tiles
+        ((2, 17, 14, 20), (128, 17, 3, 3), (2, 2), (2, 0), (1, 1), 1),  # float columns, 64-row product and asymmetric padding
         ((8, 385, 13, 15), (513, 385, 3, 3), (2, 2), (1, 1), (1, 1), 1),  # im2col, direct 64x64 GEMM
+        ((1, 160, 60, 62), (176, 160, 3, 3), (2, 2), (1, 1), (1, 1), 1),  # stride-2 columns, deep small map
         ((1, 513, 47, 49), (1027, 513, 3, 3), (2, 2), (1, 1), (1, 1), 1),  # im2col, direct 64x32 GEMM on Apple9
         ((1, 256, 28, 28), (256, 8, 3, 3), (1, 1), (1, 1), (1, 1), 32),  # grouped via im2col
-        ((1, 128, 56, 56), (256, 64, 3, 3), (1, 1), (1, 1), (1, 1), 2),  # grouped direct
+        ((1, 192, 56, 56), (256, 96, 3, 3), (1, 1), (1, 1), (1, 1), 2),  # grouped direct
+        ((2, 132, 30, 34), (160, 33, 7, 7), (1, 1), (3, 3), (1, 1), 4),  # grouped, kW taps merged
+        ((2, 132, 61, 67), (160, 33, 5, 5), (2, 2), (0, 0), (1, 1), 4),  # strided grouped, merged taps for channels-last
+        ((3, 8, 20, 48), (32, 8, 2, 2), (1, 1), (0, 0), (2, 2), 1),  # dilated few input channels via im2col
+        ((1, 8, 33, 35), (16, 8, 2, 2), (1, 1), (0, 0), (1, 1), 1),  # few input channels, unpadded direct product
         ((1, 48, 9, 9), (10, 48, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # 16-wide output tile
         ((2, 24, 13, 37), (1, 24, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # single output channel, direct
+        ((2, 48, 100, 128), (1, 48, 3, 3), (2, 2), (2, 2), (1, 1), 1),  # single output channel, fixed stride-2 taps
+        ((2, 31, 99, 129), (1, 31, 3, 3), (2, 2), (1, 1), (1, 1), 1),  # single output channel, partial stride-2 threadgroup
         ((2, 31, 129, 133), (1, 31, 1, 1), (1, 1), (0, 0), (1, 1), 1),  # single output channel, fixed pointwise
+        ((1, 16, 256, 128), (1, 16, 1, 1), (1, 1), (0, 0), (1, 1), 1),  # single output channel, aligned wide rows
         ((9, 15, 257, 257), (1, 15, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # single output channel, paired output rows
         ((2, 65, 257, 259), (1, 65, 3, 3), (1, 1), (1, 1), (1, 1), 1),  # paired output rows on Apple10, partial tile
         ((1, 16, 11, 21), (2, 8, 5, 3), (2, 1), (2, 1), (1, 1), 2),  # single output channel per group, generic
@@ -13794,19 +14146,20 @@ class TestConvolutionMetal(TestCaseMPS):
         w = torch.randn(weight_shape, dtype=dtype) * (weight_shape[1] * weight_shape[2] * weight_shape[3]) ** -0.5
         b = torch.randn(weight_shape[0], dtype=dtype)
         x_device = x.to(device)
-        if layout == "channels_last":
-            x_device = x_device.to(memory_format=torch.channels_last)
-        ref = F.conv2d(x.float(), w.float(), b.float(), stride, padding, dilation, groups)
+        memory_format = torch.channels_last if layout == "channels_last" else torch.contiguous_format
+        x_device = x_device.to(memory_format=memory_format)
         out = F.conv2d(x_device, w.to(device), b.to(device), stride, padding, dilation, groups)
-        if layout == "channels_last":
-            self.assertTrue(out.is_contiguous(memory_format=torch.channels_last))
-        tol = (2e-4 if dtype == torch.float32 else 5e-2) * ref.abs().max().item()
-        self.assertEqual(out.cpu().float(), ref, atol=tol, rtol=0)
+
+        def check(actual):
+            self.assertEqual(actual.dtype, dtype)
+            self.assertTrue(actual.is_contiguous(memory_format=memory_format))
+            _conv2d_check_close(self, actual, x, w, b, stride, padding, dilation, groups)
+
+        check(out)
         if layout == "contiguous":
             offset_input = torch.empty(x.numel() + 1, dtype=dtype, device=device)[1:].view(input_shape)
             offset_input.copy_(x_device)
-            out = F.conv2d(offset_input, w.to(device), b.to(device), stride, padding, dilation, groups)
-            self.assertEqual(out.cpu().float(), ref, atol=tol, rtol=0)
+            check(F.conv2d(offset_input, w.to(device), b.to(device), stride, padding, dilation, groups))
 
 
 class TestConvolutionMPS(TestCaseMPS):
@@ -16921,10 +17274,52 @@ class TestMetalLibrary(TestCaseMPS):
             torch.randn(oc, ic, kd, kh, 2 * kw, device="mps")[..., ::2],
         ):
             destination = torch.empty(kd, kh, kw, ic, oc, dtype=source.dtype, device="mps")
-            params = [oc, ic, kh, kw, *source.stride()]
+            params = [oc, ic, kh, kw, *source.stride(), 0]
             lib.conv_weight_to_dhwio_float(source, destination, params,
                                            threads=(oc, ic, kd * kh), group_size=(oc, 1, 1), arg_casts="int32")
             self.assertEqual(destination, source.permute(2, 3, 4, 1, 0))
+
+    @parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    @parametrize("channels", [17, 33, 257])
+    def test_conv_weight_to_dhwio_flags(self, dtype, channels):
+        path = os.path.join(_CONFORMANCE_REPO_ROOT, "aten/src/ATen/native/mps/kernels/Convolution.metal")
+        lib = torch.mps.compile_shader(embed_headers(path))
+        outputs, kh, kw = 5, 3, 4
+        count = outputs * channels * kh * kw
+        storage = torch.arange(count + 2, dtype=torch.float32).to(dtype)
+        weight = storage[1:-1].view(outputs, channels, kh, kw)
+        weight[0, 0, 0, 0] = float("inf")
+        weight[1, -1, 1, -1] = -float("inf")
+        weight[2, 0, 2, 0] = -0.0
+        spelling, integer_dtype, nan_bits = {
+            torch.float32: ("float", torch.int32, 0x7FC12345),
+            torch.float16: ("half", torch.int16, 0x7E05),
+            torch.bfloat16: ("bfloat", torch.int16, 0x7FC5),
+        }[dtype]
+        weight.view(integer_dtype)[-1, -1, -1, 0] = nan_bits
+        # Production passes the OIHW transpose, with Cg on the dispatch X axis.
+        source = storage.to("mps")[1:-1].view_as(weight).transpose(0, 1).unsqueeze(2)
+        chunks = (channels + 31) // 32
+        flag_bytes = kh * outputs * chunks
+        element_size = weight.element_size()
+        elements = count + (flag_bytes + element_size - 1) // element_size
+        destination_storage = torch.empty(elements + 2, dtype=dtype, device="mps")
+        destination_storage.view(torch.uint8).fill_(0xA5)
+        destination = destination_storage[1:-1]
+        params = [channels, outputs, kh, kw, *source.stride(), 1]
+        getattr(lib, f"conv_weight_to_dhwio_{spelling}")(
+            source, destination, params, threads=(channels, outputs, kh),
+            group_size=(min(channels, 256), 1, 1), arg_casts="int32")
+        actual = destination_storage.cpu().view(torch.uint8)
+        expected = torch.full_like(actual, 0xA5)
+        payload = weight.permute(2, 3, 0, 1).contiguous().view(torch.uint8).flatten()
+        first_flag = (count + 1) * element_size
+        expected[element_size:first_flag] = payload
+        flags = torch.zeros(kh, outputs, chunks, dtype=torch.uint8)
+        flags[0, 0, 0] = flags[1, 1, -1] = flags[2, -1, -1] = 1
+        expected[first_flag:first_flag + flag_bytes] = flags.flatten()
+        # Compare NaN payloads and signed zero exactly, plus trailer/guard bytes.
+        self.assertEqual(actual, expected)
 
 
 # TODO: Actually instantiate that test for the "mps" device to better reflect what it is doing.
