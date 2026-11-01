@@ -15,6 +15,7 @@
 #include <c10/util/TypeCast.h>
 #include <c10/util/safe_numerics.h>
 #include <fmt/format.h>
+#include <cstdlib>
 
 #include <algorithm>
 #include <bit>
@@ -250,6 +251,74 @@ static Tensor conv3d_weights_to_dhwio(const Tensor& weight, bool emit_nonfinite_
     }
   });
   return output;
+}
+
+// OIHW 3x3 (or 1x3) bfloat16 weights in conv2d_cooperative's lane order:
+// [tap][C_out / 32][C_in / 16][lane][16].
+static Tensor conv2d_cooperative_weights(const Tensor& weight_t) {
+  using namespace mps;
+  const auto weight = weight_t.contiguous();
+  auto packed = at::empty({weight.numel()}, weight.options());
+  const std::array<int32_t, 4> dims{static_cast<int32_t>(weight.size(0)),
+                                    static_cast<int32_t>(weight.size(1)),
+                                    static_cast<int32_t>(weight.size(2) * weight.size(3)),
+                                    0};
+  auto pipeline = lib.getPipelineStateForFunc("conv2d_cooperative_weights");
+  conv_metal_launch(pipeline, "conv2d_cooperative_weights", {weight}, [&](id<MTLComputeCommandEncoder> encoder) {
+    mtl_setArgs(encoder, weight, packed, dims);
+    [encoder dispatchThreads:MTLSizeMake(weight.numel(), 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  });
+  return packed;
+}
+
+// Grouped channels-last products on whole 32-channel output blocks
+// (conv2d_cooperative_nhwc) and, when O_g % 32 == 16, on the last 16 output
+// channels of each group (conv2d_cooperative_nhwc_tail), each with its weights
+// packed per call in lane order.
+static void conv2d_cooperative_nhwc_forward(const Tensor& input,
+                                            const Tensor& weight_t,
+                                            const std::optional<Tensor>& bias_opt,
+                                            const Conv2DParams& params,
+                                            const mps::Conv2dPlan& plan,
+                                            int64_t groups,
+                                            const Tensor& output) {
+  using namespace mps;
+  using c10::metal::ceil_div;
+  constexpr int64_t block = kConv2dCooperativeTile;
+  const auto weight = weight_t.contiguous();
+  const auto bias = bias_opt && bias_opt->defined() ? bias_opt->to(input.scalar_type()).contiguous() : input;
+  const int64_t og = params.C_out_per_group, cg = params.C_in_per_group, taps = params.kH * params.kW;
+  const std::array<int32_t, 4> dims{static_cast<int32_t>(og),
+                                    static_cast<int32_t>(cg),
+                                    static_cast<int32_t>(params.kH),
+                                    static_cast<int32_t>(params.kW)};
+  const auto run = [&](const std::string& name, int64_t outputs, MTLSize grid, int64_t simdgroups) {
+    const auto pack_name = name.find("tail") == std::string::npos ? "conv2d_cooperative_nhwc_weights"
+                                                                  : "conv2d_cooperative_nhwc_tail_weights";
+    auto packed = at::empty({groups * outputs * cg * taps}, weight.options());
+    auto pack = lib.getPipelineStateForFunc(pack_name);
+    conv_metal_launch(pack, pack_name, {weight}, [&](id<MTLComputeCommandEncoder> encoder) {
+      mtl_setArgs(encoder, weight, packed, dims);
+      [encoder dispatchThreads:MTLSizeMake(packed.numel(), 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    });
+    auto pipeline = lib.getPipelineStateForFunc(name);
+    conv_metal_launch(pipeline, name.c_str(), {input, packed}, [&](id<MTLComputeCommandEncoder> encoder) {
+      mtl_setArgs(encoder, input, packed, output, params, bias);
+      [encoder dispatchThreadgroups:grid
+              threadsPerThreadgroup:MTLSizeMake(simdgroups * c10::metal::simdgroup_size, 1, 1)];
+    });
+  };
+  const int64_t blocks = og / block, outH = params.outH, outW = params.outW, N = params.N;
+  if (blocks > 0) {
+    const int64_t channel_blocks = plan.rows / block;
+    run(fmt::format("conv2d_cooperative_nhwc_{}x{}", plan.columns / block, channel_blocks),
+        blocks * block,
+        MTLSizeMake(groups * ceil_div(blocks, channel_blocks), outH * ceil_div(outW, plan.columns), N),
+        plan.simdgroups);
+  }
+  if (og % block != 0) {
+    run("conv2d_cooperative_nhwc_tail", block / 2, MTLSizeMake(groups, outH * ceil_div(outW, 2 * block), N), 1);
+  }
 }
 
 struct Conv3dMppSpecialization {
@@ -1121,7 +1190,19 @@ static void conv2d_mpp_forward(Tensor input,
   const auto partial = partials || shift_scratch
       ? at::empty({tile.splits * params.N * params.C_out * params.outH * scratch_pitch}, output.options().dtype(kFloat))
       : output;
-  const char* variant = fixed3x3 ? "k3_" : tile.variant == Conv2dMppVariant::Pointwise ? "pw1_" : "";
+  std::string variant = fixed3x3 ? "k3_" : tile.variant == Conv2dMppVariant::Pointwise ? "pw1_" : "";
+  // Experiment hook: CONV2D_FIXED3_STATICK=1 picks the fixed tile with the reduction length baked in.
+  if (fixed3x3 && std::getenv("CONV2D_FIXED3_STATICK") && tile.rows == 64 && tile.simdgroups == 2 &&
+      (params.C_in == 64 || params.C_in == 96 || params.C_in == 128)) {
+    variant += fmt::format("K{}_", params.C_in);
+  }
+  // Experiment hook: CONV2D_FIXED3_WHALF=1 feeds matmul2d half weights against bfloat16 activations.
+  const bool half_weights = fixed3x3 && std::getenv("CONV2D_FIXED3_WHALF") && tile.rows == 64 && tile.simdgroups == 2 &&
+      input.scalar_type() == kBFloat16 && params.C_in > kConv2dFixed3ColumnMaxInputs;
+  if (half_weights) {
+    weight = weight.to(kHalf);
+    variant += "wh_";
+  }
   const auto dtype = scalarToMetalTypeString(input);
   const auto name = fmt::format("conv2d_mpp_{}_{}_b{}x{}_s{}_{}{}",
                                 in_nhwc ? "nhwc" : "nchw",
@@ -1131,9 +1212,26 @@ static void conv2d_mpp_forward(Tensor input,
                                 tile.simdgroups,
                                 variant,
                                 dtype);
-  auto pipeline = lib.getPipelineStateForFunc(name);
+  // Experiment hook: CONV2D_WINDOW=<CC> runs the window-staged fixed 3x3 tile (CONV2D_WINDOW_SG simdgroups).
+  const int64_t window_chunk =
+      fixed3x3 && groups == 1 && !in_nhwc && !out_nhwc && !partials && std::getenv("CONV2D_WINDOW")
+      ? std::strtoll(std::getenv("CONV2D_WINDOW"), nullptr, 10)
+      : 0;
+  const int64_t window_sg =
+      std::getenv("CONV2D_WINDOW_SG") ? std::strtoll(std::getenv("CONV2D_WINDOW_SG"), nullptr, 10) : 2;
+  const auto launch_name =
+      window_chunk ? fmt::format("conv2d_mpp_window_b64x64_s{}_c{}_{}", window_sg, window_chunk, dtype) : name;
+  auto pipeline = lib.getPipelineStateForFunc(launch_name);
   conv_metal_launch(pipeline, "conv2d_mpp", {input, weight}, [&](id<MTLComputeCommandEncoder> encoder) {
     mtl_setArgs(encoder, input, weight, output, mpp, bias, partial);
+    if (window_chunk) {
+      [encoder dispatchThreadgroups:MTLSizeMake(
+                                        c10::metal::ceil_div(Og, int64_t(64)),
+                                        int64_t(params.outH) * c10::metal::ceil_div(int64_t(params.outW), int64_t(64)),
+                                        params.N)
+              threadsPerThreadgroup:MTLSizeMake(window_sg * c10::metal::simdgroup_size, 1, 1)];
+      return;
+    }
     [encoder dispatchThreadgroups:MTLSizeMake(
                                       c10::metal::ceil_div(Og, tile.rows) * groups, tile.tiles, params.N * tile.splits)
             threadsPerThreadgroup:MTLSizeMake(tile.simdgroups * c10::metal::simdgroup_size, 1, 1)];
@@ -1439,13 +1537,51 @@ static void conv2d_metal_forward(const Tensor& input_t,
       name = fmt::format("conv2d_s2_b{}x{}_s{}_{}", plan.rows, plan.columns, plan.simdgroups, dtype);
       grid = MTLSizeMake(ceil_div(Og, plan.rows) * groups, outH * ceil_div(outW, plan.columns), N);
       break;
+    case Conv2dKernel::Cooperative: {
+      weight = conv2d_cooperative_weights(weight_t);
+      constexpr int64_t block = kConv2dCooperativeTile;
+      if (plan.flat) {
+        name = fmt::format("conv2d_cooperative_flat_{}x{}_k{}", plan.rows / block, plan.columns / block, params.kH);
+        grid = MTLSizeMake(ceil_div(Og, plan.rows), ceil_div(positions, plan.columns), N);
+        break;
+      }
+      // Stride-2 rows take 16-byte loads when every row starts 16-byte aligned.
+      name = params.sH == 1 ? fmt::format("conv2d_cooperative_{}x{}{}",
+                                          plan.rows / block,
+                                          kConv2dCooperativeSimdgroups,
+                                          input.storage_offset() % 2 ? "_odd" : "")
+                            : fmt::format("conv2d_cooperative_s2{}_{}x{}_p{}",
+                                          params.W % 8 == 0 ? "" : "u",
+                                          plan.rows / block,
+                                          plan.columns / block,
+                                          params.padH);
+      grid = MTLSizeMake(ceil_div(Og, plan.rows), outH * ceil_div(outW, plan.columns), N);
+      break;
+    }
+    case Conv2dKernel::CooperativeNhwc:
+      conv2d_cooperative_nhwc_forward(input, weight_t, bias_opt, params, plan, groups, output_t);
+      return;
+    case Conv2dKernel::PointwiseCooperative: {
+      // 16-byte weight rows need an aligned start.
+      weight = weight_t.storage_offset() % 8 == 0 ? weight_t.contiguous() : weight_t.clone(MemoryFormat::Contiguous);
+      constexpr int64_t block = kConv2dCooperativeTile;
+      name = fmt::format("conv2d_pointwise_cooperative_{}x{}", plan.rows / block, plan.columns / block);
+      const int64_t channel_tiles = ceil_div(Og, plan.rows), position_tiles = ceil_div(positions, plan.columns);
+      grid = plan.columns == block ? MTLSizeMake(position_tiles, channel_tiles, N)
+                                   : MTLSizeMake(channel_tiles, position_tiles, N);
+      break;
+    }
     case Conv2dKernel::Tensor: {
-      if (!in_nhwc) {
+      if (!in_nhwc && !plan.flat) {
         input = conv3d_to_ndhwc(input.unsqueeze(2)).squeeze(2);
       }
       weight = conv3d_weights_to_dhwio(weight_t.unsqueeze(2));
       const bool wide = plan.rows == kConv2dTensorWideOutputs;
-      const char* variant = params.kW == 5 ? "k5_" : wide ? "wide_" : Cg <= kConv2dTensorStemChannels ? "stem_" : "";
+      const char* variant = plan.flat       ? (wide ? "wide_nchw_" : "nchw_")
+          : params.kW == 5                  ? "k5_"
+          : wide                            ? "wide_"
+          : Cg <= kConv2dTensorStemChannels ? "stem_"
+                                            : "";
       name = fmt::format("conv2d_tensor_{}{}", variant, dtype);
       const int64_t rows = wide ? kConv2dTensorWideSide : kConv2dTensorRows;
       const int64_t columns = wide ? kConv2dTensorWideSide : kConv2dTensorColumns;

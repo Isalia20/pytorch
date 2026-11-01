@@ -28,6 +28,13 @@ C10_METAL_CONSTEXPR int32_t kConv2dFewOutputTile = kConv2dMinTile / 2;
 // shift of their first tiles instead.
 C10_METAL_CONSTEXPR int32_t kConv2dFixed3ColumnMaxInputs = 64;
 C10_METAL_CONSTEXPR int32_t kConv2dFixed3ColumnRows = kConv2dMinTile;
+// conv2d_cooperative: each SIMD group computes kConv2dCooperativeTile output
+// channels x kConv2dCooperativeTile positions of one output row, reducing
+// kConv2dCooperativeChunk input channels per matmul2d run; a threadgroup holds
+// kConv2dCooperativeSimdgroups SIMD groups along the row.
+C10_METAL_CONSTEXPR int32_t kConv2dCooperativeTile = 32;
+C10_METAL_CONSTEXPR int32_t kConv2dCooperativeChunk = 16;
+C10_METAL_CONSTEXPR int32_t kConv2dCooperativeSimdgroups = 4;
 // conv2d_tensor tiles: output channels x output rows x output columns, run by
 // two SIMD groups; the wide tile covers 64 channels x 8 x 8 positions on four.
 // Inputs with at most kConv2dTensorStemChannels channels use the variant that

@@ -1582,11 +1582,13 @@ template <
     int BM,
     int BN,
     int NSG,
-    bool FIXED3 = false>
+    bool FIXED3 = false,
+    int KS = 0,
+    typename TW = T>
 [[max_total_threads_per_threadgroup(NSG * c10::metal::simdgroup_size)]]
 kernel void conv2d_mpp(
     device T* input [[buffer(0)]],
-    device T* weight [[buffer(1)]],
+    device TW* weight [[buffer(1)]],
     device T* output [[buffer(2)]],
     constant Conv2dMppParams& geometry [[buffer(3)]],
     device const T* bias [[buffer(4)]],
@@ -1598,11 +1600,13 @@ kernel void conv2d_mpp(
   using extents = dextents<int32_t, 2>;
   using strides = array<int32_t, 2>;
   using tensor2d = tensor<device T, extents, tensor_inline>;
+  using tensor2dw = tensor<device TW, extents, tensor_inline>;
   using tensor2df = tensor<device float, extents, tensor_inline>;
+  // Experiment: KS > 0 bakes the reduction length into the descriptor.
   constexpr auto desc = matmul2d_descriptor(
       OUT_NHWC ? BN : BM,
       OUT_NHWC ? BM : BN,
-      static_cast<int>(dynamic_extent),
+      KS > 0 ? KS : static_cast<int>(dynamic_extent),
       OUT_NHWC && !IN_NHWC,
       OUT_NHWC || IN_NHWC,
       !is_same_v<T, float>,
@@ -1625,7 +1629,7 @@ kernel void conv2d_mpp(
     const int64_t image = int64_t(tgid.z) * p.C_in * p.H * p.W;
     conv2d_mpp_fixed3_column<T, BM, NSG>(
         input + image,
-        weight,
+        (device const T*)weight,
         output + int64_t(tgid.z) * p.C_out * p.outH * p.outW,
         bias,
         p,
@@ -1633,7 +1637,8 @@ kernel void conv2d_mpp(
         int(tgid.y) * kConv2dFixed3ColumnRows,
         tid / c10::metal::simdgroup_size,
         tid % c10::metal::simdgroup_size,
-        conv2d_mpp_tile_nonfinite<T, BM>(weight, gp, g, o_off, tid),
+        conv2d_mpp_tile_nonfinite<T, BM>(
+            (device const T*)weight, gp, g, o_off, tid),
         bool_constant<FIXED3>{});
     return;
   }
@@ -1667,12 +1672,14 @@ kernel void conv2d_mpp(
   const bool boundary = conv2d_mpp_boundary(gp, oh, x_off, BN);
   bool exceptional = false;
   if (boundary) {
-    exceptional = conv2d_mpp_tile_nonfinite<T, BM>(weight, gp, g, o_off, tid);
+    exceptional = conv2d_mpp_tile_nonfinite<T, BM>(
+        (device const T*)weight, gp, g, o_off, tid);
   }
-  auto acc = op.template get_destination_cooperative_tensor<
-      tensor2d,
-      tensor2d,
-      float>();
+  // The cooperative accumulator's operand types follow op.run's argument order.
+  using left_t = conditional_t<OUT_NHWC, tensor2d, tensor2dw>;
+  using right_t = conditional_t<OUT_NHWC, tensor2dw, tensor2d>;
+  auto acc =
+      op.template get_destination_cooperative_tensor<left_t, right_t, float>();
   for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
     acc[i] = 0.0f;
   }
@@ -1706,7 +1713,7 @@ kernel void conv2d_mpp(
     return OUT_NHWC ? t.slice(o_off, n) : t.slice(n, o_off);
   };
   auto res =
-      op.template get_destination_cooperative_tensor<tensor2d, tensor2d, T>();
+      op.template get_destination_cooperative_tensor<left_t, right_t, T>();
   if IF_CONSTEXPR (IN_NHWC) {
     if (edge) {
       // Positions step down the rows; channels keep the unit stride. The
@@ -1763,7 +1770,7 @@ kernel void conv2d_mpp(
         src,
         IN_NHWC ? extents(K, length) : extents(length, K),
         strides{1, IN_NHWC ? (flat ? p.C_in : p.sW * p.C_in) : plane});
-    tensor2d wt(
+    tensor2dw wt(
         weight + (int64_t(kh * p.kW + kw) * p.C_out + g * og) * gp.K + k0,
         extents(K, og),
         strides{1, gp.K});
@@ -1777,9 +1784,14 @@ kernel void conv2d_mpp(
   // Fixed 3x3 tiles past column 0 read every tap in bounds; they run the taps
   // row by row so that the three taps of an input row read it back to back.
   if (FIXED3 && x_off > 0) {
-    for (int kh = 0; kh < p.kH; ++kh) {
-      for (int kw = 0; kw < p.kW; ++kw) {
-        run_tap(kh, kw, x_off + kw - p.padW, 0);
+    // Experiment: literal tap bounds and forced unrolling so that the nine
+    // matmul2d runs see constant offsets.
+    constexpr int fixed_taps = 3, fixed_pad = 1;
+#pragma clang loop unroll(disable)
+    for (int kh = 0; kh < fixed_taps; ++kh) {
+#pragma clang loop unroll(disable)
+      for (int kw = 0; kw < fixed_taps; ++kw) {
+        run_tap(kh, kw, x_off + kw - fixed_pad, 0);
       }
     }
   } else {
@@ -1827,7 +1839,8 @@ kernel void conv2d_mpp(
       const int o = o_off + int(index[OUT_NHWC ? 0 : 1]);
       const int x = x_off + int(index[OUT_NHWC ? 1 : 0]);
       if (o < og && x < p.outW && !isnan(acc[i]) &&
-          conv2d_mpp_padding_nonfinite(weight, gp, g, o, oh, x, k0, K)) {
+          conv2d_mpp_padding_nonfinite(
+              (device const T*)weight, gp, g, o, oh, x, k0, K)) {
         acc[i] = NAN;
       }
     }
@@ -1914,6 +1927,1026 @@ INSTANTIATE_CONV2D(
 
 INSTANTIATE_CONV2D_FIXED3(64, 2)
 INSTANTIATE_CONV2D_FIXED3(96, 4)
+INSTANTIATE_CONV2D_FIXED3(128, 4)
+INSTANTIATE_CONV2D_FIXED3(128, 2)
+INSTANTIATE_CONV2D_FIXED3(64, 4)
+INSTANTIATE_CONV2D(
+    "conv2d_mpp_nchw_nchw_b64x64_s2_k3_K64_bfloat",
+    conv2d_mpp<bfloat, false, false, 64, 64, 2, true, 64>);
+INSTANTIATE_CONV2D(
+    "conv2d_mpp_nchw_nchw_b64x64_s2_k3_K128_bfloat",
+    conv2d_mpp<bfloat, false, false, 64, 64, 2, true, 128>);
+INSTANTIATE_CONV2D(
+    "conv2d_mpp_nchw_nchw_b64x64_s2_k3_K96_bfloat",
+    conv2d_mpp<bfloat, false, false, 64, 64, 2, true, 96>);
+INSTANTIATE_CONV2D(
+    "conv2d_mpp_nchw_nchw_b64x64_s2_k3_wh_bfloat",
+    conv2d_mpp<bfloat, false, false, 64, 64, 2, true, 0, half>);
+#define INSTANTIATE_CONV2D_FIXED3_WIDE(BM, BN, NSG)                \
+  INSTANTIATE_CONV2D(                                              \
+      "conv2d_mpp_nchw_nchw_b" #BM "x" #BN "_s" #NSG "_k3_bfloat", \
+      conv2d_mpp<bfloat, false, false, BM, BN, NSG, true>);
+INSTANTIATE_CONV2D_FIXED3_WIDE(64, 128, 2)
+INSTANTIATE_CONV2D_FIXED3_WIDE(64, 128, 4)
+INSTANTIATE_CONV2D_FIXED3_WIDE(128, 128, 4)
+
+// Fixed 3x3, stride 1, padding 1 bfloat16 convolution of NCHW input whose
+// channel counts are multiples of 32 and whose width is a multiple of 8
+// (Conv2dKernel::Cooperative). Each SIMD group accumulates 32 output channels x
+// 32 positions of one output row and loads both matmul2d operands itself, so
+// the runs issue only matrix instructions on register operands. Per kernel row
+// and 16-channel block a lane reads two input rows of 8 positions and one halo
+// position on each side; the kw = 0, 1, 2 operands are shifts of those rows.
+// Positions are permuted within each 32-position block so that a lane's 8 are
+// contiguous (16-byte loads and stores), and conv2d_cooperative_weights packs
+// each 32 x 16 weight block in lane order (two 16-byte loads per lane).
+namespace cooperative {
+constexpr constant int tile = kConv2dCooperativeTile;
+constexpr constant int chunk = kConv2dCooperativeChunk;
+constexpr constant int lane_positions = 8;
+constexpr constant ushort accumulator_elements =
+    tile * tile / c10::metal::simdgroup_size;
+
+// Lane coordinates of the matmul2d cooperative operand layout: within each
+// 16 x 16 fragment a lane holds 4 consecutive elements along dimension 0 at
+// rows `row` and `row + 8` of dimension 1, starting at column 4 * group.
+inline int group(ushort lane) {
+  return (lane & 1) + 2 * ((lane >> 3) & 1);
+}
+inline int row(ushort lane) {
+  return ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
+}
+
+template <typename T>
+inline void unpack(thread T& t, ushort at, uint4 u) {
+  const bfloat2 v0 = as_type<bfloat2>(u.x), v1 = as_type<bfloat2>(u.y),
+                v2 = as_type<bfloat2>(u.z), v3 = as_type<bfloat2>(u.w);
+  t[at] = v0.x;
+  t[at + 1] = v0.y;
+  t[at + 2] = v1.x;
+  t[at + 3] = v1.y;
+  t[at + 4] = v2.x;
+  t[at + 5] = v2.y;
+  t[at + 6] = v3.x;
+  t[at + 7] = v3.y;
+}
+
+template <typename T>
+inline void unpack4(thread T& t, ushort at, uint2 u) {
+  const bfloat2 v0 = as_type<bfloat2>(u.x), v1 = as_type<bfloat2>(u.y);
+  t[at] = v0.x;
+  t[at + 1] = v0.y;
+  t[at + 2] = v1.x;
+  t[at + 3] = v1.y;
+}
+
+// Positions px - 1 .. px + 8 of one input row; zero outside [0, width) and for
+// rows in the padding, which still multiply the weights so that non-finite
+// weights propagate as they do through zero padding. With an ODD input offset,
+// position px - 1 starts a 4-byte word, so five word loads read the row.
+template <bool ODD>
+inline void load_row(
+    thread bfloat (&r)[lane_positions + 2],
+    device const bfloat* src,
+    int px,
+    int width,
+    bool inner,
+    bool padding) {
+  if (padding) {
+    for (int j = 0; j < lane_positions + 2; ++j) {
+      r[j] = bfloat(0);
+    }
+    return;
+  }
+  if (inner && ODD) {
+    device const uint* words = reinterpret_cast<device const uint*>(src - 1);
+    for (int j = 0; j < lane_positions / 2 + 1; ++j) {
+      const bfloat2 v = as_type<bfloat2>(words[j]);
+      r[2 * j] = v.x;
+      r[2 * j + 1] = v.y;
+    }
+    return;
+  }
+  if (inner) {
+    const uint4 u = *reinterpret_cast<device const uint4*>(src);
+    unpack(r, 1, u);
+    r[0] = src[-1];
+    r[lane_positions + 1] = src[lane_positions];
+    return;
+  }
+  for (int j = 0; j < lane_positions; ++j) {
+    r[1 + j] = px + j < width ? src[j] : bfloat(0);
+  }
+  r[0] = px > 0 && px <= width ? src[-1] : bfloat(0);
+  r[lane_positions + 1] =
+      px + lane_positions < width ? src[lane_positions] : bfloat(0);
+}
+
+// Weights of one tap and its input operand: the shifted rows, position kw - 1
+// .. kw + 6 of each lane. The caller runs the product, so the three taps stay
+// literal.
+template <int KW, typename A, typename B>
+inline void load_tap(
+    thread A& a,
+    thread B& b,
+    const thread bfloat (&r0)[lane_positions + 2],
+    const thread bfloat (&r1)[lane_positions + 2],
+    device const bfloat* weight) {
+  unpack(a, 0, *reinterpret_cast<device const uint4*>(weight));
+  unpack(
+      a,
+      lane_positions,
+      *reinterpret_cast<device const uint4*>(weight + lane_positions));
+  for (int j = 0; j < 4; ++j) {
+    b[j] = r0[KW + j];
+    b[lane_positions + j] = r0[KW + 4 + j];
+    b[4 + j] = r1[KW + j];
+    b[lane_positions + 4 + j] = r1[KW + 4 + j];
+  }
+}
+
+// load_row for flat tiles: positions ow - 1 .. ow + 8 of one input row, with
+// the halos zero at the row ends and the whole row zero in the padding.
+inline void load_row_flat(
+    thread bfloat (&r)[lane_positions + 2],
+    device const bfloat* src,
+    bool left,
+    bool right,
+    bool padding) {
+  unpack(
+      r, 1, padding ? uint4(0) : *reinterpret_cast<device const uint4*>(src));
+  r[0] = left && !padding ? src[-1] : bfloat(0);
+  r[lane_positions + 1] = right && !padding ? src[lane_positions] : bfloat(0);
+}
+
+// Input columns start .. start + 16 (start = 2 * px - PAD) of one row for a
+// lane's 8 stride-2 outputs px .. px + 7, split so that each tap reads a run of
+// 8: tap 0 reads s[0..7], tap 2 s[1..8] and tap 1 m[0..7]. With PAD 1, s holds
+// the odd columns behind the left halo and m the even ones; with PAD 0, s holds
+// the even columns ahead of the right halo and m the odd ones. Rows in the
+// padding are zero, and lanes whose columns leave the row read them one by one.
+// ALIGNED rows read columns 2 * px .. 2 * px + 15 with two 16-byte loads; other
+// rows read words from the even element at or before `start` (`odd` is the
+// element parity of `start`) and pick their halves.
+template <int PAD, bool ALIGNED>
+inline void load_row_s2(
+    thread bfloat (&s)[lane_positions + 1],
+    thread bfloat (&m)[lane_positions],
+    device const bfloat* row,
+    int start,
+    int width,
+    bool odd,
+    bool inner,
+    bool padding) {
+  if (padding) {
+    for (int j = 0; j < lane_positions; ++j) {
+      s[j] = bfloat(0);
+      m[j] = bfloat(0);
+    }
+    s[lane_positions] = bfloat(0);
+    return;
+  }
+  constexpr int columns = 2 * lane_positions + 1;
+  bfloat v[columns];
+  if (!inner) {
+    for (int i = 0; i < columns; ++i) {
+      v[i] = start + i >= 0 && start + i < width ? row[start + i] : bfloat(0);
+    }
+  } else if (ALIGNED) {
+    device const bfloat* src = row + start + PAD;
+    unpack(v, PAD, *reinterpret_cast<device const uint4*>(src));
+    unpack(
+        v,
+        PAD + lane_positions,
+        *reinterpret_cast<device const uint4*>(src + lane_positions));
+    v[PAD == 1 ? 0 : columns - 1] =
+        PAD == 1 ? src[-1] : src[2 * lane_positions];
+  } else {
+    // Word k holds elements start - odd + 2k and the one after it.
+    device const uint* words =
+        reinterpret_cast<device const uint*>(row + start - (odd ? 1 : 0));
+    uint w[lane_positions + 1];
+    for (int k = 0; k < lane_positions; ++k) {
+      w[k] = words[k];
+    }
+    w[lane_positions] = odd
+        ? words[lane_positions]
+        : uint(as_type<ushort>(row[start + 2 * lane_positions]));
+    for (int i = 0; i < columns; ++i) {
+      const bfloat2 even_word = as_type<bfloat2>(w[i / 2]);
+      const bfloat2 odd_word = as_type<bfloat2>(w[(i + 1) / 2]);
+      v[i] = odd ? ((i + 1) % 2 == 0 ? odd_word.x : odd_word.y)
+                 : (i % 2 == 0 ? even_word.x : even_word.y);
+    }
+  }
+  for (int j = 0; j < lane_positions; ++j) {
+    s[j + PAD] = v[2 * j + 2 * PAD];
+    m[j] = v[2 * j + 1];
+  }
+  s[PAD == 1 ? 0 : lane_positions] = v[PAD == 1 ? 0 : columns - 1];
+}
+
+// load_tap for the stride-2 rows of load_row_s2.
+template <int KW, typename A, typename B>
+inline void load_tap_s2(
+    thread A& a,
+    thread B& b,
+    const thread bfloat (&s0)[lane_positions + 1],
+    const thread bfloat (&m0)[lane_positions],
+    const thread bfloat (&s1)[lane_positions + 1],
+    const thread bfloat (&m1)[lane_positions],
+    device const bfloat* weight) {
+  unpack(a, 0, *reinterpret_cast<device const uint4*>(weight));
+  unpack(
+      a,
+      lane_positions,
+      *reinterpret_cast<device const uint4*>(weight + lane_positions));
+  for (int j = 0; j < 4; ++j) {
+    b[j] = KW == 1 ? m0[j] : s0[KW / 2 + j];
+    b[lane_positions + j] = KW == 1 ? m0[4 + j] : s0[KW / 2 + 4 + j];
+    b[4 + j] = KW == 1 ? m1[j] : s1[KW / 2 + j];
+    b[lane_positions + 4 + j] = KW == 1 ? m1[4 + j] : s1[KW / 2 + 4 + j];
+  }
+}
+} // namespace cooperative
+
+template <int TGM, int TGN, bool ODD>
+[[max_total_threads_per_threadgroup(TGM * TGN * c10::metal::simdgroup_size)]]
+kernel void conv2d_cooperative(
+    device const bfloat* input [[buffer(0)]],
+    device const bfloat* weight [[buffer(1)]],
+    device bfloat* output [[buffer(2)]],
+    constant Conv2DParams& p [[buffer(3)]],
+    device const bfloat* bias [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]) {
+  using namespace cooperative;
+  constexpr auto desc = matmul2d_descriptor(
+      tile,
+      tile,
+      chunk,
+      false,
+      false,
+      true,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroup> op;
+  auto a =
+      op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+  auto b =
+      op.template get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+  auto c = op.template get_destination_cooperative_tensor<
+      remove_addrspace_t<decltype(a)>,
+      remove_addrspace_t<decltype(b)>,
+      float>();
+  // get_capacity() only folds in the device compiler, after unrolling.
+  for (ushort i = 0; i < accumulator_elements; ++i) {
+    c[i] = 0.0f;
+  }
+  const int plane = p.H * p.W;
+  const int tiles_w = c10::metal::ceil_div(p.W, TGN * tile);
+  const int oh = int(tgid.y) / tiles_w;
+  const int x0 = int(tgid.y) % tiles_w * (TGN * tile) + int(sg % TGN) * tile;
+  const int o0 = int(tgid.x) * (TGM * tile) + int(sg / TGN) * tile;
+  const int r = row(lane), px = x0 + lane_positions * group(lane);
+  device const bfloat* x = input + (int64_t(tgid.z) * p.C_in + r) * plane + px;
+  device const bfloat* w =
+      weight + int64_t(o0 / tile) * p.C_in * tile + lane * chunk;
+  const int64_t tap = int64_t(p.C_out) * p.C_in;
+  const bool inner = x0 > 0 && x0 + tile < p.W;
+  for (int kh = 0; kh < 3; ++kh) {
+    const int ih = oh + kh - 1;
+    const bool padding = ih < 0 || ih >= p.H;
+    for (int c0 = 0; c0 < p.C_in; c0 += chunk) {
+      bfloat r0[lane_positions + 2], r1[lane_positions + 2];
+      device const bfloat* xs =
+          x + int64_t(c0) * plane + clamp(ih, 0, p.H - 1) * p.W;
+      load_row<ODD>(r0, xs, px, p.W, inner, padding);
+      load_row<ODD>(r1, xs + 8 * plane, px, p.W, inner, padding);
+      // `#pragma unroll` over a loop holding op.run compiles to slower code.
+      load_tap<0>(a, b, r0, r1, w + (kh * 3 + 0) * tap + c0 * tile);
+      op.run(a, b, c);
+      load_tap<1>(a, b, r0, r1, w + (kh * 3 + 1) * tap + c0 * tile);
+      op.run(a, b, c);
+      load_tap<2>(a, b, r0, r1, w + (kh * 3 + 2) * tap + c0 * tile);
+      op.run(a, b, c);
+    }
+  }
+  device bfloat* y =
+      output + (int64_t(tgid.z) * p.C_out + o0 + r) * plane + oh * p.W + px;
+#pragma unroll
+  for (int f = 0; f < 2; ++f) {
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const int m = 16 * f + 8 * h;
+      const float bv = p.has_bias ? float(bias[o0 + r + m]) : 0.0f;
+      const ushort i = 4 * h + 16 * f;
+      const float4 lo = float4(c[i], c[i + 1], c[i + 2], c[i + 3]) + bv;
+      const float4 hi = float4(c[i + 8], c[i + 9], c[i + 10], c[i + 11]) + bv;
+      device bfloat* q = y + m * plane;
+      if (px + lane_positions <= p.W) {
+        *reinterpret_cast<device bfloat4*>(q) = bfloat4(lo);
+        *reinterpret_cast<device bfloat4*>(q + 4) = bfloat4(hi);
+      } else {
+        for (int j = 0; j < 4; ++j) {
+          if (px + j < p.W) {
+            q[j] = bfloat(lo[j]);
+          }
+          if (px + 4 + j < p.W) {
+            q[4 + j] = bfloat(hi[j]);
+          }
+        }
+      }
+    }
+  }
+}
+
+// conv2d_cooperative over the flattened positions of each image, for rows
+// narrower than a threadgroup, batches and the 16-channel steps of shallow or
+// 176-channel inputs; KH 1 runs a single tap row (1x3 kernels). The width is a
+// multiple of 8, so a lane's 8 positions stay within one row.
+template <int TGM, int TGN, int KH>
+[[max_total_threads_per_threadgroup(TGM * TGN * c10::metal::simdgroup_size)]]
+kernel void conv2d_cooperative_flat(
+    device const bfloat* input [[buffer(0)]],
+    device const bfloat* weight [[buffer(1)]],
+    device bfloat* output [[buffer(2)]],
+    constant Conv2DParams& p [[buffer(3)]],
+    device const bfloat* bias [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]) {
+  using namespace cooperative;
+  constexpr auto desc = matmul2d_descriptor(
+      tile,
+      tile,
+      chunk,
+      false,
+      false,
+      true,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroup> op;
+  auto a =
+      op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+  auto b =
+      op.template get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+  auto c = op.template get_destination_cooperative_tensor<
+      remove_addrspace_t<decltype(a)>,
+      remove_addrspace_t<decltype(b)>,
+      float>();
+  for (ushort i = 0; i < accumulator_elements; ++i) {
+    c[i] = 0.0f;
+  }
+  const int o0 = int(tgid.x) * (TGM * tile) + int(sg / TGN) * tile;
+  if (o0 >= p.C_out) {
+    return;
+  }
+  const int plane = p.H * p.W;
+  const int r = row(lane);
+  const int p0 = int(tgid.y) * (TGN * tile) + int(sg % TGN) * tile +
+      lane_positions * group(lane);
+  // Runs past the end compute the last run again and are not stored.
+  const int pc = min(p0, plane - lane_positions);
+  const int oh = pc / p.W, ow = pc % p.W;
+  const bool left = ow > 0, right = ow + lane_positions < p.W;
+  device const bfloat* x = input + (int64_t(tgid.z) * p.C_in + r) * plane + ow;
+  device const bfloat* w =
+      weight + int64_t(o0 / tile) * p.C_in * tile + lane * chunk;
+  const int64_t tap = int64_t(p.C_out) * p.C_in;
+  for (int kh = 0; kh < KH; ++kh) {
+    const int ih = oh + kh - KH / 2;
+    const bool padding = ih < 0 || ih >= p.H;
+    for (int c0 = 0; c0 < p.C_in; c0 += chunk) {
+      bfloat r0[lane_positions + 2], r1[lane_positions + 2];
+      device const bfloat* xs =
+          x + int64_t(c0) * plane + clamp(ih, 0, p.H - 1) * p.W;
+      load_row_flat(r0, xs, left, right, padding);
+      load_row_flat(r1, xs + 8 * plane, left, right, padding);
+      load_tap<0>(a, b, r0, r1, w + (kh * 3 + 0) * tap + c0 * tile);
+      op.run(a, b, c);
+      load_tap<1>(a, b, r0, r1, w + (kh * 3 + 1) * tap + c0 * tile);
+      op.run(a, b, c);
+      load_tap<2>(a, b, r0, r1, w + (kh * 3 + 2) * tap + c0 * tile);
+      op.run(a, b, c);
+    }
+  }
+  if (p0 >= plane) {
+    return;
+  }
+  device bfloat* y = output + (int64_t(tgid.z) * p.C_out + o0 + r) * plane + p0;
+#pragma unroll
+  for (int f = 0; f < 2; ++f) {
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const int m = 16 * f + 8 * h;
+      const float bv = p.has_bias ? float(bias[o0 + r + m]) : 0.0f;
+      const ushort i = 4 * h + 16 * f;
+      const float4 lo = float4(c[i], c[i + 1], c[i + 2], c[i + 3]) + bv;
+      const float4 hi = float4(c[i + 8], c[i + 9], c[i + 10], c[i + 11]) + bv;
+      *reinterpret_cast<device uint4*>(y + m * plane) =
+          uint4(as_type<uint2>(bfloat4(lo)), as_type<uint2>(bfloat4(hi)));
+    }
+  }
+}
+
+// Stride-2 conv2d_cooperative with equal padding PAD (0 or 1): a lane's 8
+// outputs read 17 consecutive input columns per row, deinterleaved into the
+// even and odd columns that the three taps share (load_row_s2). Weights are
+// packed as for conv2d_cooperative.
+template <int TGM, int TGN, int PAD, bool ALIGNED>
+[[max_total_threads_per_threadgroup(TGM * TGN * c10::metal::simdgroup_size)]]
+kernel void conv2d_cooperative_s2(
+    device const bfloat* input [[buffer(0)]],
+    device const bfloat* weight [[buffer(1)]],
+    device bfloat* output [[buffer(2)]],
+    constant Conv2DParams& p [[buffer(3)]],
+    device const bfloat* bias [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]) {
+  using namespace cooperative;
+  constexpr auto desc = matmul2d_descriptor(
+      tile,
+      tile,
+      chunk,
+      false,
+      false,
+      true,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroup> op;
+  auto a =
+      op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+  auto b =
+      op.template get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+  auto c = op.template get_destination_cooperative_tensor<
+      remove_addrspace_t<decltype(a)>,
+      remove_addrspace_t<decltype(b)>,
+      float>();
+  for (ushort i = 0; i < accumulator_elements; ++i) {
+    c[i] = 0.0f;
+  }
+  const int o0 = int(tgid.x) * (TGM * tile) + int(sg / TGN) * tile;
+  if (o0 >= p.C_out) {
+    return;
+  }
+  const int plane = p.H * p.W, out_plane = p.outH * p.outW;
+  const int tiles_w = c10::metal::ceil_div(p.outW, TGN * tile);
+  const int oh = int(tgid.y) / tiles_w;
+  const int x0 = int(tgid.y) % tiles_w * (TGN * tile) + int(sg % TGN) * tile;
+  const int r = row(lane), px = x0 + lane_positions * group(lane),
+            start = 2 * px - PAD;
+  const int64_t channel = int64_t(tgid.z) * p.C_in + r;
+  device const bfloat* x = input + channel * plane;
+  device const bfloat* w =
+      weight + int64_t(o0 / tile) * p.C_in * tile + lane * chunk;
+  const int64_t tap = int64_t(p.C_out) * p.C_in;
+  const bool inner = start >= 0 && start + 2 * lane_positions < p.W;
+  for (int kh = 0; kh < 3; ++kh) {
+    const int ih = 2 * oh + kh - PAD;
+    const bool padding = ih < 0 || ih >= p.H;
+    const int row_offset = clamp(ih, 0, p.H - 1) * p.W;
+    // Both rows of a lane, 8 channels apart, and every 16-channel step keep the
+    // parity.
+    const bool odd =
+        !ALIGNED && ((channel * plane + row_offset + start) & 1) != 0;
+    for (int c0 = 0; c0 < p.C_in; c0 += chunk) {
+      bfloat s0[lane_positions + 1], m0[lane_positions], s1[lane_positions + 1],
+          m1[lane_positions];
+      device const bfloat* xs = x + int64_t(c0) * plane + row_offset;
+      load_row_s2<PAD, ALIGNED>(s0, m0, xs, start, p.W, odd, inner, padding);
+      load_row_s2<PAD, ALIGNED>(
+          s1, m1, xs + 8 * plane, start, p.W, odd, inner, padding);
+      load_tap_s2<0>(a, b, s0, m0, s1, m1, w + (kh * 3 + 0) * tap + c0 * tile);
+      op.run(a, b, c);
+      load_tap_s2<1>(a, b, s0, m0, s1, m1, w + (kh * 3 + 1) * tap + c0 * tile);
+      op.run(a, b, c);
+      load_tap_s2<2>(a, b, s0, m0, s1, m1, w + (kh * 3 + 2) * tap + c0 * tile);
+      op.run(a, b, c);
+    }
+  }
+  device bfloat* y = output + (int64_t(tgid.z) * p.C_out + o0 + r) * out_plane +
+      oh * p.outW + px;
+  const bool vector_stores = p.outW % 4 == 0 && px + lane_positions <= p.outW;
+#pragma unroll
+  for (int f = 0; f < 2; ++f) {
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const int m = 16 * f + 8 * h;
+      const float bv = p.has_bias ? float(bias[o0 + r + m]) : 0.0f;
+      const ushort i = 4 * h + 16 * f;
+      const float4 lo = float4(c[i], c[i + 1], c[i + 2], c[i + 3]) + bv;
+      const float4 hi = float4(c[i + 8], c[i + 9], c[i + 10], c[i + 11]) + bv;
+      device bfloat* q = y + m * out_plane;
+      if (vector_stores) {
+        *reinterpret_cast<device bfloat4*>(q) = bfloat4(lo);
+        *reinterpret_cast<device bfloat4*>(q + 4) = bfloat4(hi);
+      } else {
+        for (int j = 0; j < 4; ++j) {
+          if (px + j < p.outW) {
+            q[j] = bfloat(lo[j]);
+          }
+          if (px + 4 + j < p.outW) {
+            q[4 + j] = bfloat(hi[j]);
+          }
+        }
+      }
+    }
+  }
+}
+
+// OIHW 3x3 (or 1x3) weights -> [tap][C_out / 32][C_in / 16][lane][16] for
+// conv2d_cooperative: element e of a lane is output channel
+// 16 * (e / 8) + row + 8 * (e / 4 % 2) and input channel 4 * group + e % 4 of
+// its 32 x 16 block.
+kernel void conv2d_cooperative_weights(
+    device const bfloat* weight [[buffer(0)]],
+    device bfloat* packed [[buffer(1)]],
+    constant int4& dims [[buffer(2)]],
+    uint index [[thread_position_in_grid]]) {
+  using namespace cooperative;
+  const int C_out = dims.x, C_in = dims.y, taps = dims.z;
+  const int e = index % chunk;
+  const ushort lane = index / chunk % c10::metal::simdgroup_size;
+  const int block = index / (chunk * c10::metal::simdgroup_size);
+  const int cb = block % (C_in / chunk),
+            ob = block / (C_in / chunk) % (C_out / tile);
+  const int t = block / (C_in / chunk) / (C_out / tile);
+  const int o = ob * tile + 16 * (e / 8) + row(lane) + 8 * (e / 4 % 2);
+  const int ci = cb * chunk + 4 * group(lane) + e % 4;
+  packed[index] = weight[(int64_t(o) * C_in + ci) * taps + t];
+}
+
+INSTANTIATE_CONV2D(
+    "conv2d_cooperative_1x4",
+    conv2d_cooperative<1, kConv2dCooperativeSimdgroups, false>);
+INSTANTIATE_CONV2D(
+    "conv2d_cooperative_2x4",
+    conv2d_cooperative<2, kConv2dCooperativeSimdgroups, false>);
+INSTANTIATE_CONV2D(
+    "conv2d_cooperative_1x4_odd",
+    conv2d_cooperative<1, kConv2dCooperativeSimdgroups, true>);
+INSTANTIATE_CONV2D(
+    "conv2d_cooperative_flat_1x2_k3",
+    conv2d_cooperative_flat<1, 2, 3>);
+INSTANTIATE_CONV2D(
+    "conv2d_cooperative_flat_1x2_k1",
+    conv2d_cooperative_flat<1, 2, 1>);
+// Aligned rows with padding 0 have odd output widths, so they never take the
+// two-block tile.
+#define INSTANTIATE_CONV2D_COOPERATIVE_S2(TGM, TGN, PAD, ALIGNED, NAME) \
+  INSTANTIATE_CONV2D(                                                   \
+      "conv2d_cooperative_" #NAME "_" #TGM "x" #TGN "_p" #PAD,          \
+      conv2d_cooperative_s2<TGM, TGN, PAD, ALIGNED>);
+INSTANTIATE_CONV2D_COOPERATIVE_S2(2, 1, 0, true, s2)
+INSTANTIATE_CONV2D_COOPERATIVE_S2(2, 1, 1, true, s2)
+INSTANTIATE_CONV2D_COOPERATIVE_S2(2, 2, 1, true, s2)
+INSTANTIATE_CONV2D_COOPERATIVE_S2(2, 1, 0, false, s2u)
+INSTANTIATE_CONV2D_COOPERATIVE_S2(2, 1, 1, false, s2u)
+INSTANTIATE_CONV2D_COOPERATIVE_S2(2, 2, 0, false, s2u)
+INSTANTIATE_CONV2D_COOPERATIVE_S2(2, 2, 1, false, s2u)
+
+// Grouped stride-1 bfloat16 convolution of channels-last input into
+// channels-last output (Conv2dKernel::CooperativeNhwc) on whole 32-channel
+// input blocks: TGM x TGN SIMD groups each accumulate 32 positions of one
+// output row x 32 output channels of one group. The input is the left operand:
+// its channels (the K dimension) are contiguous, renamed within each 32-block
+// so that one 16-byte load per pixel feeds two 16-deep runs; positions are
+// renamed so that a lane's 4 pixels are consecutive (M row r + 8i <-> pixel
+// 4r + i), so the kW taps of a kernel row shift each lane's pixels by one and
+// a lane loads 4 + kW - 1 pixels per (kernel row, channel block). Output
+// channels are renamed as in conv2d_cooperative, so a lane stores 8
+// consecutive channels of a pixel. Taps outside the image read zeros, which
+// still multiply the weights. Only whole 32-channel output blocks run here;
+// conv2d_cooperative_nhwc_tail computes a last block of 16.
+template <int TGM, int TGN>
+[[max_total_threads_per_threadgroup(TGM * TGN * c10::metal::simdgroup_size)]]
+kernel void conv2d_cooperative_nhwc(
+    device const bfloat* input [[buffer(0)]],
+    device const bfloat* weight [[buffer(1)]],
+    device bfloat* output [[buffer(2)]],
+    constant Conv2DParams& p [[buffer(3)]],
+    device const bfloat* bias [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]) {
+  using namespace cooperative;
+  constexpr auto desc = matmul2d_descriptor(
+      tile,
+      tile,
+      chunk,
+      false,
+      false,
+      true,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroup> op;
+  auto a =
+      op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+  auto b =
+      op.template get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+  auto c = op.template get_destination_cooperative_tensor<
+      remove_addrspace_t<decltype(a)>,
+      remove_addrspace_t<decltype(b)>,
+      float>();
+  for (ushort i = 0; i < accumulator_elements; ++i) {
+    c[i] = 0.0f;
+  }
+  const int og = p.C_out_per_group, cg = p.C_in_per_group;
+  const int out_blocks = og / tile;
+  const int channel_tiles = c10::metal::ceil_div(out_blocks, TGN);
+  const int grp = int(tgid.x) / channel_tiles;
+  const int ob = int(tgid.x) % channel_tiles * TGN + int(sg % TGN);
+  if (ob >= out_blocks) {
+    return;
+  }
+  const int tiles_w = c10::metal::ceil_div(p.outW, TGM * tile);
+  const int oh = int(tgid.y) / tiles_w;
+  const int x0 = int(tgid.y) % tiles_w * (TGM * tile) + int(sg / TGN) * tile;
+  const int r = row(lane), gl = group(lane);
+  const int col0 = x0 + 4 * r - p.padW;
+  device const bfloat* x = input + int64_t(tgid.z) * p.H * p.W * p.C_in +
+      grp * cg + lane_positions * gl;
+  device const bfloat* w = weight +
+      (int64_t(grp) * out_blocks + ob) * p.kH * p.kW * cg * tile +
+      lane * 2 * chunk;
+  for (int kh = 0; kh < p.kH; ++kh) {
+    const int ih = oh + kh - p.padH;
+    const bool row_ok = ih >= 0 && ih < p.H;
+    device const bfloat* xr = x + int64_t(clamp(ih, 0, p.H - 1)) * p.W * p.C_in;
+    for (int c0 = 0; c0 < cg; c0 += 2 * chunk) {
+      // v[i] holds pixel col0 + kw + i at tap kw; before tap 0, v[1..3] hold
+      // pixels col0 .. col0 + 2.
+      uint4 v[4];
+      for (int i = 1; i < 4; ++i) {
+        const int col = col0 + i - 1;
+        v[i] = row_ok && col >= 0 && col < p.W
+            ? *reinterpret_cast<device const uint4*>(xr + col * p.C_in + c0)
+            : uint4(0);
+      }
+      for (int kw = 0; kw < p.kW; ++kw) {
+        v[0] = v[1];
+        v[1] = v[2];
+        v[2] = v[3];
+        const int col = col0 + 3 + kw;
+        v[3] = row_ok && col >= 0 && col < p.W
+            ? *reinterpret_cast<device const uint4*>(xr + col * p.C_in + c0)
+            : uint4(0);
+        const uint4 w0 = *reinterpret_cast<device const uint4*>(w);
+        const uint4 w1 =
+            *reinterpret_cast<device const uint4*>(w + lane_positions);
+        const uint4 w2 =
+            *reinterpret_cast<device const uint4*>(w + 2 * lane_positions);
+        const uint4 w3 =
+            *reinterpret_cast<device const uint4*>(w + 3 * lane_positions);
+        w += 2 * chunk * c10::metal::simdgroup_size;
+        unpack4(a, 0, v[0].xy);
+        unpack4(a, 4, v[1].xy);
+        unpack4(a, 8, v[2].xy);
+        unpack4(a, 12, v[3].xy);
+        unpack(b, 0, w0);
+        unpack(b, lane_positions, w1);
+        op.run(a, b, c);
+        unpack4(a, 0, v[0].zw);
+        unpack4(a, 4, v[1].zw);
+        unpack4(a, 8, v[2].zw);
+        unpack4(a, 12, v[3].zw);
+        unpack(b, 0, w2);
+        unpack(b, lane_positions, w3);
+        op.run(a, b, c);
+      }
+    }
+  }
+  const int oc = ob * tile + lane_positions * gl;
+  float4 blo = 0.0f, bhi = 0.0f;
+  if (p.has_bias) {
+    device const bfloat* bp = bias + grp * og + oc;
+    blo = float4(float(bp[0]), float(bp[1]), float(bp[2]), float(bp[3]));
+    bhi = float4(float(bp[4]), float(bp[5]), float(bp[6]), float(bp[7]));
+  }
+  device bfloat* y = output +
+      (int64_t(tgid.z) * p.outH + oh) * p.outW * p.C_out + grp * og + oc;
+#pragma unroll
+  for (int f = 0; f < 2; ++f) {
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const int px = x0 + 4 * r + h + 2 * f;
+      const ushort i = 4 * h + 16 * f;
+      const float4 lo = float4(c[i], c[i + 1], c[i + 2], c[i + 3]) + blo;
+      const float4 hi = float4(c[i + 8], c[i + 9], c[i + 10], c[i + 11]) + bhi;
+      if (px < p.outW) {
+        *reinterpret_cast<device uint4*>(y + int64_t(px) * p.C_out) =
+            uint4(as_type<uint2>(bfloat4(lo)), as_type<uint2>(bfloat4(hi)));
+      }
+    }
+  }
+}
+
+// The last 16 output channels of each group when O_g % 32 == 16: 32 x 16
+// matmul2d runs (the lane layout of conv2d_cooperative_nhwc restricted to one
+// 16-channel fragment), two 32-position blocks per SIMD group sharing the
+// weight operand, so the accumulators take the registers of one 32 x 32 block.
+kernel void conv2d_cooperative_nhwc_tail(
+    device const bfloat* input [[buffer(0)]],
+    device const bfloat* weight [[buffer(1)]],
+    device bfloat* output [[buffer(2)]],
+    constant Conv2DParams& p [[buffer(3)]],
+    device const bfloat* bias [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]]) {
+  using namespace cooperative;
+  constexpr int tail = tile / 2;
+  constexpr auto desc = matmul2d_descriptor(
+      tile,
+      tail,
+      chunk,
+      false,
+      false,
+      true,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroup> op;
+  auto a =
+      op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+  auto b =
+      op.template get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+  auto acc0 = op.template get_destination_cooperative_tensor<
+      remove_addrspace_t<decltype(a)>,
+      remove_addrspace_t<decltype(b)>,
+      float>();
+  auto acc1 = op.template get_destination_cooperative_tensor<
+      remove_addrspace_t<decltype(a)>,
+      remove_addrspace_t<decltype(b)>,
+      float>();
+  for (ushort i = 0; i < accumulator_elements / 2; ++i) {
+    acc0[i] = 0.0f;
+    acc1[i] = 0.0f;
+  }
+  const int og = p.C_out_per_group, cg = p.C_in_per_group;
+  const int grp = int(tgid.x);
+  const int tiles_w = c10::metal::ceil_div(p.outW, 2 * tile);
+  const int oh = int(tgid.y) / tiles_w;
+  const int x0 = int(tgid.y) % tiles_w * (2 * tile);
+  const int r = row(lane), gl = group(lane);
+  const int col0 = x0 + 4 * r - p.padW, col1 = col0 + tile;
+  device const bfloat* x = input + int64_t(tgid.z) * p.H * p.W * p.C_in +
+      grp * cg + lane_positions * gl;
+  device const bfloat* w =
+      weight + int64_t(grp) * p.kH * p.kW * cg * tail + lane * chunk;
+  for (int kh = 0; kh < p.kH; ++kh) {
+    const int ih = oh + kh - p.padH;
+    const bool row_ok = ih >= 0 && ih < p.H;
+    device const bfloat* xr = x + int64_t(clamp(ih, 0, p.H - 1)) * p.W * p.C_in;
+    for (int c0 = 0; c0 < cg; c0 += 2 * chunk) {
+      // As in conv2d_cooperative_nhwc, for each of the two position blocks.
+      uint4 v[4], u[4];
+      for (int i = 1; i < 4; ++i) {
+        const int cv = col0 + i - 1, cu = col1 + i - 1;
+        v[i] = row_ok && cv >= 0 && cv < p.W
+            ? *reinterpret_cast<device const uint4*>(xr + cv * p.C_in + c0)
+            : uint4(0);
+        u[i] = row_ok && cu >= 0 && cu < p.W
+            ? *reinterpret_cast<device const uint4*>(xr + cu * p.C_in + c0)
+            : uint4(0);
+      }
+      for (int kw = 0; kw < p.kW; ++kw) {
+        v[0] = v[1];
+        v[1] = v[2];
+        v[2] = v[3];
+        u[0] = u[1];
+        u[1] = u[2];
+        u[2] = u[3];
+        const int cv = col0 + 3 + kw, cu = col1 + 3 + kw;
+        v[3] = row_ok && cv >= 0 && cv < p.W
+            ? *reinterpret_cast<device const uint4*>(xr + cv * p.C_in + c0)
+            : uint4(0);
+        u[3] = row_ok && cu >= 0 && cu < p.W
+            ? *reinterpret_cast<device const uint4*>(xr + cu * p.C_in + c0)
+            : uint4(0);
+        const uint4 w0 = *reinterpret_cast<device const uint4*>(w);
+        const uint4 w1 =
+            *reinterpret_cast<device const uint4*>(w + lane_positions);
+        w += chunk * c10::metal::simdgroup_size;
+        unpack(b, 0, w0);
+        unpack4(a, 0, v[0].xy);
+        unpack4(a, 4, v[1].xy);
+        unpack4(a, 8, v[2].xy);
+        unpack4(a, 12, v[3].xy);
+        op.run(a, b, acc0);
+        unpack4(a, 0, u[0].xy);
+        unpack4(a, 4, u[1].xy);
+        unpack4(a, 8, u[2].xy);
+        unpack4(a, 12, u[3].xy);
+        op.run(a, b, acc1);
+        unpack(b, 0, w1);
+        unpack4(a, 0, v[0].zw);
+        unpack4(a, 4, v[1].zw);
+        unpack4(a, 8, v[2].zw);
+        unpack4(a, 12, v[3].zw);
+        op.run(a, b, acc0);
+        unpack4(a, 0, u[0].zw);
+        unpack4(a, 4, u[1].zw);
+        unpack4(a, 8, u[2].zw);
+        unpack4(a, 12, u[3].zw);
+        op.run(a, b, acc1);
+      }
+    }
+  }
+  // A lane holds 4 consecutive output channels of 4 pixels per position block.
+  const int oc = og - tail + 4 * gl;
+  float4 bv = 0.0f;
+  if (p.has_bias) {
+    device const bfloat* bp = bias + grp * og + oc;
+    bv = float4(float(bp[0]), float(bp[1]), float(bp[2]), float(bp[3]));
+  }
+  device bfloat* y = output +
+      (int64_t(tgid.z) * p.outH + oh) * p.outW * p.C_out + grp * og + oc;
+#pragma unroll
+  for (int f = 0; f < 2; ++f) {
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const ushort i = 4 * h + 8 * f;
+      const int px = x0 + 4 * r + h + 2 * f;
+      if (px < p.outW) {
+        *reinterpret_cast<device bfloat4*>(y + int64_t(px) * p.C_out) = bfloat4(
+            float4(acc0[i], acc0[i + 1], acc0[i + 2], acc0[i + 3]) + bv);
+      }
+      if (px + tile < p.outW) {
+        *reinterpret_cast<device bfloat4*>(y + int64_t(px + tile) * p.C_out) =
+            bfloat4(
+                float4(acc1[i], acc1[i + 1], acc1[i + 2], acc1[i + 3]) + bv);
+      }
+    }
+  }
+}
+
+// OIHW weights of each group -> [group][O_g / 32][kh][C_g /
+// 32][kw][lane][2][16] for conv2d_cooperative_nhwc. Element e of run h of a
+// lane is output channel 8 * group + 4 * (e / 8) + e % 4 and input channel 8 *
+// (k / 4) + 4 * h + k % 4 (k = row + 8 * (e / 4 % 2)) of its 32 x 32 block.
+// With TAIL, the last 16 output channels of each group -> [group][kh][C_g /
+// 32][kw][lane][2][8] for conv2d_cooperative_nhwc_tail: output channel O_g - 16
+// + 4 * group + e % 4 and k = row + 8 * (e / 4).
+template <bool TAIL>
+kernel void conv2d_cooperative_nhwc_weights(
+    device const bfloat* weight [[buffer(0)]],
+    device bfloat* packed [[buffer(1)]],
+    constant int4& dims [[buffer(2)]],
+    uint index [[thread_position_in_grid]]) {
+  using namespace cooperative;
+  const int og = dims.x, cg = dims.y, kH = dims.z, kW = dims.w;
+  constexpr int elements = TAIL ? lane_positions : chunk;
+  const int out_blocks = TAIL ? 1 : og / tile;
+  const int e = index % elements;
+  const int h = index / elements % 2;
+  const ushort lane = index / (2 * elements) % c10::metal::simdgroup_size;
+  int rest = index / (2 * elements * c10::metal::simdgroup_size);
+  const int kw = rest % kW;
+  rest /= kW;
+  const int cb = rest % (cg / tile);
+  rest /= cg / tile;
+  const int kh = rest % kH;
+  rest /= kH;
+  const int ob = rest % out_blocks, grp = rest / out_blocks;
+  const int o = TAIL
+      ? og - tile / 2 + 4 * group(lane) + e % 4
+      : ob * tile + lane_positions * group(lane) + 4 * (e / 8) + e % 4;
+  const int k = row(lane) + 8 * (TAIL ? e / 4 : e / 4 % 2);
+  const int ci = cb * tile + 8 * (k / 4) + 4 * h + k % 4;
+  packed[index] =
+      weight[((int64_t(grp) * og + o) * cg + ci) * kH * kW + kh * kW + kw];
+}
+
+INSTANTIATE_CONV2D(
+    "conv2d_cooperative_nhwc_2x1",
+    conv2d_cooperative_nhwc<2, 1>);
+INSTANTIATE_CONV2D(
+    "conv2d_cooperative_nhwc_2x4",
+    conv2d_cooperative_nhwc<2, 4>);
+INSTANTIATE_CONV2D(
+    "conv2d_cooperative_nhwc_weights",
+    conv2d_cooperative_nhwc_weights<false>);
+INSTANTIATE_CONV2D(
+    "conv2d_cooperative_nhwc_tail_weights",
+    conv2d_cooperative_nhwc_weights<true>);
+
+// bfloat16 1x1 stride-1 convolution of NCHW input on whole 32-channel blocks
+// (Conv2dKernel::PointwiseCooperative), a GEMM per image: TGM x TGN SIMD groups
+// each accumulate 32 output channels x 32 positions from cooperative operands
+// they load themselves. Input channels are renamed within each 32-channel block
+// (logical 16 * c + 4 * group + j at physical 8 * group + 4 * c + j), so a lane
+// reads each of its four weight rows with one 16-byte load per two 16-channel
+// runs; positions are renamed as in conv2d_cooperative, so each input row and
+// each output row of a lane is one 16-byte access. Tiles one position block
+// wide step through the positions first.
+template <int TGM, int TGN>
+[[max_total_threads_per_threadgroup(TGM * TGN * c10::metal::simdgroup_size)]]
+kernel void conv2d_pointwise_cooperative(
+    device const bfloat* input [[buffer(0)]],
+    device const bfloat* weight [[buffer(1)]],
+    device bfloat* output [[buffer(2)]],
+    constant Conv2DParams& p [[buffer(3)]],
+    device const bfloat* bias [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]) {
+  using namespace cooperative;
+  constexpr auto desc = matmul2d_descriptor(
+      tile,
+      tile,
+      chunk,
+      false,
+      false,
+      true,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroup> op;
+  auto a =
+      op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+  auto b =
+      op.template get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+  auto c = op.template get_destination_cooperative_tensor<
+      remove_addrspace_t<decltype(a)>,
+      remove_addrspace_t<decltype(b)>,
+      float>();
+  for (ushort i = 0; i < accumulator_elements; ++i) {
+    c[i] = 0.0f;
+  }
+  const int o0 =
+      int(TGN == 1 ? tgid.y : tgid.x) * (TGM * tile) + int(sg / TGN) * tile;
+  if (o0 >= p.C_out) {
+    return;
+  }
+  const int plane = p.H * p.W;
+  const int r = row(lane);
+  const int px = int(TGN == 1 ? tgid.x : tgid.y) * (TGN * tile) +
+      int(sg % TGN) * tile + lane_positions * group(lane);
+  device const bfloat* w =
+      weight + int64_t(o0 + r) * p.C_in + lane_positions * group(lane);
+  // Logical channel r + 8 * h + 16 * c of a block sits at physical row
+  // 8 * (r / 4) + r % 4 + 16 * h + 4 * c. Position runs past the end load the
+  // last full run and are not stored.
+  device const bfloat* x = input +
+      (int64_t(tgid.z) * p.C_in + 8 * (r / 4) + r % 4) * plane +
+      min(px, plane - lane_positions);
+  for (int c0 = 0; c0 < p.C_in; c0 += 2 * chunk) {
+    const uint4 w0 = *reinterpret_cast<device const uint4*>(w + c0);
+    const uint4 w1 =
+        *reinterpret_cast<device const uint4*>(w + 8 * p.C_in + c0);
+    const uint4 w2 =
+        *reinterpret_cast<device const uint4*>(w + 16 * p.C_in + c0);
+    const uint4 w3 =
+        *reinterpret_cast<device const uint4*>(w + 24 * p.C_in + c0);
+    device const bfloat* xs = x + int64_t(c0) * plane;
+    const uint4 x0 = *reinterpret_cast<device const uint4*>(xs);
+    const uint4 x1 = *reinterpret_cast<device const uint4*>(xs + 16 * plane);
+    const uint4 x2 = *reinterpret_cast<device const uint4*>(xs + 4 * plane);
+    const uint4 x3 = *reinterpret_cast<device const uint4*>(xs + 20 * plane);
+    unpack4(a, 0, w0.xy);
+    unpack4(a, 4, w1.xy);
+    unpack4(a, 8, w2.xy);
+    unpack4(a, 12, w3.xy);
+    unpack4(b, 0, x0.xy);
+    unpack4(b, 8, x0.zw);
+    unpack4(b, 4, x1.xy);
+    unpack4(b, 12, x1.zw);
+    op.run(a, b, c);
+    unpack4(a, 0, w0.zw);
+    unpack4(a, 4, w1.zw);
+    unpack4(a, 8, w2.zw);
+    unpack4(a, 12, w3.zw);
+    unpack4(b, 0, x2.xy);
+    unpack4(b, 8, x2.zw);
+    unpack4(b, 4, x3.xy);
+    unpack4(b, 12, x3.zw);
+    op.run(a, b, c);
+  }
+  if (px >= plane) {
+    return;
+  }
+  device bfloat* y = output + (int64_t(tgid.z) * p.C_out + o0 + r) * plane + px;
+#pragma unroll
+  for (int f = 0; f < 2; ++f) {
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const int m = 16 * f + 8 * h;
+      const float bv = p.has_bias ? float(bias[o0 + r + m]) : 0.0f;
+      const ushort i = 4 * h + 16 * f;
+      const float4 lo = float4(c[i], c[i + 1], c[i + 2], c[i + 3]) + bv;
+      const float4 hi = float4(c[i + 8], c[i + 9], c[i + 10], c[i + 11]) + bv;
+      *reinterpret_cast<device uint4*>(y + m * plane) =
+          uint4(as_type<uint2>(bfloat4(lo)), as_type<uint2>(bfloat4(hi)));
+    }
+  }
+}
+
+#define INSTANTIATE_CONV2D_POINTWISE_COOPERATIVE(TGM, TGN) \
+  INSTANTIATE_CONV2D(                                      \
+      "conv2d_pointwise_cooperative_" #TGM "x" #TGN,       \
+      conv2d_pointwise_cooperative<TGM, TGN>);
+
+INSTANTIATE_CONV2D_POINTWISE_COOPERATIVE(2, 1)
+INSTANTIATE_CONV2D_POINTWISE_COOPERATIVE(2, 4)
+INSTANTIATE_CONV2D_POINTWISE_COOPERATIVE(4, 2)
+INSTANTIATE_CONV2D_POINTWISE_COOPERATIVE(2, 16)
+INSTANTIATE_CONV2D_POINTWISE_COOPERATIVE(4, 8)
+INSTANTIATE_CONV2D_POINTWISE_COOPERATIVE(8, 4)
 
 // Square stride-1 convolution through the MPP convolution2d op
 // (Conv2dKernel::Tensor): NSG SIMD groups compute OUTPUTS channels x ROWS x
@@ -1930,7 +2963,8 @@ template <
     int ROWS,
     int COLUMNS,
     int NSG,
-    int TAPS>
+    int TAPS,
+    bool NCHW = false>
 [[max_total_threads_per_threadgroup(NSG * c10::metal::simdgroup_size)]]
 kernel void conv2d_tensor(
     device T* input [[buffer(0)]],
@@ -1965,10 +2999,13 @@ kernel void conv2d_tensor(
   const int y0 = int(tgid.y) / x_tiles * ROWS;
   const int n = int(tgid.z);
   const int ix = x0 - p.padW, iy = y0 - p.padH;
+  // Experiment: NCHW planes presented to the op as a strided NHWC view.
   tensor4d x(
-      input + int64_t(n) * p.H * p.W * p.C_in + g * cg,
+      input + int64_t(n) * p.H * p.W * p.C_in +
+          (NCHW ? g * cg * p.H * p.W : g * cg),
       extents(cg, p.W, p.H, 1),
-      strides{1, p.C_in, p.C_in * p.W, p.C_in * p.W * p.H});
+      NCHW ? strides{p.H * p.W, 1, p.W, p.C_in * p.W * p.H}
+           : strides{1, p.C_in, p.C_in * p.W, p.C_in * p.W * p.H});
   auto xs = x.slice(0, max(ix, 0), max(iy, 0), 0);
   tensor4d w(
       weight + g * og,
@@ -1991,9 +3028,11 @@ kernel void conv2d_tensor(
     res[i] = T(acc[i] + (p.has_bias ? float(bias[g * og + o]) : 0.0f));
   }
   tensor4d y(
-      output + int64_t(n) * p.outH * p.outW * p.C_out + g * og,
+      output + int64_t(n) * p.outH * p.outW * p.C_out +
+          (NCHW ? g * og * p.outH * p.outW : g * og),
       extents(og, p.outW, p.outH, 1),
-      strides{1, p.C_out, p.C_out * p.outW, p.C_out * p.outW * p.outH});
+      NCHW ? strides{p.outH * p.outW, 1, p.outW, p.C_out * p.outW * p.outH}
+           : strides{1, p.C_out, p.C_out * p.outW, p.C_out * p.outW * p.outH});
   res.store(y.slice(o0, x0, y0, 0));
 }
 
@@ -2043,6 +3082,28 @@ kernel void conv2d_tensor(
 
 INSTANTIATE_CONV2D_TENSOR_ALL(half)
 INSTANTIATE_CONV2D_TENSOR_ALL(bfloat)
+INSTANTIATE_CONV2D(
+    "conv2d_tensor_wide_nchw_bfloat",
+    conv2d_tensor<
+        bfloat,
+        0,
+        kConv2dTensorWideOutputs,
+        kConv2dTensorWideSide,
+        kConv2dTensorWideSide,
+        kConv2dTensorWideSimdgroups,
+        3,
+        true>);
+INSTANTIATE_CONV2D(
+    "conv2d_tensor_nchw_bfloat",
+    conv2d_tensor<
+        bfloat,
+        0,
+        kConv2dTensorOutputs,
+        kConv2dTensorRows,
+        kConv2dTensorColumns,
+        kConv2dTensorSimdgroups,
+        3,
+        true>);
 
 template <typename T>
 struct Conv2dPatchWindow {
@@ -3187,6 +4248,119 @@ INSTANTIATE_CONV2D_O1_ALL(bfloat)
 INSTANTIATE_CONV2D_O1(float, 3, 2, 1, 1)
 INSTANTIATE_CONV2D_O1(bfloat, 1, 1, 1, 16)
 INSTANTIATE_CONV2D_O1(bfloat, 3, 1, 1, 16)
+
+// Experiment (Conv2dKernel::Mpp fixed 3x3, window-staged): a threadgroup stages
+// CC input channels of the (BN + 2) x 3 window of its output row in threadgroup
+// memory once, with 16-byte loads and zero fill at the image border, and runs
+// the nine tap products of a BM x BN tile with matmul2d on threadgroup views of
+// that window. Device traffic per tile drops from nine input reads to one.
+template <typename T, int BM, int BN, int NSG, int CC>
+[[max_total_threads_per_threadgroup(NSG * c10::metal::simdgroup_size)]]
+kernel void conv2d_mpp_window(
+    device T* input [[buffer(0)]],
+    device T* weight [[buffer(1)]],
+    device T* output [[buffer(2)]],
+    constant Conv2dMppParams& geometry [[buffer(3)]],
+    device const T* bias [[buffer(4)]],
+    device float* partial [[buffer(5)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+  constexpr int taps = 3, pad = 1, cols = BN + 2,
+                threads = NSG * c10::metal::simdgroup_size;
+  constexpr int vec = 8;
+  using P8 = packed_vec<T, vec>;
+  constant Conv2DParams& p = geometry.conv;
+  threadgroup T stage[CC * taps * cols];
+  using extents = dextents<int32_t, 2>;
+  using strides = array<int32_t, 2>;
+  using tensor2d = tensor<device T, extents, tensor_inline>;
+  using shared2d = tensor<threadgroup T, extents, tensor_inline>;
+  constexpr auto desc = matmul2d_descriptor(
+      BM,
+      BN,
+      static_cast<int>(dynamic_extent),
+      false,
+      false,
+      !is_same_v<T, float>,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroups<NSG>> op;
+  const int o_off = int(tgid.x) * BM;
+  const int w_tiles = c10::metal::ceil_div(p.outW, BN);
+  const int oh = int(tgid.y) / w_tiles, x_off = int(tgid.y) % w_tiles * BN;
+  const int nb = int(tgid.z);
+  const int plane = p.H * p.W;
+  device T* in = input + int64_t(nb) * p.C_in * plane;
+  auto acc = op.template get_destination_cooperative_tensor<
+      tensor2d,
+      shared2d,
+      float>();
+  for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+    acc[i] = 0.0f;
+  }
+  for (int c0 = 0; c0 < p.C_in; c0 += CC) {
+    const int K = min(CC, p.C_in - c0);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Each thread fills whole window rows: (channel, kh) pairs.
+    for (int row = int(tid); row < K * taps; row += threads) {
+      const int c = row / taps, kh = row % taps;
+      const int ih = oh + kh - pad;
+      threadgroup T* dst = stage + (c * taps + kh) * cols;
+      if (ih < 0 || ih >= p.H) {
+        for (int j = 0; j < cols; ++j) {
+          dst[j] = T(0);
+        }
+        continue;
+      }
+      device const T* src = in + int64_t(c0 + c) * plane + int64_t(ih) * p.W;
+      const int iw0 = x_off - pad;
+      dst[0] = iw0 >= 0 ? src[iw0] : T(0);
+      int j = 1;
+      for (; j + vec <= cols - 1 && iw0 + j + vec <= p.W; j += vec) {
+        *reinterpret_cast<threadgroup P8*>(dst + j) =
+            *reinterpret_cast<device const P8*>(src + iw0 + j);
+      }
+      for (; j < cols; ++j) {
+        const int iw = iw0 + j;
+        dst[j] = iw < p.W ? src[iw] : T(0);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int kh = 0; kh < taps; ++kh) {
+      for (int kw = 0; kw < taps; ++kw) {
+        shared2d xt(
+            stage + kh * cols + kw, extents(BN, K), strides{1, taps * cols});
+        tensor2d wt(
+            weight + (int64_t(kh * taps + kw) * p.C_out) * p.C_in + c0,
+            extents(K, p.C_out),
+            strides{1, p.C_in});
+        auto w_tile = wt.slice(0, o_off);
+        op.run(w_tile, xt, acc);
+      }
+    }
+  }
+  auto res =
+      op.template get_destination_cooperative_tensor<tensor2d, shared2d, T>();
+  for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+    const int o =
+        min(o_off + int(acc.get_multidimensional_index(i)[1]), p.C_out - 1);
+    res[i] = T(acc[i] + (p.has_bias ? float(bias[o]) : 0.0f));
+  }
+  tensor2d out(
+      output + (int64_t(nb) * p.C_out * p.outH + oh) * p.outW,
+      extents(p.outW, p.C_out),
+      strides{1, p.outH * p.outW});
+  res.store(out.slice(x_off, o_off));
+}
+
+INSTANTIATE_CONV2D(
+    "conv2d_mpp_window_b64x64_s2_c64_bfloat",
+    conv2d_mpp_window<bfloat, 64, 64, 2, 64>);
+INSTANTIATE_CONV2D(
+    "conv2d_mpp_window_b64x64_s2_c32_bfloat",
+    conv2d_mpp_window<bfloat, 64, 64, 2, 32>);
+INSTANTIATE_CONV2D(
+    "conv2d_mpp_window_b64x64_s4_c64_bfloat",
+    conv2d_mpp_window<bfloat, 64, 64, 4, 64>);
 
 // Sums the float32 split-K partials of conv2d_mpp and adds bias.
 template <typename T>

@@ -1253,6 +1253,208 @@ class TestConvolutionNNDevice(NNTestCase):
     @dtypes(torch.bfloat16)
     @disablecuDNN
     @disableMkldnn
+    @parametrize_test("shape", [(1, 32, 32, 5, 128), (1, 64, 96, 3, 256)])
+    @parametrize_test("offset", [0, 1])
+    @parametrize_test("operand", ["none", "input", "weight", "bias"])
+    @parametrize_test("value", [float("nan"), float("inf")])
+    def test_conv2d_whole_channel_blocks(
+        self, device, dtype, shape, offset, operand, value
+    ):
+        # 32-channel blocks and rows of whole 128-position groups take the MPS
+        # cooperative kernel, whose padding rows must still multiply the
+        # weights; an odd input offset takes its word-load variant. Small
+        # integers keep every product and sum exact.
+        batch, channels, outputs, height, width = shape
+        x = torch.arange(batch * channels * height * width) % 5 - 2
+        x = x.reshape(batch, channels, height, width).to(dtype) / 4
+        weight = torch.arange(outputs * channels * 9) % 5 - 2
+        weight = weight.reshape(outputs, channels, 3, 3).to(dtype) / 16
+        bias = torch.arange(outputs).remainder(3).to(dtype) / 8
+        if operand != "none":
+            target = {"input": x, "weight": weight, "bias": bias}[operand].view(-1)
+            target[0] = target[-1] = value
+        expected = torch.ops.aten._slow_conv2d_forward(
+            x.double(), weight.double(), [3, 3], bias.double(), [1, 1], [1, 1]
+        ).to(dtype)
+        storage = torch.empty(x.numel() + offset, dtype=dtype, device=device)
+        x_device = storage[offset:].view_as(x).copy_(x)
+        actual = F.conv2d(x_device, weight.to(device), bias.to(device), padding=1)
+        self._assert_nonfinite_equal(actual.cpu(), expected)
+
+    @dtypes(torch.bfloat16)
+    @disablecuDNN
+    @disableMkldnn
+    @parametrize_test(
+        "shape",
+        [
+            (2, 32, 32, 33, 40, 3),
+            (1, 16, 64, 64, 56, 3),
+            (1, 176, 64, 16, 128, 3),
+            (3, 64, 96, 24, 32, 3),
+            (1, 64, 64, 40, 64, 1),
+            (1, 32, 32, 9, 512, 1),
+        ],
+    )
+    @parametrize_test("operand", ["none", "input", "weight", "bias"])
+    @parametrize_test("value", [float("nan"), float("inf")])
+    def test_conv2d_flat_channel_blocks(self, device, dtype, shape, operand, value):
+        # 3x3 and 1x3 products on 16-channel steps that the MPS cooperative row
+        # tiles do not take (narrow rows, batches, 16 or 176 input channels,
+        # single tap rows) run on its flat tiles, including a partial last
+        # position tile. Small integers keep every product and sum exact.
+        batch, channels, outputs, height, width, kernel_height = shape
+        x = torch.arange(batch * channels * height * width) % 5 - 2
+        x = x.reshape(batch, channels, height, width).to(dtype) / 4
+        weight = torch.arange(outputs * channels * kernel_height * 3) % 5 - 2
+        weight = weight.reshape(outputs, channels, kernel_height, 3).to(dtype) / 16
+        bias = torch.arange(outputs).remainder(3).to(dtype) / 8
+        if operand != "none":
+            target = {"input": x, "weight": weight, "bias": bias}[operand].view(-1)
+            target[0] = target[-1] = value
+        padding = [kernel_height // 2, 1]
+        expected = torch.ops.aten._slow_conv2d_forward(
+            x.double(),
+            weight.double(),
+            [kernel_height, 3],
+            bias.double(),
+            [1, 1],
+            padding,
+        ).to(dtype)
+        actual = F.conv2d(
+            x.to(device), weight.to(device), bias.to(device), padding=padding
+        )
+        self._assert_nonfinite_equal(actual.cpu(), expected)
+
+    @dtypes(torch.bfloat16)
+    @disablecuDNN
+    @disableMkldnn
+    @parametrize_test(
+        "shape",
+        [
+            (1, 32, 64, 128, 128, 1),
+            (1, 48, 96, 130, 136, 1),
+            (1, 32, 64, 129, 136, 0),
+            (1, 32, 64, 129, 129, 0),
+            (1, 32, 32, 129, 129, 0),
+            (1, 32, 64, 128, 127, 1),
+            (1, 16, 64, 128, 134, 1),
+            (2, 160, 64, 128, 128, 1),
+        ],
+    )
+    @parametrize_test("operand", ["none", "input", "weight", "bias"])
+    @parametrize_test("value", [float("nan"), float("inf")])
+    def test_conv2d_stride2_channel_blocks(self, device, dtype, shape, operand, value):
+        # Stride-2 3x3 products on 16-channel blocks take the MPS cooperative
+        # stride-2 kernel: 16-byte and word row loads (aligned and odd widths),
+        # both paddings, both tiles and a deeper batched input. Small integers
+        # keep every product and sum exact.
+        batch, channels, outputs, height, width, padding = shape
+        x = torch.arange(batch * channels * height * width) % 5 - 2
+        x = x.reshape(batch, channels, height, width).to(dtype) / 4
+        weight = torch.arange(outputs * channels * 9) % 5 - 2
+        weight = weight.reshape(outputs, channels, 3, 3).to(dtype) / 16
+        bias = torch.arange(outputs).remainder(3).to(dtype) / 8
+        if operand != "none":
+            target = {"input": x, "weight": weight, "bias": bias}[operand].view(-1)
+            target[0] = target[-1] = value
+        expected = torch.ops.aten._slow_conv2d_forward(
+            x.double(), weight.double(), [3, 3], bias.double(), [2, 2], [padding] * 2
+        ).to(dtype)
+        actual = F.conv2d(
+            x.to(device), weight.to(device), bias.to(device), stride=2, padding=padding
+        )
+        self._assert_nonfinite_equal(actual.cpu(), expected)
+
+    @dtypes(torch.bfloat16)
+    @disablecuDNN
+    @disableMkldnn
+    @parametrize_test(
+        "shape",
+        [
+            (1, 512, 160, 6, 40, 5, 2),
+            (1, 512, 64, 5, 24, 7, 2),
+            (1, 512, 32, 4, 70, 5, 2),
+            (4, 128, 128, 5, 40, 7, 2),
+            (4, 256, 384, 3, 33, 7, 4),
+        ],
+    )
+    @parametrize_test("operand", ["none", "input", "weight", "bias"])
+    @parametrize_test("value", [float("nan"), float("inf")])
+    def test_conv2d_grouped_channels_last_blocks(
+        self, device, dtype, shape, operand, value
+    ):
+        # Grouped channels-last 5x5 / 7x7 products on 32-channel input blocks
+        # take the MPS cooperative NHWC kernels: 256-channel groups with 80
+        # outputs (two 32-channel blocks and a 16-channel tail), 32 or 16
+        # outputs, batches of 64-channel groups, partial position tiles. Small
+        # integers keep every product and sum exact.
+        batch, channels, outputs, height, width, kernel, groups = shape
+        x = torch.arange(batch * channels * height * width) % 5 - 2
+        x = x.reshape(batch, channels, height, width).to(dtype) / 4
+        weight = torch.arange(outputs * channels // groups * kernel * kernel) % 5 - 2
+        weight = weight.reshape(outputs, channels // groups, kernel, kernel)
+        weight = weight.to(dtype) / 16
+        bias = torch.arange(outputs).remainder(3).to(dtype) / 8
+        if operand != "none":
+            target = {"input": x, "weight": weight, "bias": bias}[operand].view(-1)
+            target[0] = target[-1] = value
+        padding = kernel // 2
+        expected = F.conv2d(
+            x.double(), weight.double(), bias.double(), padding=padding, groups=groups
+        ).to(dtype)
+        actual = F.conv2d(
+            x.to(device, memory_format=torch.channels_last),
+            weight.to(device),
+            bias.to(device),
+            padding=padding,
+            groups=groups,
+        )
+        self.assertTrue(actual.is_contiguous(memory_format=torch.channels_last))
+        self._assert_nonfinite_equal(actual.cpu(), expected)
+
+    @dtypes(torch.bfloat16)
+    @disablecuDNN
+    @disableMkldnn
+    @parametrize_test(
+        "shape",
+        [
+            (1, 64, 64, 100, 164),
+            (1, 64, 128, 128, 130),
+            (1, 256, 128, 256, 264),
+            (1, 256, 256, 127, 264),
+            (2, 512, 64, 10, 20),
+            (2, 320, 320, 20, 30),
+            (1, 320, 352, 8, 16),
+            (2, 960, 640, 8, 12),
+        ],
+    )
+    @parametrize_test("operand", ["none", "input", "weight", "bias"])
+    @parametrize_test("value", [float("nan"), float("inf")])
+    def test_conv2d_pointwise_channel_blocks(
+        self, device, dtype, shape, operand, value
+    ):
+        # 1x1 products on 32-channel blocks take the MPS cooperative pointwise
+        # kernel: every output channel per threadgroup, batched, and
+        # 64-channel tiles with partial channel and position tiles. Small
+        # integers keep every product and sum exact.
+        batch, channels, outputs, height, width = shape
+        x = torch.arange(batch * channels * height * width) % 5 - 2
+        x = x.reshape(batch, channels, height, width).to(dtype) / 4
+        weight = torch.arange(outputs * channels) % 5 - 2
+        weight = weight.reshape(outputs, channels, 1, 1).to(dtype) / 16
+        bias = torch.arange(outputs).remainder(3).to(dtype) / 8
+        if operand != "none":
+            target = {"input": x, "weight": weight, "bias": bias}[operand].view(-1)
+            target[0] = target[-1] = value
+        expected = torch.ops.aten._slow_conv2d_forward(
+            x.double(), weight.double(), [1, 1], bias.double(), [1, 1], [0, 0]
+        ).to(dtype)
+        actual = F.conv2d(x.to(device), weight.to(device), bias.to(device))
+        self._assert_nonfinite_equal(actual.cpu(), expected)
+
+    @dtypes(torch.bfloat16)
+    @disablecuDNN
+    @disableMkldnn
     @parametrize_test(
         "pattern",
         [

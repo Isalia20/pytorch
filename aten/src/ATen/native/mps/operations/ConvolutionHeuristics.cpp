@@ -1,6 +1,7 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
 #include <ATen/mps/MPSDevice.h>
 #include <ATen/native/mps/operations/ConvolutionHeuristics.h>
+#include <cstdlib>
 #include <c10/metal/common.h>
 
 #include <algorithm>
@@ -201,6 +202,11 @@ Conv2dPlan select_conv2d_winograd(const Conv2DParams& p, bool in_nhwc, const Con
 
 namespace {
 
+int64_t conv2d_env(const char* name, int64_t fallback) {
+  const char* value = std::getenv(name);
+  return value ? std::strtoll(value, nullptr, 10) : fallback;
+}
+
 using Wino = Conv2dTuning::Winograd;
 using HalfWino = Conv2dTuning::HalfWinograd;
 using O1 = Conv2dTuning::SingleOutput;
@@ -210,6 +216,8 @@ using S2 = Conv2dTuning::Stride2;
 using Copy = Conv2dTuning::Materialization;
 using Pointwise = Conv2dTuning::Pointwise;
 using Fixed3 = Conv2dTuning::Fixed3x3;
+using Coop = Conv2dTuning::Cooperative;
+using CoopPointwise = Conv2dTuning::PointwiseCooperative;
 using c10::metal::ceil_div;
 constexpr int64_t kInt32Max = std::numeric_limits<int32_t>::max();
 constexpr int64_t kTile = kConv2dRowTile;
@@ -254,6 +262,8 @@ struct Conv2dSelector {
         bfloat_nchw(bfloat_simd && groups == 1 && !in_nhwc && !out_nhwc),
         even_offset(input.storage_offset() % 2 == 0),
         even_output_offset(output.storage_offset() % 2 == 0),
+        input_offset_aligned(input.storage_offset() % 8 == 0),
+        output_offset_aligned(output.storage_offset() % 8 == 0),
         s1(p.sH == 1 && p.sW == 1),
         stride2(p.sH == 2 && p.sW == 2),
         strided(p.sH > 1 || p.sW > 1),
@@ -273,6 +283,8 @@ struct Conv2dSelector {
   const bool apple10, in_nhwc, out_nhwc, fp32, half, bf16, bfloat_simd, bfloat_nchw;
   // Packed two-element loads and stores.
   const bool even_offset, even_output_offset;
+  // 16-byte loads and stores of whole bfloat16 lanes.
+  const bool input_offset_aligned, output_offset_aligned;
   const bool s1, stride2, strided, d1, p1, p0, k3, pointwise, patch_embed, packed3;
 
   bool heavy_pointwise() const {
@@ -337,6 +349,17 @@ struct Conv2dSelector {
     const bool stem = in_nhwc && dense3 && Cg <= kConv2dTensorStemChannels;
     const bool tiles = dense3 ? Og >= kConv2dTensorOutputs
                               : Og % kConv2dTensorOutputs == 0 && Cg > kConv2dTensorStemChannels;
+    // Experiment hook: CONV2D_TENSOR_NCHW=1 runs the MPP op on NCHW planes through a strided view
+    // (plan.flat marks it for the host).
+    const bool nchw_op = conv2d_env("CONV2D_TENSOR_NCHW", 0) && apple10 && bf16 && dense3 && s1 && d1 &&
+        !in_nhwc && !out_nhwc && Og >= kConv2dTensorOutputs;
+    if (nchw_op) {
+      const bool wide_nchw = Og % kConv2dTensorWideOutputs == 0 && conv2d_env("CONV2D_TENSOR_WIDE", 1);
+      return Conv2dPlan{.kernel = Conv2dKernel::Tensor,
+                        .rows = wide_nchw ? kConv2dTensorWideOutputs : kConv2dTensorOutputs,
+                        .simdgroups = wide_nchw ? kConv2dTensorWideSimdgroups : kConv2dTensorSimdgroups,
+                        .flat = true};
+    }
     if (!(apple10 || stem) || fp32 || !(k3 || k5) || !s1 || !d1 || !out_nhwc || !tiles || copied) {
       return std::nullopt;
     }
@@ -347,6 +370,122 @@ struct Conv2dSelector {
     return Conv2dPlan{.kernel = Conv2dKernel::Tensor,
                       .rows = wide ? kConv2dTensorWideOutputs : kConv2dTensorOutputs,
                       .simdgroups = wide ? kConv2dTensorWideSimdgroups : kConv2dTensorSimdgroups};
+  }
+
+  // conv2d_cooperative: Apple10 bfloat16 NCHW products on 16-channel steps with
+  // both matmul2d operands in cooperative registers. Single images whose rows
+  // fill whole 128-position threadgroups take row tiles of whole 32-channel
+  // blocks; narrower rows, batches, 16-channel steps and 1x3 kernels take flat
+  // tiles, which are 0.3-0.5% slower on whole rows. Stride-2 products take
+  // 64-channel tiles of one 32-position block, or of two for shallow inputs on
+  // rows of whole 64-position blocks.
+  std::optional<Conv2dPlan> select_cooperative() const {
+    constexpr int64_t block = kConv2dCooperativeTile;
+    if (stride2) {
+      const bool shallow = Cg <= Coop::stride2_shallow_inputs && positions >= Coop::stride2_min_positions;
+      const bool deep =
+          Cg <= Coop::stride2_max_inputs && N * positions >= Coop::stride2_deep_min_positions && outW % block == 0;
+      // Experiment hook: CONV2D_COOP_S2=0 disables the stride-2 route.
+      if (!conv2d_env("CONV2D_COOP_S2", 1) || !(apple10 && bfloat_nchw && k3 && d1 && p.padH == p.padW && p.padH <= 1) ||
+          !input_offset_aligned || !output_offset_aligned || Cg % kConv2dCooperativeChunk != 0 || Og % block != 0 ||
+          !(shallow || deep)) {
+        return std::nullopt;
+      }
+      const bool wide = Cg <= Coop::stride2_shallow_inputs && outW % (2 * block) == 0 && Og % (2 * block) == 0;
+      return Conv2dPlan{.kernel = Conv2dKernel::Cooperative,
+                        .rows = 2 * block,
+                        .columns = (wide ? 2 : 1) * block,
+                        .simdgroups = wide ? 4 : 2};
+    }
+    // Odd input offsets read the rows with word loads.
+    const bool whole_rows = W % (block * kConv2dCooperativeSimdgroups) == 0 &&
+        (input_offset_aligned || !even_offset) && output_offset_aligned;
+    const bool whole_blocks =
+        Coop::inputs.contains(Cg) && Coop::outputs.contains(Og) && Cg % block == 0 && Og % block == 0;
+    // Experiment hook: CONV2D_COOP=0 disables the route, CONV2D_COOP_ROWS=64 picks the 2x4 grid.
+    if (!conv2d_env("CONV2D_COOP", 1) || !(apple10 && bfloat_nchw && kW == 3 && s1 && d1 && p.padW == 1)) {
+      return std::nullopt;
+    }
+    if (k3 && p1 && N == 1 && whole_rows && whole_blocks) {
+      const int64_t outputs = input_offset_aligned ? conv2d_env("CONV2D_COOP_ROWS", block) : block;
+      return Conv2dPlan{.kernel = Conv2dKernel::Cooperative,
+                        .rows = outputs,
+                        .columns = block * kConv2dCooperativeSimdgroups,
+                        .simdgroups = kConv2dCooperativeSimdgroups * outputs / block};
+    }
+    // Flat tiles of one 32-channel block and two position blocks; a lane's 8
+    // positions stay within a row of a width that is a multiple of 8.
+    const bool flat_inputs = Cg <= Coop::inputs.last ||
+        (Cg <= Coop::flat_deep_inputs && Og <= Coop::flat_deep_max_outputs);
+    const bool flat = (kH == 3 || kH == 1) && p.padH == kH / 2 && W % 8 == 0 &&
+        N * plane >= Coop::flat_min_positions && input_offset_aligned && output_offset_aligned &&
+        Cg % kConv2dCooperativeChunk == 0 && Og % block == 0 && Og <= Coop::flat_max_outputs && flat_inputs;
+    // Experiment hook: CONV2D_COOP_FLAT=0 disables the flat tiles.
+    if (!flat || !conv2d_env("CONV2D_COOP_FLAT", 1)) {
+      return std::nullopt;
+    }
+    return Conv2dPlan{
+        .kernel = Conv2dKernel::Cooperative, .rows = block, .columns = 2 * block, .simdgroups = 2, .flat = true};
+  }
+
+  // conv2d_cooperative_nhwc: Apple10 grouped 5x5 / 7x7 bfloat16 products from
+  // channels-last input into channels-last output on whole 32-channel input
+  // blocks and 16-channel output blocks; batches take tiles of one 32-channel
+  // output block, single images of four.
+  std::optional<Conv2dPlan> select_cooperative_nhwc() const {
+    constexpr int64_t block = kConv2dCooperativeTile;
+    const bool shape = groups > 1 && kH == kW && (kH == 5 || kH == 7) && p.padH == kH / 2 && p.padW == kW / 2 &&
+        Cg % block == 0 && Og % (block / 2) == 0;
+    const bool wins = Cg >= Coop::nhwc_deep_inputs || (N >= Coop::nhwc_min_batch && kH == 7 && Og % block == 0);
+    // Experiment hook: CONV2D_NHWC_COOP=0 disables the route.
+    if (!conv2d_env("CONV2D_NHWC_COOP", 1) || !(apple10 && bf16 && in_nhwc && out_nhwc && s1 && d1 && shape && wins) ||
+        !input_offset_aligned || !output_offset_aligned) {
+      return std::nullopt;
+    }
+    const int64_t channel_blocks = N >= Coop::nhwc_min_batch ? 1 : 4;
+    return Conv2dPlan{.kernel = Conv2dKernel::CooperativeNhwc,
+                      .rows = channel_blocks * block,
+                      .columns = 2 * block,
+                      .simdgroups = 2 * channel_blocks};
+  }
+
+  // conv2d_pointwise_cooperative: Apple10 bfloat16 NCHW 1x1 products on whole
+  // 32-channel blocks with 8-position runs. Up to 256 outputs one threadgroup
+  // computes every output channel of its positions, with 8 SIMD groups for
+  // shallow inputs and 32 for deep ones; 320-640 outputs take 64-channel tiles
+  // one position block wide. Shallow inputs with 256 outputs keep the pointwise
+  // tiles (N32 C64 56x56 ran at 0.80x of them).
+  std::optional<Conv2dPlan> select_pointwise_cooperative() const {
+    constexpr int64_t block = kConv2dCooperativeTile;
+    const bool blocks = Cg % block == 0 && Og % block == 0 && plane % 8 == 0 && plane * block <= kInt32Max &&
+        input_offset_aligned && output_offset_aligned;
+    // Experiment hook: CONV2D_PW_COOP=0 disables the route.
+    if (!conv2d_env("CONV2D_PW_COOP", 1) || !(apple10 && bfloat_nchw && pointwise && s1 && blocks)) {
+      return std::nullopt;
+    }
+    const bool shallow = Cg == CoopPointwise::shallow_inputs && Og <= CoopPointwise::shallow_max_outputs &&
+        N * plane >= CoopPointwise::shallow_min_positions;
+    const bool wide = Cg >= CoopPointwise::wide_min_inputs && (Og == 4 * block || Og == 8 * block) &&
+        (plane >= CoopPointwise::wide_min_positions ||
+         (Og == 8 * block && plane >= CoopPointwise::wide_tall_min_positions));
+    const bool batched = Cg >= CoopPointwise::batched_min_inputs && Og == 2 * block && N > 1;
+    const bool all_outputs = Og == 2 * block || Og == 4 * block || Og == 8 * block;
+    if (all_outputs && (shallow || wide || batched)) {
+      const int64_t simdgroups = shallow ? 8 : 32;
+      return Conv2dPlan{.kernel = Conv2dKernel::PointwiseCooperative,
+                        .rows = Og,
+                        .columns = block * simdgroups / (Og / block),
+                        .simdgroups = simdgroups};
+    }
+    const bool mid = CoopPointwise::mid_outputs.contains(Og) && Cg >= CoopPointwise::mid_min_inputs &&
+        plane <= CoopPointwise::mid_max_positions;
+    const bool deep = Og == CoopPointwise::deep_outputs && Cg >= CoopPointwise::deep_min_inputs &&
+        (N > 1 || plane >= CoopPointwise::deep_min_positions);
+    if (mid || deep) {
+      return Conv2dPlan{
+          .kernel = Conv2dKernel::PointwiseCooperative, .rows = 2 * block, .columns = block, .simdgroups = 2};
+    }
+    return std::nullopt;
   }
 
   // conv2d_tiny: direct stems with a few input channels.
@@ -396,7 +535,7 @@ struct Conv2dSelector {
          (!apple10 && C_in <= Wino::tall_max_inputs && C_out == Wino::tall_wide_outputs &&
           plane >= Wino::tall_min_wide_positions) ||
          (apple10 && Wino::tall_large_outputs.contains(C_out) && plane >= tall_large_positions &&
-          !(deep_fixed3() && C_out <= Fixed3::max_tall_outputs)));
+          !(deep_fixed3() && C_out <= conv2d_env("CONV2D_FIXED3_MAX_TALL_OUTPUTS", Fixed3::max_tall_outputs))));
     const bool wino4x2 = bfloat_nchw && C_in >= Wino::tall_channels &&
         (single_tall ||
          (N >= Wino::tall_min_batch && C_out >= tuning.batched_winograd_min_output_channels &&
@@ -413,6 +552,9 @@ struct Conv2dSelector {
     // NCHW single outputs keep the direct O1 kernels.
     const bool fused_winograd = winograd_shape && Cg >= Wino::fused_min_inputs && full_chunks && !starved &&
         (!bf16 || bfloat_simd) && (Og > 1 || in_nhwc || out_nhwc);
+    if (conv2d_env("CONV2D_FORCE_WINO2X2", 0) && winograd_shape && bfloat_nchw && N == 1) {
+      return Conv2dPlan{Conv2dKernel::Winograd2x2};
+    }
     if (apple10) {
       // Apple10 runs low-precision direct products on the matrix hardware, but
       // not float32 ones: fused F(2x2) wins up to the separate-transform crossover.
@@ -598,6 +740,12 @@ struct Conv2dSelector {
         ((Cg == 16 && Og >= Patch::stride1_min_outputs && W % 8 == 0 && even_offset) || patch_flat ||
          patch_flat64) &&
         C_in * plane <= kInt32Max && C_out * positions <= kInt32Max;
+    // Experiment hook: CONV2D_FORCE_PATCH=<rows> stages any 3x3 stride-1 bf16 NCHW product with
+    // whole 32-channel chunks on the flat patch tile of that many rows.
+    if (const auto forced_rows = conv2d_env("CONV2D_FORCE_PATCH", 0);
+        forced_rows && packed3 && !strided && bfloat_nchw && Cg % kConv2dNarrowTile == 0 && W % 2 == 0 && even_offset) {
+      return Conv2dPlan{.kernel = Conv2dKernel::Patch, .rows = forced_rows, .columns = kConv2dNarrowTile, .simdgroups = 4, .flat = true};
+    }
     const bool patch_s2 = packed3 && stride2 &&
         ((Patch::stride2_small_inputs.contains(Cg) && Patch::stride2_small_outputs.contains(Og)) ||
          (Cg >= Patch::stride2_min_large_inputs && Patch::large_outputs.contains(Og) &&
@@ -777,6 +925,13 @@ struct Conv2dSelector {
       plan.rows = c10::metal::round_up(Og, wide_rows) < c10::metal::round_up(Og, kTile) ? wide_rows : kTile;
       plan.columns = kTile;
       plan.simdgroups = plan.rows == wide_rows ? 4 : 2;
+      if (const auto rows = conv2d_env("CONV2D_FIXED3_ROWS", 0)) {
+        plan.rows = rows;
+        plan.simdgroups = conv2d_env("CONV2D_FIXED3_SG", rows == kTile ? 2 : 4);
+      }
+      if (const auto cols = conv2d_env("CONV2D_FIXED3_COLS", 0)) {
+        plan.columns = cols;
+      }
     }
     return plan;
   }
@@ -793,6 +948,9 @@ Conv2dPlan select_conv2d_kernel(const Conv2DParams& p,
                                 const Conv2dDevice& dev) {
   const Conv2dSelector selector(p, input, output, groups, dev);
   for (const auto select : {&Conv2dSelector::select_tensor,
+                            &Conv2dSelector::select_cooperative,
+                            &Conv2dSelector::select_cooperative_nhwc,
+                            &Conv2dSelector::select_pointwise_cooperative,
                             &Conv2dSelector::select_tiny,
                             &Conv2dSelector::select_winograd,
                             &Conv2dSelector::select_single_output,

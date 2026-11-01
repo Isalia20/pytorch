@@ -77,6 +77,18 @@ enum class Conv2dKernel {
   // conv2d_tensor: 3x3 stride-1 half/bfloat16 products through the MPP
   // convolution2d op, from NHWC input into NHWC output.
   Tensor,
+  // conv2d_cooperative: 3x3 bfloat16 NCHW products on 16-channel steps, with
+  // both matmul2d operands loaded into cooperative registers: row tiles,
+  // flat tiles (conv2d_cooperative_flat, also 1x3) and stride 2
+  // (conv2d_cooperative_s2).
+  Cooperative,
+  // conv2d_pointwise_cooperative: 1x1 stride-1 bfloat16 NCHW products on
+  // 32-channel blocks, with cooperative operands as in conv2d_cooperative.
+  PointwiseCooperative,
+  // conv2d_cooperative_nhwc: grouped 5x5 / 7x7 stride-1 bfloat16 products
+  // from channels-last input into channels-last output on 32-channel input
+  // blocks, with cooperative operands.
+  CooperativeNhwc,
 };
 
 // Input preparation for conv2d_mpp.
@@ -333,6 +345,57 @@ struct Conv2dTuning {
   // elements the copy outweighs the op's gain over the direct kernels.
   static constexpr int64_t tensor_max_copied_inputs = int64_t(1) << 22;
 
+  // conv2d_cooperative runs direct products at the matrix-unit rate; deeper
+  // inputs keep Winograd's fewer multiplies (C320-C1280 maps run at 0.2-0.8x of
+  // the Winograd routes, C256 ties), and wider outputs were not measured.
+  struct Cooperative {
+    static constexpr Range inputs{32, 128};
+    static constexpr Range outputs{32, 256};
+    // Stride 2 has no Winograd competitor; up to 128 input channels it wins
+    // from 64x64 outputs, deeper inputs up to 384 channels from 8192 outputs in
+    // whole 32-position row blocks. Smaller grids or deeper inputs keep the
+    // split-K MPP and stride-2 tiles (C512+ ran at 0.2-0.9x of them).
+    static constexpr int64_t stride2_shallow_inputs = 128;
+    static constexpr int64_t stride2_min_positions = 4096;
+    static constexpr int64_t stride2_max_inputs = 384;
+    static constexpr int64_t stride2_deep_min_positions = 8192;
+    // Flat tiles (rows narrower than a threadgroup, batches, 16-channel steps
+    // and single tap rows) win from 2048 positions; 176 inputs were measured
+    // only with 64 outputs.
+    static constexpr int64_t flat_min_positions = 2048;
+    static constexpr int64_t flat_max_outputs = 512;
+    static constexpr int64_t flat_deep_inputs = 176;
+    static constexpr int64_t flat_deep_max_outputs = 64;
+    // Grouped channels-last 5x5 / 7x7 products win on 256-channel groups and
+    // on batches of 7x7 products over 64-channel groups in whole 32-channel
+    // output blocks; single images and 5x5 kernels over 64-channel groups keep
+    // the MPP and Tensor routes.
+    static constexpr int64_t nhwc_deep_inputs = 256;
+    static constexpr int64_t nhwc_min_batch = 4;
+  };
+
+  // conv2d_pointwise_cooperative wins over the pointwise tiles where one
+  // threadgroup holds every output channel, so each input element is read
+  // once (shallow inputs, deep inputs on large maps, batched 64-output
+  // products), and on 320-384 outputs over compact maps or 640 outputs over
+  // deep batches and large maps, whose 64-channel tiles step through the
+  // positions first. Elsewhere the pointwise tiles were as fast or faster.
+  struct PointwiseCooperative {
+    static constexpr int64_t shallow_inputs = 64;
+    static constexpr int64_t shallow_max_outputs = 128;
+    static constexpr int64_t shallow_min_positions = 16384;
+    static constexpr int64_t wide_min_inputs = 256;
+    static constexpr int64_t wide_min_positions = 65536;
+    static constexpr int64_t wide_tall_min_positions = 32768;
+    static constexpr int64_t batched_min_inputs = 512;
+    static constexpr Range mid_outputs{320, 384};
+    static constexpr int64_t mid_min_inputs = 320;
+    static constexpr int64_t mid_max_positions = 16384;
+    static constexpr int64_t deep_outputs = 640;
+    static constexpr int64_t deep_min_inputs = 960;
+    static constexpr int64_t deep_min_positions = 65536;
+  };
+
   // Unrolling all nine taps pays off for large maps or well-filled 96-row
   // products; smaller cases retain the generic product.
   struct Fixed3x3 {
@@ -399,7 +462,8 @@ struct Conv2dPlan {
   int64_t channel_partitions = 1;
   // SingleOutput: kernel width and horizontal stride baked into the kernel.
   bool fixed_taps = false;
-  // Patch and Mpp: tiles run over the flattened image, not per output row.
+  // Patch, Mpp and Cooperative: tiles run over the flattened image, not per
+  // output row.
   bool flat = false;
   // WinogradFused: one threadgroup transforms its input tiles once and runs
   // every 32-output block over them (conv2d_winograd_loop).
