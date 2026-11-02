@@ -1582,13 +1582,11 @@ template <
     int BM,
     int BN,
     int NSG,
-    bool FIXED3 = false,
-    int KS = 0,
-    typename TW = T>
+    bool FIXED3 = false>
 [[max_total_threads_per_threadgroup(NSG * c10::metal::simdgroup_size)]]
 kernel void conv2d_mpp(
     device T* input [[buffer(0)]],
-    device TW* weight [[buffer(1)]],
+    device T* weight [[buffer(1)]],
     device T* output [[buffer(2)]],
     constant Conv2dMppParams& geometry [[buffer(3)]],
     device const T* bias [[buffer(4)]],
@@ -1600,13 +1598,11 @@ kernel void conv2d_mpp(
   using extents = dextents<int32_t, 2>;
   using strides = array<int32_t, 2>;
   using tensor2d = tensor<device T, extents, tensor_inline>;
-  using tensor2dw = tensor<device TW, extents, tensor_inline>;
   using tensor2df = tensor<device float, extents, tensor_inline>;
-  // Experiment: KS > 0 bakes the reduction length into the descriptor.
   constexpr auto desc = matmul2d_descriptor(
       OUT_NHWC ? BN : BM,
       OUT_NHWC ? BM : BN,
-      KS > 0 ? KS : static_cast<int>(dynamic_extent),
+      static_cast<int>(dynamic_extent),
       OUT_NHWC && !IN_NHWC,
       OUT_NHWC || IN_NHWC,
       !is_same_v<T, float>,
@@ -1637,8 +1633,7 @@ kernel void conv2d_mpp(
         int(tgid.y) * kConv2dFixed3ColumnRows,
         tid / c10::metal::simdgroup_size,
         tid % c10::metal::simdgroup_size,
-        conv2d_mpp_tile_nonfinite<T, BM>(
-            (device const T*)weight, gp, g, o_off, tid),
+        conv2d_mpp_tile_nonfinite<T, BM>(weight, gp, g, o_off, tid),
         bool_constant<FIXED3>{});
     return;
   }
@@ -1672,14 +1667,12 @@ kernel void conv2d_mpp(
   const bool boundary = conv2d_mpp_boundary(gp, oh, x_off, BN);
   bool exceptional = false;
   if (boundary) {
-    exceptional = conv2d_mpp_tile_nonfinite<T, BM>(
-        (device const T*)weight, gp, g, o_off, tid);
+    exceptional = conv2d_mpp_tile_nonfinite<T, BM>(weight, gp, g, o_off, tid);
   }
-  // The cooperative accumulator's operand types follow op.run's argument order.
-  using left_t = conditional_t<OUT_NHWC, tensor2d, tensor2dw>;
-  using right_t = conditional_t<OUT_NHWC, tensor2dw, tensor2d>;
-  auto acc =
-      op.template get_destination_cooperative_tensor<left_t, right_t, float>();
+  auto acc = op.template get_destination_cooperative_tensor<
+      tensor2d,
+      tensor2d,
+      float>();
   for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
     acc[i] = 0.0f;
   }
@@ -1713,7 +1706,7 @@ kernel void conv2d_mpp(
     return OUT_NHWC ? t.slice(o_off, n) : t.slice(n, o_off);
   };
   auto res =
-      op.template get_destination_cooperative_tensor<left_t, right_t, T>();
+      op.template get_destination_cooperative_tensor<tensor2d, tensor2d, T>();
   if IF_CONSTEXPR (IN_NHWC) {
     if (edge) {
       // Positions step down the rows; channels keep the unit stride. The
@@ -1770,7 +1763,7 @@ kernel void conv2d_mpp(
         src,
         IN_NHWC ? extents(K, length) : extents(length, K),
         strides{1, IN_NHWC ? (flat ? p.C_in : p.sW * p.C_in) : plane});
-    tensor2dw wt(
+    tensor2d wt(
         weight + (int64_t(kh * p.kW + kw) * p.C_out + g * og) * gp.K + k0,
         extents(K, og),
         strides{1, gp.K});
@@ -1930,18 +1923,6 @@ INSTANTIATE_CONV2D_FIXED3(96, 4)
 INSTANTIATE_CONV2D_FIXED3(128, 4)
 INSTANTIATE_CONV2D_FIXED3(128, 2)
 INSTANTIATE_CONV2D_FIXED3(64, 4)
-INSTANTIATE_CONV2D(
-    "conv2d_mpp_nchw_nchw_b64x64_s2_k3_K64_bfloat",
-    conv2d_mpp<bfloat, false, false, 64, 64, 2, true, 64>);
-INSTANTIATE_CONV2D(
-    "conv2d_mpp_nchw_nchw_b64x64_s2_k3_K128_bfloat",
-    conv2d_mpp<bfloat, false, false, 64, 64, 2, true, 128>);
-INSTANTIATE_CONV2D(
-    "conv2d_mpp_nchw_nchw_b64x64_s2_k3_K96_bfloat",
-    conv2d_mpp<bfloat, false, false, 64, 64, 2, true, 96>);
-INSTANTIATE_CONV2D(
-    "conv2d_mpp_nchw_nchw_b64x64_s2_k3_wh_bfloat",
-    conv2d_mpp<bfloat, false, false, 64, 64, 2, true, 0, half>);
 #define INSTANTIATE_CONV2D_FIXED3_WIDE(BM, BN, NSG)                \
   INSTANTIATE_CONV2D(                                              \
       "conv2d_mpp_nchw_nchw_b" #BM "x" #BN "_s" #NSG "_k3_bfloat", \
@@ -3164,8 +3145,7 @@ template <
     int ROWS,
     int COLUMNS,
     int NSG,
-    int TAPS,
-    bool NCHW = false>
+    int TAPS>
 [[max_total_threads_per_threadgroup(NSG * c10::metal::simdgroup_size)]]
 kernel void conv2d_tensor(
     device T* input [[buffer(0)]],
@@ -3200,13 +3180,10 @@ kernel void conv2d_tensor(
   const int y0 = int(tgid.y) / x_tiles * ROWS;
   const int n = int(tgid.z);
   const int ix = x0 - p.padW, iy = y0 - p.padH;
-  // Experiment: NCHW planes presented to the op as a strided NHWC view.
   tensor4d x(
-      input + int64_t(n) * p.H * p.W * p.C_in +
-          (NCHW ? g * cg * p.H * p.W : g * cg),
+      input + int64_t(n) * p.H * p.W * p.C_in + g * cg,
       extents(cg, p.W, p.H, 1),
-      NCHW ? strides{p.H * p.W, 1, p.W, p.C_in * p.W * p.H}
-           : strides{1, p.C_in, p.C_in * p.W, p.C_in * p.W * p.H});
+      strides{1, p.C_in, p.C_in * p.W, p.C_in * p.W * p.H});
   auto xs = x.slice(0, max(ix, 0), max(iy, 0), 0);
   tensor4d w(
       weight + g * og,
@@ -3229,11 +3206,9 @@ kernel void conv2d_tensor(
     res[i] = T(acc[i] + (p.has_bias ? float(bias[g * og + o]) : 0.0f));
   }
   tensor4d y(
-      output + int64_t(n) * p.outH * p.outW * p.C_out +
-          (NCHW ? g * og * p.outH * p.outW : g * og),
+      output + int64_t(n) * p.outH * p.outW * p.C_out + g * og,
       extents(og, p.outW, p.outH, 1),
-      NCHW ? strides{p.outH * p.outW, 1, p.outW, p.C_out * p.outW * p.outH}
-           : strides{1, p.C_out, p.C_out * p.outW, p.C_out * p.outW * p.outH});
+      strides{1, p.C_out, p.C_out * p.outW, p.C_out * p.outW * p.outH});
   res.store(y.slice(o0, x0, y0, 0));
 }
 
@@ -3283,28 +3258,6 @@ kernel void conv2d_tensor(
 
 INSTANTIATE_CONV2D_TENSOR_ALL(half)
 INSTANTIATE_CONV2D_TENSOR_ALL(bfloat)
-INSTANTIATE_CONV2D(
-    "conv2d_tensor_wide_nchw_bfloat",
-    conv2d_tensor<
-        bfloat,
-        0,
-        kConv2dTensorWideOutputs,
-        kConv2dTensorWideSide,
-        kConv2dTensorWideSide,
-        kConv2dTensorWideSimdgroups,
-        3,
-        true>);
-INSTANTIATE_CONV2D(
-    "conv2d_tensor_nchw_bfloat",
-    conv2d_tensor<
-        bfloat,
-        0,
-        kConv2dTensorOutputs,
-        kConv2dTensorRows,
-        kConv2dTensorColumns,
-        kConv2dTensorSimdgroups,
-        3,
-        true>);
 
 template <typename T>
 struct Conv2dPatchWindow {
@@ -4537,119 +4490,6 @@ INSTANTIATE_CONV2D(
 INSTANTIATE_CONV2D_O1(float, 3, 2, 1, 1)
 INSTANTIATE_CONV2D_O1(bfloat, 1, 1, 1, 16)
 INSTANTIATE_CONV2D_O1(bfloat, 3, 1, 1, 16)
-
-// Experiment (Conv2dKernel::Mpp fixed 3x3, window-staged): a threadgroup stages
-// CC input channels of the (BN + 2) x 3 window of its output row in threadgroup
-// memory once, with 16-byte loads and zero fill at the image border, and runs
-// the nine tap products of a BM x BN tile with matmul2d on threadgroup views of
-// that window. Device traffic per tile drops from nine input reads to one.
-template <typename T, int BM, int BN, int NSG, int CC>
-[[max_total_threads_per_threadgroup(NSG * c10::metal::simdgroup_size)]]
-kernel void conv2d_mpp_window(
-    device T* input [[buffer(0)]],
-    device T* weight [[buffer(1)]],
-    device T* output [[buffer(2)]],
-    constant Conv2dMppParams& geometry [[buffer(3)]],
-    device const T* bias [[buffer(4)]],
-    device float* partial [[buffer(5)]],
-    uint3 tgid [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]]) {
-  constexpr int taps = 3, pad = 1, cols = BN + 2,
-                threads = NSG * c10::metal::simdgroup_size;
-  constexpr int vec = 8;
-  using P8 = packed_vec<T, vec>;
-  constant Conv2DParams& p = geometry.conv;
-  threadgroup T stage[CC * taps * cols];
-  using extents = dextents<int32_t, 2>;
-  using strides = array<int32_t, 2>;
-  using tensor2d = tensor<device T, extents, tensor_inline>;
-  using shared2d = tensor<threadgroup T, extents, tensor_inline>;
-  constexpr auto desc = matmul2d_descriptor(
-      BM,
-      BN,
-      static_cast<int>(dynamic_extent),
-      false,
-      false,
-      !is_same_v<T, float>,
-      matmul2d_descriptor::mode::multiply_accumulate);
-  matmul2d<desc, execution_simdgroups<NSG>> op;
-  const int o_off = int(tgid.x) * BM;
-  const int w_tiles = c10::metal::ceil_div(p.outW, BN);
-  const int oh = int(tgid.y) / w_tiles, x_off = int(tgid.y) % w_tiles * BN;
-  const int nb = int(tgid.z);
-  const int plane = p.H * p.W;
-  device T* in = input + int64_t(nb) * p.C_in * plane;
-  auto acc = op.template get_destination_cooperative_tensor<
-      tensor2d,
-      shared2d,
-      float>();
-  for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
-    acc[i] = 0.0f;
-  }
-  for (int c0 = 0; c0 < p.C_in; c0 += CC) {
-    const int K = min(CC, p.C_in - c0);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    // Each thread fills whole window rows: (channel, kh) pairs.
-    for (int row = int(tid); row < K * taps; row += threads) {
-      const int c = row / taps, kh = row % taps;
-      const int ih = oh + kh - pad;
-      threadgroup T* dst = stage + (c * taps + kh) * cols;
-      if (ih < 0 || ih >= p.H) {
-        for (int j = 0; j < cols; ++j) {
-          dst[j] = T(0);
-        }
-        continue;
-      }
-      device const T* src = in + int64_t(c0 + c) * plane + int64_t(ih) * p.W;
-      const int iw0 = x_off - pad;
-      dst[0] = iw0 >= 0 ? src[iw0] : T(0);
-      int j = 1;
-      for (; j + vec <= cols - 1 && iw0 + j + vec <= p.W; j += vec) {
-        *reinterpret_cast<threadgroup P8*>(dst + j) =
-            *reinterpret_cast<device const P8*>(src + iw0 + j);
-      }
-      for (; j < cols; ++j) {
-        const int iw = iw0 + j;
-        dst[j] = iw < p.W ? src[iw] : T(0);
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int kh = 0; kh < taps; ++kh) {
-      for (int kw = 0; kw < taps; ++kw) {
-        shared2d xt(
-            stage + kh * cols + kw, extents(BN, K), strides{1, taps * cols});
-        tensor2d wt(
-            weight + (int64_t(kh * taps + kw) * p.C_out) * p.C_in + c0,
-            extents(K, p.C_out),
-            strides{1, p.C_in});
-        auto w_tile = wt.slice(0, o_off);
-        op.run(w_tile, xt, acc);
-      }
-    }
-  }
-  auto res =
-      op.template get_destination_cooperative_tensor<tensor2d, shared2d, T>();
-  for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
-    const int o =
-        min(o_off + int(acc.get_multidimensional_index(i)[1]), p.C_out - 1);
-    res[i] = T(acc[i] + (p.has_bias ? float(bias[o]) : 0.0f));
-  }
-  tensor2d out(
-      output + (int64_t(nb) * p.C_out * p.outH + oh) * p.outW,
-      extents(p.outW, p.C_out),
-      strides{1, p.outH * p.outW});
-  res.store(out.slice(x_off, o_off));
-}
-
-INSTANTIATE_CONV2D(
-    "conv2d_mpp_window_b64x64_s2_c64_bfloat",
-    conv2d_mpp_window<bfloat, 64, 64, 2, 64>);
-INSTANTIATE_CONV2D(
-    "conv2d_mpp_window_b64x64_s2_c32_bfloat",
-    conv2d_mpp_window<bfloat, 64, 64, 2, 32>);
-INSTANTIATE_CONV2D(
-    "conv2d_mpp_window_b64x64_s4_c64_bfloat",
-    conv2d_mpp_window<bfloat, 64, 64, 4, 64>);
 
 // Sums the float32 split-K partials of conv2d_mpp and adds bias.
 template <typename T>

@@ -202,11 +202,6 @@ Conv2dPlan select_conv2d_winograd(const Conv2DParams& p, bool in_nhwc, const Con
 
 namespace {
 
-int64_t conv2d_env(const char* name, int64_t fallback) {
-  const char* value = std::getenv(name);
-  return value ? std::strtoll(value, nullptr, 10) : fallback;
-}
-
 using Wino = Conv2dTuning::Winograd;
 using HalfWino = Conv2dTuning::HalfWinograd;
 using O1 = Conv2dTuning::SingleOutput;
@@ -361,17 +356,6 @@ struct Conv2dSelector {
     const bool stem = in_nhwc && dense3 && Cg <= kConv2dTensorStemChannels;
     const bool tiles = dense3 ? Og >= kConv2dTensorOutputs
                               : Og % kConv2dTensorOutputs == 0 && Cg > kConv2dTensorStemChannels;
-    // Experiment hook: CONV2D_TENSOR_NCHW=1 runs the MPP op on NCHW planes through a strided view
-    // (plan.flat marks it for the host).
-    const bool nchw_op = conv2d_env("CONV2D_TENSOR_NCHW", 0) && apple10 && bf16 && dense3 && s1 && d1 &&
-        !in_nhwc && !out_nhwc && Og >= kConv2dTensorOutputs;
-    if (nchw_op) {
-      const bool wide_nchw = Og % kConv2dTensorWideOutputs == 0 && conv2d_env("CONV2D_TENSOR_WIDE", 1);
-      return Conv2dPlan{.kernel = Conv2dKernel::Tensor,
-                        .rows = wide_nchw ? kConv2dTensorWideOutputs : kConv2dTensorOutputs,
-                        .simdgroups = wide_nchw ? kConv2dTensorWideSimdgroups : kConv2dTensorSimdgroups,
-                        .flat = true};
-    }
     if (!(apple10 || stem) || fp32 || !(k3 || k5) || !s1 || !d1 || !out_nhwc || !tiles || copied) {
       return std::nullopt;
     }
@@ -397,8 +381,7 @@ struct Conv2dSelector {
       const bool shallow = Cg <= Coop::stride2_shallow_inputs && positions >= Coop::stride2_min_positions;
       const bool deep =
           Cg <= Coop::stride2_max_inputs && N * positions >= Coop::stride2_deep_min_positions && outW % block == 0;
-      // Experiment hook: CONV2D_COOP_S2=0 disables the stride-2 route.
-      if (!conv2d_env("CONV2D_COOP_S2", 1) || !(apple10 && bfloat_nchw && k3 && d1 && p.padH == p.padW && p.padH <= 1) ||
+      if (!(apple10 && bfloat_nchw && k3 && d1 && p.padH == p.padW && p.padH <= 1) ||
           !input_offset_aligned || !output_offset_aligned || Cg % kConv2dCooperativeChunk != 0 || Og % block != 0 ||
           !(shallow || deep)) {
         return std::nullopt;
@@ -414,16 +397,14 @@ struct Conv2dSelector {
         (input_offset_aligned || !even_offset) && output_offset_aligned;
     const bool whole_blocks =
         Coop::inputs.contains(Cg) && Coop::outputs.contains(Og) && Cg % block == 0 && Og % block == 0;
-    // Experiment hook: CONV2D_COOP=0 disables the route, CONV2D_COOP_ROWS=64 picks the 2x4 grid.
-    if (!conv2d_env("CONV2D_COOP", 1) || !(apple10 && bfloat_nchw && kW == 3 && s1 && d1 && p.padW == 1)) {
+    if (!(apple10 && bfloat_nchw && kW == 3 && s1 && d1 && p.padW == 1)) {
       return std::nullopt;
     }
     if (k3 && p1 && N == 1 && whole_rows && whole_blocks) {
-      const int64_t outputs = input_offset_aligned ? conv2d_env("CONV2D_COOP_ROWS", block) : block;
       return Conv2dPlan{.kernel = Conv2dKernel::Cooperative,
-                        .rows = outputs,
+                        .rows = block,
                         .columns = block * kConv2dCooperativeSimdgroups,
-                        .simdgroups = kConv2dCooperativeSimdgroups * outputs / block};
+                        .simdgroups = kConv2dCooperativeSimdgroups};
     }
     // Flat tiles of one 32-channel block and two position blocks; a lane's 8
     // positions stay within a row of a width that is a multiple of 8.
@@ -432,8 +413,7 @@ struct Conv2dSelector {
     const bool flat = (kH == 3 || kH == 1) && p.padH == kH / 2 && W % 8 == 0 &&
         N * plane >= Coop::flat_min_positions && input_offset_aligned && output_offset_aligned &&
         Cg % kConv2dCooperativeChunk == 0 && Og % block == 0 && Og <= Coop::flat_max_outputs && flat_inputs;
-    // Experiment hook: CONV2D_COOP_FLAT=0 disables the flat tiles.
-    if (!flat || !conv2d_env("CONV2D_COOP_FLAT", 1)) {
+    if (!flat) {
       return std::nullopt;
     }
     return Conv2dPlan{
@@ -449,9 +429,8 @@ struct Conv2dSelector {
     const bool shape = groups > 1 && kH == kW && (kH == 5 || kH == 7) && p.padH == kH / 2 && p.padW == kW / 2 &&
         Cg % block == 0 && Og % (block / 2) == 0;
     const bool wins = Cg >= Coop::nhwc_deep_inputs || (N >= Coop::nhwc_min_batch && kH == 7 && Og % block == 0);
-    // Experiment hook: CONV2D_NHWC_COOP=0 disables the route.
-    if (!conv2d_env("CONV2D_NHWC_COOP", 1) || !(apple10 && bf16 && in_nhwc && out_nhwc && s1 && d1 && shape && wins) ||
-        !input_offset_aligned || !output_offset_aligned) {
+    if (!(apple10 && bf16 && in_nhwc && out_nhwc && s1 && d1 && shape && wins) || !input_offset_aligned ||
+        !output_offset_aligned) {
       return std::nullopt;
     }
     const int64_t channel_blocks = N >= Coop::nhwc_min_batch ? 1 : 4;
@@ -471,8 +450,7 @@ struct Conv2dSelector {
     constexpr int64_t block = kConv2dCooperativeTile;
     const bool blocks = Cg % block == 0 && Og % block == 0 && plane % 8 == 0 && plane * block <= kInt32Max &&
         input_offset_aligned && output_offset_aligned;
-    // Experiment hook: CONV2D_PW_COOP=0 disables the route.
-    if (!conv2d_env("CONV2D_PW_COOP", 1) || !(apple10 && bfloat_nchw && pointwise && s1 && blocks)) {
+    if (!(apple10 && bfloat_nchw && pointwise && s1 && blocks)) {
       return std::nullopt;
     }
     const bool shallow = Cg == CoopPointwise::shallow_inputs && Og <= CoopPointwise::shallow_max_outputs &&
@@ -553,7 +531,7 @@ struct Conv2dSelector {
          (!apple10 && C_in <= Wino::tall_max_inputs && C_out == Wino::tall_wide_outputs &&
           plane >= Wino::tall_min_wide_positions) ||
          (apple10 && Wino::tall_large_outputs.contains(C_out) && plane >= tall_large_positions &&
-          !(deep_fixed3() && C_out <= conv2d_env("CONV2D_FIXED3_MAX_TALL_OUTPUTS", Fixed3::max_tall_outputs))));
+          !(deep_fixed3() && C_out <= Fixed3::max_tall_outputs)));
     const bool wino4x2 = bfloat_nchw && C_in >= Wino::tall_channels &&
         (single_tall ||
          (N >= Wino::tall_min_batch && C_out >= tuning.batched_winograd_min_output_channels &&
@@ -570,9 +548,6 @@ struct Conv2dSelector {
     // NCHW single outputs keep the direct O1 kernels.
     const bool fused_winograd = winograd_shape && Cg >= Wino::fused_min_inputs && full_chunks && !starved &&
         (!bf16 || bfloat_simd) && (Og > 1 || in_nhwc || out_nhwc);
-    if (conv2d_env("CONV2D_FORCE_WINO2X2", 0) && winograd_shape && bfloat_nchw && N == 1) {
-      return Conv2dPlan{Conv2dKernel::Winograd2x2};
-    }
     if (apple10) {
       // Apple10 runs low-precision direct products on the matrix hardware, but
       // not float32 ones: fused F(2x2) wins up to the separate-transform crossover.
@@ -766,12 +741,6 @@ struct Conv2dSelector {
         ((Cg == 16 && Og >= Patch::stride1_min_outputs && W % 8 == 0 && even_offset) || patch_flat ||
          patch_flat64) &&
         C_in * plane <= kInt32Max && C_out * positions <= kInt32Max;
-    // Experiment hook: CONV2D_FORCE_PATCH=<rows> stages any 3x3 stride-1 bf16 NCHW product with
-    // whole 32-channel chunks on the flat patch tile of that many rows.
-    if (const auto forced_rows = conv2d_env("CONV2D_FORCE_PATCH", 0);
-        forced_rows && packed3 && !strided && bfloat_nchw && Cg % kConv2dNarrowTile == 0 && W % 2 == 0 && even_offset) {
-      return Conv2dPlan{.kernel = Conv2dKernel::Patch, .rows = forced_rows, .columns = kConv2dNarrowTile, .simdgroups = 4, .flat = true};
-    }
     const bool patch_s2 = packed3 && stride2 &&
         ((Patch::stride2_small_inputs.contains(Cg) && Patch::stride2_small_outputs.contains(Og)) ||
          (Cg >= Patch::stride2_min_large_inputs && Patch::large_outputs.contains(Og) &&
@@ -951,13 +920,6 @@ struct Conv2dSelector {
       plan.rows = c10::metal::round_up(Og, wide_rows) < c10::metal::round_up(Og, kTile) ? wide_rows : kTile;
       plan.columns = kTile;
       plan.simdgroups = plan.rows == wide_rows ? 4 : 2;
-      if (const auto rows = conv2d_env("CONV2D_FIXED3_ROWS", 0)) {
-        plan.rows = rows;
-        plan.simdgroups = conv2d_env("CONV2D_FIXED3_SG", rows == kTile ? 2 : 4);
-      }
-      if (const auto cols = conv2d_env("CONV2D_FIXED3_COLS", 0)) {
-        plan.columns = cols;
-      }
     }
     return plan;
   }
