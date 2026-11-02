@@ -337,6 +337,18 @@ struct Conv2dSelector {
         waste * float(Cg * kH * kW) > Conv2dTuning::flatten_min_saved_reduction;
   }
 
+  // NCHW input with channels-last weights can keep the input planes and
+  // scatter the cooperative product directly into channels-last output.
+  std::optional<Conv2dPlan> select_cooperative_output() const {
+    if (!(apple10 && bf16 && groups == 1 && !in_nhwc && out_nhwc && k3 && s1 && d1 && p1) ||
+        !input_offset_aligned || !output_offset_aligned || W % 8 != 0 || Cg % 16 != 0 || Og % 32 != 0 ||
+        Cg > 128 || Og > 128 || N * positions < 4096) {
+      return std::nullopt;
+    }
+    return Conv2dPlan{
+        .kernel = Conv2dKernel::Cooperative, .rows = 32, .columns = 64, .simdgroups = 2, .flat = true};
+  }
+
   // conv2d_tensor: half/bfloat16 3x3 and 5x5 products with channels-last
   // output. The op's output-channel tile must not exceed the output channels;
   // dense 3x3 products take partial tiles, other shapes only whole ones, which
@@ -479,8 +491,9 @@ struct Conv2dSelector {
     }
     const bool mid = CoopPointwise::mid_outputs.contains(Og) && Cg >= CoopPointwise::mid_min_inputs &&
         plane <= CoopPointwise::mid_max_positions;
-    const bool deep = Og == CoopPointwise::deep_outputs && Cg >= CoopPointwise::deep_min_inputs &&
-        (N > 1 || plane >= CoopPointwise::deep_min_positions);
+    const bool deep = Og == CoopPointwise::deep_outputs &&
+        ((N == 1 && Cg >= CoopPointwise::deep_large_min_inputs && plane >= CoopPointwise::deep_min_positions) ||
+         (N > 1 && Cg >= CoopPointwise::deep_batched_min_inputs));
     if (mid || deep) {
       return Conv2dPlan{
           .kernel = Conv2dKernel::PointwiseCooperative, .rows = 2 * block, .columns = block, .simdgroups = 2};
@@ -490,6 +503,11 @@ struct Conv2dSelector {
 
   // conv2d_tiny: direct stems with a few input channels.
   std::optional<Conv2dPlan> select_tiny() const {
+    if (apple10 && bfloat_nchw && Cg == 3 && k3 && stride2 && p0 && d1 && Og % kConv2dNarrowTile == 0 &&
+        outW >= 8 && outW % 2 == 0 && even_output_offset) {
+      return Conv2dPlan{.kernel = Conv2dKernel::StemCooperative, .rows = 32, .columns = 64, .simdgroups = 2};
+    }
+
     const bool bounded_tiny_type = (fp32 && (Cg == 2 || Cg == 3) && kH == 4 && kW == 4) || (half && Cg == 2 && k3);
     if (bounded_tiny_type && groups == 1 && s1 && d1 && p.padH <= kH / 2 && p.padW <= kW / 2 &&
         Og % kConv2dTinyChannelsPerThread == 0 && Og <= Conv2dTuning::bounded_tiny_max_output_channels) {
@@ -649,8 +667,10 @@ struct Conv2dSelector {
         cooperative_items * N * C_out >= O1::min_threads && cooperative_groups >= dev.cores &&
         ceil_div(cooperative_items, spatial_lanes) <=
             std::numeric_limits<uint32_t>::max() / c10::metal::simdgroup_size) {
+      // Sharing input rows pays once the paired tiles still fill the GPU.
+      const bool paired = apple10 && bf16 && positions >= O1::partitioned_paired_min_positions;
       return Conv2dPlan{.kernel = Conv2dKernel::SingleOutput,
-                        .rows = 1,
+                        .rows = paired ? 2 : 1,
                         .columns = cooperative_columns,
                         .simdgroups = O1::simdgroups,
                         .channel_partitions = channel_partitions,
@@ -680,6 +700,12 @@ struct Conv2dSelector {
   // Staged direct tiles: half patches, bfloat16 pointwise planes, narrow
   // collective tiles and bfloat16 patches.
   std::optional<Conv2dPlan> select_staged() const {
+    if (apple10 && bfloat_nchw && kH == 2 && kW == 2 && s1 && d1 && p0 &&
+        (Cg == 8 || Cg == 16) && (Og == 8 || Og == 16) && outW >= 64 && outW % 32 == 0 &&
+        N * positions >= 4096 && N * positions <= 128 * 1024 && std::max(Cg, Og) * plane <= kInt32Max) {
+      return Conv2dPlan{.kernel = Conv2dKernel::Small2x2, .rows = 16, .columns = 64, .simdgroups = 2};
+    }
+
     // Staging must save a collective product versus the direct tap loop to
     // pay for its explicit loads/barriers. These are performance limits. Up to
     // 64 outputs the patch tiles pad more than 64-row MPP tiles, which only
@@ -947,7 +973,8 @@ Conv2dPlan select_conv2d_kernel(const Conv2DParams& p,
                                 int64_t groups,
                                 const Conv2dDevice& dev) {
   const Conv2dSelector selector(p, input, output, groups, dev);
-  for (const auto select : {&Conv2dSelector::select_tensor,
+  for (const auto select : {&Conv2dSelector::select_cooperative_output,
+                            &Conv2dSelector::select_tensor,
                             &Conv2dSelector::select_cooperative,
                             &Conv2dSelector::select_cooperative_nhwc,
                             &Conv2dSelector::select_pointwise_cooperative,

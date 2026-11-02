@@ -13716,6 +13716,112 @@ def _conv2d_check_close(test, actual, x, weight, bias, *args):
 
 
 class TestConvolutionMetal(TestCaseMPS):
+    @dtypes(torch.bfloat16)
+    @parametrize("data", ["integer", "normal"])
+    @parametrize("has_bias", [False, True])
+    @parametrize("case", [
+        ("small2_16", (1, 16, 321, 321), 8, 2, 1, 0, 1, False, 0, 0),
+        ("small2_8", (1, 8, 321, 321), 16, 2, 1, 0, 1, False, 0, 0),
+        ("small2_equal8", (2, 8, 66, 97), 8, 2, 1, 0, 1, False, 1, 1),
+        ("small2_equal16", (1, 16, 65, 65), 16, 2, 1, 0, 1, False, 0, 1),
+        ("small2_batched", (2, 16, 130, 97), 8, 2, 1, 0, 1, False, 1, 1),
+        ("small2_tails", (2, 8, 65, 98), 13, 2, 1, 0, 1, False, 1, 1),
+        ("small2_narrow", (2, 16, 65, 130), 9, 2, 1, 0, 1, False, 1, 1),
+        ("pointwise_wide", (1, 256, 256, 256), 640, 1, 1, 0, 1, False, 0, 1),
+        ("stride2_width1", (1, 32, 65, 161), 64, (3, 1), 2, (1, 0), 1, False, 1, 1),
+        ("stride2_width1_batched", (2, 96, 63, 159), 64, (3, 1), 2, (1, 0), 1, False, 1, 1),
+        ("stride2_width1_grouped", (1, 64, 65, 159), 128, (3, 1), 2, (1, 0), 2, False, 1, 1),
+        ("stride2_width1_tails", (2, 33, 67, 59), 49, (3, 1), 2, (1, 0), 1, False, 1, 1),
+        ("cl_weight", (4, 64, 56, 56), 64, 3, 1, 1, 1, True, 0, 0),
+        ("cl_weight_channels", (2, 80, 55, 56), 96, 3, 1, 1, 1, True, 0, 1),
+        ("cl_weight_tails", (3, 64, 55, 57), 64, 3, 1, 1, 1, True, 1, 1),
+        ("stem", (1, 3, 601, 601), 64, 3, 2, 0, 1, False, 0, 0),
+        ("stem_batched", (2, 3, 603, 597), 64, 3, 2, 0, 1, False, 1, 1),
+        ("stem_tails", (2, 3, 603, 599), 64, 3, 2, 0, 1, False, 1, 1),
+        ("depthwise", (1, 64, 300, 300), 64, 3, 1, 1, 64, False, 0, 0),
+        ("depthwise_offset", (2, 7, 301, 302), 7, 3, 1, 1, 7, False, 2, 2),
+        ("depthwise_tails", (2, 7, 301, 303), 7, 3, 1, 1, 7, False, 1, 1),
+        ("single_output", (1, 128, 255, 257), 1, 3, 1, 1, 1, False, 1, 1),
+        ("single_output_tails", (2, 129, 257, 255), 1, 3, 1, 1, 1, False, 1, 1),
+        ("single_output_grouped", (1, 66, 129, 129), 2, 3, 1, 1, 2, False, 1, 1),
+    ], name_fn=lambda case: case[0])
+    def test_conv2d_bfloat16_boundaries(self, device, dtype, data, has_bias, case):
+        _, shape, outputs, kernel, stride, padding, groups, weight_cl, input_offset, weight_offset = case
+        kernel = (kernel, kernel) if isinstance(kernel, int) else kernel
+        weight_shape = (outputs, shape[1] // groups, *kernel)
+        if data == "integer":
+            # Integer products make incorrect lane permutations visible without a tolerance.
+            x = torch.randint(-1, 2, shape).to(dtype)
+            weight = torch.randint(-1, 2, weight_shape).to(dtype)
+            bias = torch.randint(-4, 5, (outputs,)).to(dtype) if has_bias else None
+        else:
+            x = torch.randn(shape, dtype=dtype)
+            weight = (torch.randn(weight_shape) / math.sqrt(math.prod(weight_shape[1:]))).to(dtype)
+            bias = torch.randn(outputs, dtype=dtype) if has_bias else None
+        if weight_cl:
+            weight = weight.contiguous(memory_format=torch.channels_last)
+
+        def to_device(value, offset):
+            storage = torch.empty(value.numel() + offset, device=device, dtype=dtype)
+            result = storage.as_strided(value.shape, value.stride(), offset)
+            result.copy_(value)
+            return result
+
+        actual = F.conv2d(to_device(x, input_offset), to_device(weight, weight_offset),
+                          None if bias is None else to_device(bias, input_offset),
+                          stride=stride, padding=padding, groups=groups)
+        self.assertEqual(actual.dtype, dtype)
+        memory_format = torch.channels_last if weight_cl else torch.contiguous_format
+        self.assertTrue(actual.is_contiguous(memory_format=memory_format))
+        if data == "integer":
+            expected = F.conv2d(x.double(), weight.double(), None if bias is None else bias.double(),
+                                stride=stride, padding=padding, groups=groups).to(dtype)
+            self.assertEqual(actual.cpu(), expected, atol=0, rtol=0)
+        else:
+            _conv2d_check_close(self, actual, x, weight, bias, stride, padding, 1, groups)
+
+    @dtypes(torch.bfloat16)
+    @parametrize("channels,outputs", [(8, 16), (16, 8)])
+    @parametrize("operand", ["input", "weight"])
+    @parametrize("value", [float("inf"), -float("inf"), float("nan")])
+    def test_conv2d_small2_nonfinite(self, device, dtype, channels, outputs, operand, value):
+        x = torch.full((1, channels, 65, 65), 0.25, dtype=dtype)
+        weight = torch.full((outputs, channels, 2, 2), 0.5, dtype=dtype)
+        bias = (torch.arange(outputs) / 8).to(dtype)
+        if operand == "input":
+            x[0, 0, 32, 32] = value
+            weight[0, 0, 0, 0] = 0
+        else:
+            weight[0, 0, 0, 0] = value
+            x[0, 0, 32, 32] = 0
+        expected = F.conv2d(x.double(), weight.double(), bias.double()).to(dtype)
+        actual = F.conv2d(x.to(device), weight.to(device), bias.to(device)).cpu()
+        self.assertEqual(torch.isnan(actual), torch.isnan(expected))
+        self.assertEqual(torch.isposinf(actual), torch.isposinf(expected))
+        self.assertEqual(torch.isneginf(actual), torch.isneginf(expected))
+        finite = torch.isfinite(expected)
+        self.assertEqual(actual[finite], expected[finite], atol=0, rtol=0)
+
+    @dtypes(torch.bfloat16)
+    @parametrize("columns", ["sampled", "unused"])
+    @parametrize("value", [float("inf"), -float("inf"), float("nan")])
+    def test_conv2d_stride2_width1_nonfinite(self, device, dtype, columns, value):
+        x = torch.full((1, 32, 65, 161), 0.25, dtype=dtype)
+        weight = torch.full((64, 32, 3, 1), 0.5, dtype=dtype)
+        weight[0, 0, 1, 0] = 0
+        bias = (torch.arange(64) / 8).to(dtype)
+        if columns == "unused":
+            x[..., 1::2] = value
+        else:
+            x[0, 0, 32, 80] = value
+        expected = F.conv2d(x.double(), weight.double(), bias.double(), stride=2, padding=(1, 0)).to(dtype)
+        actual = F.conv2d(x.to(device), weight.to(device), bias.to(device), stride=2, padding=(1, 0)).cpu()
+        self.assertEqual(torch.isnan(actual), torch.isnan(expected))
+        self.assertEqual(torch.isposinf(actual), torch.isposinf(expected))
+        self.assertEqual(torch.isneginf(actual), torch.isneginf(expected))
+        finite = torch.isfinite(expected)
+        self.assertEqual(actual[finite], expected[finite], atol=0, rtol=0)
+
     @dtypes(torch.float32, torch.float16, torch.bfloat16)
     @parametrize("input_cl,weight_cl", [(False, True), (True, False), (True, True)])
     @parametrize("has_bias", [False, True])
@@ -13902,6 +14008,7 @@ class TestConvolutionMetal(TestCaseMPS):
         ("tiny", (1, 1, 3, 8), 4, (3, 3), (1, 1), 1, 1),
         ("o1_fixed", (4, 4, 64, 128), 1, (3, 3), (1, 1), 1, 1),
         ("o1_paired", (16, 4, 64, 128), 1, (3, 3), (1, 1), 1, 1),
+        ("o1_partitioned", (1, 128, 129, 129), 1, (3, 3), (1, 1), 1, 1),
         ("o1_generic", (4, 4, 64, 128), 1, (3, 5), (1, 2), 1, 1),
         ("o1_stride2", (2, 48, 100, 128), 1, (3, 3), (2, 2), 2, 1),
         ("depthwise_fixed", (1, 2, 3, 3), 2, (3, 3), (1, 1), 1, 2),

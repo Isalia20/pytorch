@@ -2265,7 +2265,7 @@ kernel void conv2d_cooperative(
 // narrower than a threadgroup, batches and the 16-channel steps of shallow or
 // 176-channel inputs; KH 1 runs a single tap row (1x3 kernels). The width is a
 // multiple of 8, so a lane's 8 positions stay within one row.
-template <int TGM, int TGN, int KH>
+template <int TGM, int TGN, int KH, bool OUT_NHWC = false>
 [[max_total_threads_per_threadgroup(TGM * TGN * c10::metal::simdgroup_size)]]
 kernel void conv2d_cooperative_flat(
     device const bfloat* input [[buffer(0)]],
@@ -2333,7 +2333,9 @@ kernel void conv2d_cooperative_flat(
   if (p0 >= plane) {
     return;
   }
-  device bfloat* y = output + (int64_t(tgid.z) * p.C_out + o0 + r) * plane + p0;
+  device bfloat* y = OUT_NHWC
+      ? output + (int64_t(tgid.z) * plane + p0) * p.C_out + o0 + r
+      : output + (int64_t(tgid.z) * p.C_out + o0 + r) * plane + p0;
 #pragma unroll
   for (int f = 0; f < 2; ++f) {
 #pragma unroll
@@ -2343,8 +2345,16 @@ kernel void conv2d_cooperative_flat(
       const ushort i = 4 * h + 16 * f;
       const float4 lo = float4(c[i], c[i + 1], c[i + 2], c[i + 3]) + bv;
       const float4 hi = float4(c[i + 8], c[i + 9], c[i + 10], c[i + 11]) + bv;
-      *reinterpret_cast<device uint4*>(y + m * plane) =
-          uint4(as_type<uint2>(bfloat4(lo)), as_type<uint2>(bfloat4(hi)));
+      if IF_CONSTEXPR (OUT_NHWC) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          y[m + j * p.C_out] = bfloat(lo[j]);
+          y[m + (4 + j) * p.C_out] = bfloat(hi[j]);
+        }
+      } else {
+        *reinterpret_cast<device uint4*>(y + m * plane) =
+            uint4(as_type<uint2>(bfloat4(lo)), as_type<uint2>(bfloat4(hi)));
+      }
     }
   }
 }
@@ -2488,6 +2498,9 @@ INSTANTIATE_CONV2D(
 INSTANTIATE_CONV2D(
     "conv2d_cooperative_flat_1x2_k3",
     conv2d_cooperative_flat<1, 2, 3>);
+INSTANTIATE_CONV2D(
+    "conv2d_cooperative_flat_1x2_k3_nhwc",
+    conv2d_cooperative_flat<1, 2, 3, true>);
 INSTANTIATE_CONV2D(
     "conv2d_cooperative_flat_1x2_k1",
     conv2d_cooperative_flat<1, 2, 1>);
@@ -2948,6 +2961,194 @@ INSTANTIATE_CONV2D_POINTWISE_COOPERATIVE(2, 16)
 INSTANTIATE_CONV2D_POINTWISE_COOPERATIVE(4, 8)
 INSTANTIATE_CONV2D_POINTWISE_COOPERATIVE(8, 4)
 
+// RGB stride-2 stems fit all 27 taps in one cooperative product. Renaming
+// positions within each 32-column tile makes each lane write eight neighbors.
+[[max_total_threads_per_threadgroup(2 * c10::metal::simdgroup_size)]]
+kernel void conv2d_stem_cooperative(
+    device const bfloat* input [[buffer(0)]],
+    device const bfloat* weight [[buffer(1)]],
+    device bfloat* output [[buffer(2)]],
+    constant Conv2DParams& p [[buffer(3)]],
+    device const bfloat* bias [[buffer(4)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    ushort sg [[simdgroup_index_in_threadgroup]]) {
+  constexpr auto desc = matmul2d_descriptor(
+      32,
+      32,
+      32,
+      false,
+      false,
+      true,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroup> op;
+  auto a =
+      op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+  auto b =
+      op.template get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+  auto acc = op.template get_destination_cooperative_tensor<
+      remove_addrspace_t<decltype(a)>,
+      remove_addrspace_t<decltype(b)>,
+      float>();
+  const int o0 = int(tg.y) * 32, x0 = int(tg.x) * 64 + int(sg) * 32;
+  const int oh = int(tg.z) % p.outH, n = int(tg.z) / p.outH;
+#pragma unroll
+  for (ushort i = 0; i < 32; ++i) {
+    const auto idx = a.get_multidimensional_index(i);
+    const int k = idx[0], o = o0 + int(idx[1]);
+    a[i] = k < 27 ? weight[int64_t(o) * 27 + k] : bfloat(0);
+    acc[i] = 0;
+  }
+#pragma unroll
+  for (ushort h = 0; h < 2; ++h) {
+#pragma unroll
+    for (ushort f = 0; f < 2; ++f) {
+      const ushort base = 4 * h + 16 * f;
+      const auto idx = b.get_multidimensional_index(base);
+      const int k = idx[1], x = x0 + 8 * (idx[0] / 4);
+      bfloat values[8] = {};
+      if (k < 27 && x < p.outW) {
+        const int ic = k / 9, kh = k % 9 / 3, kw = k % 3;
+        device const bfloat* src =
+            input + ((int64_t(n) * 3 + ic) * p.H + oh * 2 + kh) * p.W + x * 2;
+        if (x > p.outW - 8) {
+#pragma unroll
+          for (int j = 0; j < 8; ++j) {
+            if (x + j < p.outW) {
+              values[j] = src[j * 2 + kw];
+            }
+          }
+        } else {
+          const auto v0 = as_type<bfloat4>(
+              *reinterpret_cast<device const packed_ushort4*>(src));
+          const auto v1 = as_type<bfloat4>(
+              *reinterpret_cast<device const packed_ushort4*>(src + 4));
+          const auto v2 = as_type<bfloat4>(
+              *reinterpret_cast<device const packed_ushort4*>(src + 8));
+          const auto v3 = as_type<bfloat4>(
+              *reinterpret_cast<device const packed_ushort4*>(src + 12));
+          const bfloat4 lo = kw == 0 ? bfloat4(v0.x, v0.z, v1.x, v1.z)
+              : kw == 1              ? bfloat4(v0.y, v0.w, v1.y, v1.w)
+                                     : bfloat4(v0.z, v1.x, v1.z, v2.x);
+          const bfloat4 hi = kw == 0 ? bfloat4(v2.x, v2.z, v3.x, v3.z)
+              : kw == 1              ? bfloat4(v2.y, v2.w, v3.y, v3.w)
+                                     : bfloat4(v2.z, v3.x, v3.z, src[16]);
+#pragma unroll
+          for (ushort j = 0; j < 4; ++j) {
+            values[j] = lo[j];
+            values[j + 4] = hi[j];
+          }
+        }
+      }
+#pragma unroll
+      for (ushort j = 0; j < 4; ++j) {
+        b[base + j] = values[j];
+        b[base + 8 + j] = values[j + 4];
+      }
+    }
+  }
+  op.run(a, b, acc);
+#pragma unroll
+  for (ushort h = 0; h < 2; ++h) {
+#pragma unroll
+    for (ushort f = 0; f < 2; ++f) {
+      const ushort base = 4 * h + 16 * f;
+      const auto idx = acc.get_multidimensional_index(base);
+      const int o = o0 + int(idx[1]), x = x0 + 8 * (idx[0] / 4);
+      const float bv = p.has_bias ? float(bias[o]) : 0.0f;
+      device bfloat* dst =
+          output + ((int64_t(n) * p.C_out + o) * p.outH + oh) * p.outW + x;
+      const bfloat4 lo = bfloat4(
+          float4(acc[base], acc[base + 1], acc[base + 2], acc[base + 3]) + bv);
+      const bfloat4 hi = bfloat4(
+          float4(acc[base + 8], acc[base + 9], acc[base + 10], acc[base + 11]) +
+          bv);
+      if (x <= p.outW - 8) {
+        const uint2 a = as_type<uint2>(lo), b = as_type<uint2>(hi);
+        *reinterpret_cast<device packed_uint4*>(dst) =
+            packed_uint4(a.x, a.y, b.x, b.y);
+      } else {
+#pragma unroll
+        for (ushort j = 0; j < 8; ++j) {
+          if (x + j < p.outW) {
+            dst[j] = j < 4 ? lo[j] : hi[j - 4];
+          }
+        }
+      }
+    }
+  }
+}
+
+// Fold all four taps into short cooperative products without materializing
+// im2col. Each SIMD group owns one 16-channel by 32-position row tile;
+// output widths are multiples of 32 so a tile never crosses a row.
+template <int CHANNELS, int OUTPUTS>
+[[max_total_threads_per_threadgroup(2 * c10::metal::simdgroup_size)]]
+kernel void conv2d_small2(
+    device const bfloat* input [[buffer(0)]],
+    device const bfloat* weight [[buffer(1)]],
+    device bfloat* output [[buffer(2)]],
+    constant Conv2DParams& p [[buffer(3)]],
+    device const bfloat* bias [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    ushort sg [[simdgroup_index_in_threadgroup]]) {
+  constexpr auto desc = matmul2d_descriptor(
+      16,
+      32,
+      32,
+      false,
+      false,
+      true,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroup> op;
+  auto a =
+      op.template get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+  auto b =
+      op.template get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+  auto acc = op.template get_destination_cooperative_tensor<
+      remove_addrspace_t<decltype(a)>,
+      remove_addrspace_t<decltype(b)>,
+      float>();
+  const int pos = int(tgid.x) * 64 + int(sg) * 32;
+  const int ow = pos % p.outW, oh = pos / p.outW;
+  const int plane = p.outH * p.outW;
+  device const bfloat* x = input + int64_t(tgid.z) * CHANNELS * p.H * p.W;
+  device bfloat* y = output + int64_t(tgid.z) * OUTPUTS * plane;
+  for (ushort i = 0; i < 16; ++i) {
+    acc[i] = 0.0f;
+  }
+  for (int k0 = 0; k0 < CHANNELS * 4; k0 += 32) {
+#pragma unroll
+    for (ushort i = 0; i < 16; ++i) {
+      const auto q = a.get_multidimensional_index(i);
+      a[i] =
+          q[1] < OUTPUTS ? weight[q[1] * CHANNELS * 4 + k0 + q[0]] : bfloat(0);
+    }
+#pragma unroll
+    for (ushort i = 0; i < 32; ++i) {
+      const auto q = b.get_multidimensional_index(i);
+      const int col = ow + q[0], k = k0 + q[1];
+      b[i] = pos + q[0] < plane
+          ? x[(k / 4 * p.H + oh + k / 2 % 2) * p.W + col + k % 2]
+          : bfloat(0);
+    }
+    op.run(a, b, acc);
+  }
+#pragma unroll
+  for (ushort i = 0; i < 16; ++i) {
+    const auto q = acc.get_multidimensional_index(i);
+    const int oc = q[1];
+    if (pos + q[0] < plane && oc < OUTPUTS) {
+      y[oc * plane + pos + q[0]] =
+          bfloat(acc[i] + (p.has_bias ? float(bias[oc]) : 0.0f));
+    }
+  }
+}
+
+INSTANTIATE_CONV2D("conv2d_small2_8_8", conv2d_small2<8, 8>);
+INSTANTIATE_CONV2D("conv2d_small2_8_16", conv2d_small2<8, 16>);
+INSTANTIATE_CONV2D("conv2d_small2_16_8", conv2d_small2<16, 8>);
+INSTANTIATE_CONV2D("conv2d_small2_16_16", conv2d_small2<16, 16>);
+
 // Square stride-1 convolution through the MPP convolution2d op
 // (Conv2dKernel::Tensor): NSG SIMD groups compute OUTPUTS channels x ROWS x
 // COLUMNS positions of one group of one image from NHWC input and HWIO
@@ -3404,7 +3605,7 @@ INSTANTIATE_CONV2D(
 
 // Stride-2 rows read directly from NCHW input (Conv2dKernel::Stride2): a
 // threadgroup computes BM output channels x BN positions of one output row.
-template <typename T, int BM, int BN, int NSG>
+template <typename T, int BM, int BN, int NSG, bool KW1 = false>
 [[max_total_threads_per_threadgroup(NSG * c10::metal::simdgroup_size)]]
 kernel void conv2d_s2(
     device T* input [[buffer(0)]],
@@ -3416,11 +3617,12 @@ kernel void conv2d_s2(
     uint tid [[thread_index_in_threadgroup]]) {
   using S = conditional_t<is_same_v<T, float>, float, ushort>;
   using P4 = packed_vec<S, 4>;
-  // Two buffers, each with two input columns per output before the halo.
+  // KW1 needs only even input columns, with no horizontal tap halo.
   constexpr int KC = kConv2dStride2BaseStageBytes / (2 * (2 * BN) * sizeof(T));
-  constexpr int input_columns = 2 * (BN - 1) + kConv2dStride2MaxTapSpan + 1;
+  constexpr int input_columns =
+      KW1 ? 2 * BN : 2 * (BN - 1) + kConv2dStride2MaxTapSpan + 1;
   constexpr int VEC = (input_columns + 7) / 8;
-  constexpr int HALF = VEC * 4, ROW = 2 * HALF;
+  constexpr int HALF = VEC * 4, ROW = KW1 ? HALF : 2 * HALF;
   constexpr int NT = NSG * c10::metal::simdgroup_size,
                 PER = (KC * VEC + NT - 1) / NT;
   threadgroup T tile[2][KC * ROW];
@@ -3479,7 +3681,9 @@ kernel void conv2d_s2(
         }
       }
       ev[i] = vec<S, 4>(a.x, a.z, b.x, b.z);
-      od[i] = vec<S, 4>(a.y, a.w, b.y, b.w);
+      if IF_CONSTEXPR (!KW1) {
+        od[i] = vec<S, 4>(a.y, a.w, b.y, b.w);
+      }
     }
   };
   auto commit = [&](int buf) {
@@ -3489,8 +3693,10 @@ kernel void conv2d_s2(
       if (e < KC * VEC) {
         const int k = e / VEC, j = e % VEC;
         *reinterpret_cast<threadgroup P4*>(t + k * ROW + j * 4) = P4(ev[i]);
-        *reinterpret_cast<threadgroup P4*>(t + k * ROW + HALF + j * 4) =
-            P4(od[i]);
+        if IF_CONSTEXPR (!KW1) {
+          *reinterpret_cast<threadgroup P4*>(t + k * ROW + HALF + j * 4) =
+              P4(od[i]);
+        }
       }
     }
   };
@@ -3506,8 +3712,9 @@ kernel void conv2d_s2(
     }
     const int kh = chunk / cchunks, c0 = chunk % cchunks * KC;
     const int kc = min(KC, cg - c0);
-    for (int kw = 0; kw < p.kW; ++kw) {
-      const int shift = kw * p.dW, off = (shift & 1) * HALF + (shift >> 1);
+    for (int kw = 0; kw < (KW1 ? 1 : p.kW); ++kw) {
+      const int shift = kw * p.dW;
+      const int off = KW1 ? 0 : (shift & 1) * HALF + (shift >> 1);
       tensor2dtg xt(tile[buf] + off, extents(BN, kc), strides{1, ROW});
       tensor2d wt(
           weight + (int64_t(kh * p.kW + kw) * p.C_out + g * og + o_off) * cg +
@@ -3554,6 +3761,9 @@ INSTANTIATE_CONV2D_S2_ALL(float)
 INSTANTIATE_CONV2D_S2_ALL(half)
 INSTANTIATE_CONV2D_S2_ALL(bfloat)
 INSTANTIATE_CONV2D_S2(bfloat, 96, 32, 4)
+INSTANTIATE_CONV2D(
+    "conv2d_s2_b64x32_s4_bfloat_kw1",
+    conv2d_s2<bfloat, 64, 32, 4, true>);
 
 #endif // C10_METAL_HAS_MPP
 
@@ -3763,6 +3973,82 @@ void conv2d_tiny_store8(device bfloat* dst, float4 lo, float4 hi) {
   const uint2 z = as_type<uint2>(bfloat4(hi));
   *reinterpret_cast<device packed_uint4*>(dst) =
       packed_uint4(a.x, a.y, z.x, z.y);
+}
+
+// Packed loads share the central eight values between the three horizontal
+// taps. The host restricts row starts and offsets to the packed uint alignment.
+kernel void conv2d_depthwise_3x3_bfloat(
+    device const bfloat* input [[buffer(0)]],
+    device const bfloat* weight [[buffer(1)]],
+    device bfloat* output [[buffer(2)]],
+    constant Conv2DParams& p [[buffer(3)]],
+    device const bfloat* bias [[buffer(4)]],
+    uint3 pos [[thread_position_in_grid]]) {
+  constexpr int RH = kConv2dDepthwiseRows;
+  const int ow = int(pos.x) * 8, oh = int(pos.y) * RH;
+  const int nc = int(pos.z), c = nc % p.C_in;
+  device const bfloat* in = input + int64_t(nc) * p.H * p.W;
+  device const bfloat* wt = weight + int64_t(c) * 9;
+  float4 lo[RH], hi[RH];
+#pragma unroll
+  for (int r = 0; r < RH; ++r) {
+    lo[r] = hi[r] = p.has_bias ? float(bias[c]) : 0.0f;
+  }
+#pragma unroll
+  for (int rr = 0; rr < RH + 2; ++rr) {
+    const int64_t ih = int64_t(oh) + rr - 1;
+    array<float4, 2> values = {float4(0), float4(0)};
+    float left = 0, right = 0;
+    if (ih >= 0 && ih < p.H) {
+      device const bfloat* row = in + ih * p.W;
+      if (ow <= p.W - 8) {
+        values = conv2d_tiny_load8(row + ow);
+      } else {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          if (ow + j < p.W) {
+            values[j / 4][j % 4] = float(row[ow + j]);
+          }
+        }
+      }
+      if (ow > 0) {
+        left = float(row[ow - 1]);
+      }
+      if (ow < p.W - 8) {
+        right = float(row[ow + 8]);
+      }
+    }
+    const float4 a = values[0], b = values[1];
+#pragma unroll
+    for (int r = 0; r < RH; ++r) {
+      const int kh = rr - r;
+      if (kh >= 0 && kh < 3) {
+        lo[r] = fma(float4(left, a.xyz), float(wt[kh * 3]), lo[r]);
+        hi[r] = fma(float4(a.w, b.xyz), float(wt[kh * 3]), hi[r]);
+        lo[r] = fma(a, float(wt[kh * 3 + 1]), lo[r]);
+        hi[r] = fma(b, float(wt[kh * 3 + 1]), hi[r]);
+        lo[r] = fma(float4(a.yzw, b.x), float(wt[kh * 3 + 2]), lo[r]);
+        hi[r] = fma(float4(b.yzw, right), float(wt[kh * 3 + 2]), hi[r]);
+      }
+    }
+  }
+#pragma unroll
+  for (int r = 0; r < RH; ++r) {
+    if (oh + r < p.outH) {
+      device bfloat* dst =
+          output + (int64_t(nc) * p.outH + oh + r) * p.outW + ow;
+      if (ow <= p.outW - 8) {
+        conv2d_tiny_store8(dst, lo[r], hi[r]);
+      } else {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          if (ow + j < p.outW) {
+            dst[j] = bfloat(j < 4 ? lo[r][j] : hi[r][j - 4]);
+          }
+        }
+      }
+    }
+  }
 }
 
 template <typename T, int C, int KW>
@@ -4245,6 +4531,9 @@ static_assert(kConv2dO1ChannelPartitions == 8, "Match the _cp8 names above");
 INSTANTIATE_CONV2D_O1_ALL(float)
 INSTANTIATE_CONV2D_O1_ALL(half)
 INSTANTIATE_CONV2D_O1_ALL(bfloat)
+INSTANTIATE_CONV2D(
+    "conv2d_o1_3_1_2_4_bfloat_cp8",
+    conv2d_o1<bfloat, 3, 1, 2, 4, kConv2dO1ChannelPartitions>);
 INSTANTIATE_CONV2D_O1(float, 3, 2, 1, 1)
 INSTANTIATE_CONV2D_O1(bfloat, 1, 1, 1, 16)
 INSTANTIATE_CONV2D_O1(bfloat, 3, 1, 1, 16)

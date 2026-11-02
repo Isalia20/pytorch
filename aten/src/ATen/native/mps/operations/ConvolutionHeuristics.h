@@ -69,6 +69,10 @@ enum class Conv2dKernel {
   Narrow,
   // conv2d_patch: sampled 1x1 or 2x2/3x3 patches staged per threadgroup.
   Patch,
+  // conv2d_small2: short 2x2 reductions gathered into cooperative operands.
+  Small2x2,
+  // conv2d_stem_cooperative: RGB 3x3 stride-2 without input packing.
+  StemCooperative,
   // conv2d_s2: stride-2 rows read directly from NCHW, <= 128 input channels.
   Stride2,
   // conv2d_mpp: GEMM over the input prepared per Conv2dMppInput, split-K when
@@ -219,6 +223,7 @@ struct Conv2dTuning {
     // need output rows that keep this alignment.
     static constexpr int64_t wide_columns = 16;
     static constexpr int64_t paired_min_threads = 16384;
+    static constexpr int64_t partitioned_paired_min_positions = 16384;
     static constexpr int64_t wide_max_inputs = 32;
     static constexpr int64_t short_max_inputs = 16;
     static constexpr int64_t paired_max_inputs = 128;
@@ -378,8 +383,8 @@ struct Conv2dTuning {
   // threadgroup holds every output channel, so each input element is read
   // once (shallow inputs, deep inputs on large maps, batched 64-output
   // products), and on 320-384 outputs over compact maps or 640 outputs over
-  // deep batches and large maps, whose 64-channel tiles step through the
-  // positions first. Elsewhere the pointwise tiles were as fast or faster.
+  // deep batches and large single images, whose 64-channel tiles step through
+  // the positions first. Elsewhere the pointwise tiles were as fast or faster.
   struct PointwiseCooperative {
     static constexpr int64_t shallow_inputs = 64;
     static constexpr int64_t shallow_max_outputs = 128;
@@ -392,7 +397,8 @@ struct Conv2dTuning {
     static constexpr int64_t mid_min_inputs = 320;
     static constexpr int64_t mid_max_positions = 16384;
     static constexpr int64_t deep_outputs = 640;
-    static constexpr int64_t deep_min_inputs = 960;
+    static constexpr int64_t deep_large_min_inputs = 256;
+    static constexpr int64_t deep_batched_min_inputs = 960;
     static constexpr int64_t deep_min_positions = 65536;
   };
 

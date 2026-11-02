@@ -894,8 +894,15 @@ static void conv2d_depthwise_forward(const Tensor& input_t,
   const bool full = fast && params.kW == 3 && params.sW == 1 && params.outW % kConv2dDepthwiseColumns == 0 &&
       input.scalar_type() == kBFloat16;
   const auto bias = params.has_bias ? bias_opt->to(input.scalar_type()).contiguous() : input;
-  const auto name = fmt::format(
-      "conv2d_depthwise_{}_{}_{}_{}", fast ? params.kW : 0, fast ? params.sW : 0, scalarToMetalTypeString(input), full);
+  const bool vectorized = input.scalar_type() == kBFloat16 && fast && params.kW == 3 && params.sW == 1 &&
+      params.padH == 1 && params.padW == 1 && params.C_in == params.C_out && params.W % 2 == 0 &&
+      input.storage_offset() % 2 == 0 && output.storage_offset() % 2 == 0;
+  const auto name = vectorized ? "conv2d_depthwise_3x3_bfloat"
+                               : fmt::format("conv2d_depthwise_{}_{}_{}_{}",
+                                             fast ? params.kW : 0,
+                                             fast ? params.sW : 0,
+                                             scalarToMetalTypeString(input),
+                                             full);
   auto pipeline = lib.getPipelineStateForFunc(name);
   const auto nx = c10::metal::ceil_div(int64_t(params.outW), rw);
   const auto ny = c10::metal::ceil_div(int64_t(params.outH), int64_t(kConv2dDepthwiseRows));
@@ -1532,16 +1539,32 @@ static void conv2d_metal_forward(const Tensor& input_t,
       grid = MTLSizeMake(ceil_div(Og, plan.rows), tiles, N);
       break;
     }
+    case Conv2dKernel::StemCooperative:
+      name = "conv2d_stem_cooperative";
+      grid = MTLSizeMake(ceil_div(outW, plan.columns), Og / plan.rows, N * outH);
+      break;
+    case Conv2dKernel::Small2x2:
+      name = fmt::format("conv2d_small2_{}_{}", Cg, Og);
+      grid = MTLSizeMake(ceil_div(positions, plan.columns), 1, N);
+      break;
     case Conv2dKernel::Stride2:
       weight = conv3d_weights_to_dhwio(weight_t.transpose(0, 1).unsqueeze(2));
       name = fmt::format("conv2d_s2_b{}x{}_s{}_{}", plan.rows, plan.columns, plan.simdgroups, dtype);
+      if (conv2d_device().apple10_or_newer && input.scalar_type() == kBFloat16 && params.kW == 1 && plan.rows == 64 &&
+          plan.columns == 32 && plan.simdgroups == 4) {
+        name += "_kw1";
+      }
       grid = MTLSizeMake(ceil_div(Og, plan.rows) * groups, outH * ceil_div(outW, plan.columns), N);
       break;
     case Conv2dKernel::Cooperative: {
       weight = conv2d_cooperative_weights(weight_t);
       constexpr int64_t block = kConv2dCooperativeTile;
       if (plan.flat) {
-        name = fmt::format("conv2d_cooperative_flat_{}x{}_k{}", plan.rows / block, plan.columns / block, params.kH);
+        name = fmt::format("conv2d_cooperative_flat_{}x{}_k{}{}",
+                           plan.rows / block,
+                           plan.columns / block,
+                           params.kH,
+                           output_t.is_contiguous() ? "" : "_nhwc");
         grid = MTLSizeMake(ceil_div(Og, plan.rows), ceil_div(positions, plan.columns), N);
         break;
       }
