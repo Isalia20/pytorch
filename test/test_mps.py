@@ -10532,7 +10532,7 @@ class TestLargeTensors(TestCaseMPS):
         gc.collect()
         torch.mps.empty_cache()
 
-    @largeTensorTest("16GB", device="mps")
+    @largeTensorTest("12GB", device="mps")
     @parametrize("C,O", [(65536, 8), (8, 65536)])  # input-plane / output-plane overflow
     def test_conv3d_int32_overflow(self, C, O):
         x = torch.randn(1, C, 1, 182, 181, dtype=torch.float16, device='mps')
@@ -10545,7 +10545,7 @@ class TestLargeTensors(TestCaseMPS):
         gc.collect()
         torch.mps.empty_cache()
 
-    @largeTensorTest("16GB", device="mps")
+    @largeTensorTest("12GB", device="mps")
     def test_conv3d_tile_count_int32_overflow(self):
         output_channels = torch.iinfo(torch.int32).max - 1
         # Stride 2 bypasses the pointwise matmul path while keeping the output
@@ -16344,16 +16344,28 @@ class TestComplex(TestCase):
 class TestCommon(TestCase):
     exact_dtype = True
 
+    @staticmethod
+    def _fft_tolerance(dtype, n):
+        # Rounding grows with the stage count, log2(n). Half-precision results round only once, at the final store.
+        eps = torch.finfo(dtype).eps
+        return 2 * eps if dtype == torch.float16 else 16 * eps * math.log2(max(n, 2))
+
+    # Pins four-step and tiled passes over batched long axes, which OpInfo sample sizes never reach.
     @parametrize("shape", [(2, 3, 4, 5, 6), (32, 8192), (2048, 32), (4096, 32), (2048, 2048), (8, 4096, 256)])
     def test_fftn_all_dims(self, device, shape):
         x = torch.randn(shape, dtype=torch.complex64)
-        self.assertEqual(torch.fft.fftn(x.to(device)).cpu(), torch.fft.fftn(x), atol=1e-3, rtol=1e-4)
+        tol = self._fft_tolerance(torch.float32, x.numel())
+        # Unnormalized outputs are about sqrt(numel) in magnitude
+        self.assertEqual(torch.fft.fftn(x.to(device)).cpu(), torch.fft.fftn(x), atol=tol * x.numel() ** 0.5, rtol=tol)
 
+    # Pins the global-memory passes: 176400 = 2^4 * 3^2 * 5^2 * 7^2 needs all of the odd radices.
     def test_rfft_long_mixed_radix(self, device):
-        x = torch.randn(2, 176400)
+        n = 176400
+        tol = self._fft_tolerance(torch.float32, n)
+        x = torch.randn(2, n)
         y = torch.fft.rfft(x.to(device)).cpu()
-        self.assertEqual(y, torch.fft.rfft(x), atol=1e-2, rtol=1e-4)
-        self.assertEqual(torch.fft.irfft(y.to(device), n=176400).cpu(), x, atol=1e-4, rtol=1e-4)
+        self.assertEqual(y, torch.fft.rfft(x), atol=tol * n ** 0.5, rtol=tol)
+        self.assertEqual(torch.fft.irfft(y.to(device), n=n).cpu(), x, atol=tol, rtol=tol)
 
     @dtypes(torch.float32, torch.float16)
     @parametrize("kind", ["fft", "rfft", "irfft"])
@@ -16361,6 +16373,8 @@ class TestCommon(TestCase):
     def test_fft_normalization_intermediates(self, device, dtype, kind, shape):
         complex_dtype = torch.complex32 if dtype == torch.float16 else torch.complex64
         in_shape = (*shape[:-1], shape[-1] // 2 + 1) if kind == "irfft" else shape
+        # Constant inputs: the final peak fits half precision, but an axis normalized too late overflows it and one
+        # normalized too early underflows it.
         value = 1000 if len(shape) == 1 else 100 if kind == "irfft" else 1e-4
         x = torch.full(in_shape, value,
                        dtype=dtype if kind == "rfft" else complex_dtype, device=device)
@@ -16368,8 +16382,11 @@ class TestCommon(TestCase):
         op = getattr(torch.fft, kind + "n")
         ref = op(x.cpu().to(torch.float64 if kind == "rfft" else torch.complex128), **kwargs)
         result = torch._fft_r2c(x, list(range(x.ndim)), 2, True) if kind == "rfft" else op(x, **kwargs)
-        self.assertEqual(result.cpu(), ref.to(result.dtype), atol=1e-7, rtol=2e-3)
+        n = math.prod(shape)
+        atol = self._fft_tolerance(torch.float32, n) * ref.abs().max().item()
+        self.assertEqual(result.cpu(), ref.to(result.dtype), atol=atol, rtol=self._fft_tolerance(dtype, n))
 
+    # Pins each kernel family through each layout: fixed lengths, p2, p235, all (11, 13, 143), and Bluestein (1001, 4099).
     @dtypes(torch.float32, torch.float16)
     @parametrize("n", [11, 13, 26, 64, 128, 143, 200, 224, 240, 256, 512, 1001, 1024, 2048, 4096, 4099])
     @parametrize("kind", ["fft", "ifft", "rfft", "irfft"])
@@ -16377,6 +16394,7 @@ class TestCommon(TestCase):
     def test_fft_strides(self, device, dtype, n, kind, layout):
         complex_dtype = torch.complex32 if dtype == torch.float16 else torch.complex64
         length = 2 * n if kind == "rfft" else n + 1 if kind == "irfft" else n
+        # 2 * length + 3 points so that the 3::2 slice has `length` points, stride 2 and a nonzero offset
         x = torch.randn(5, 2 * length + 3, device=device, dtype=dtype if kind == "rfft" else complex_dtype)
         x = {"sliced": x[:, 3::2], "transposed": x[:, :length].t().contiguous().t()}.get(layout, x[:, :length].contiguous())
         op = torch._fft_r2c if kind == "rfft" else getattr(torch.fft, kind)
@@ -16386,8 +16404,69 @@ class TestCommon(TestCase):
         if layout == "out":
             out_dtype = dtype if kind == "irfft" else complex_dtype
             kwargs["out"] = torch.empty(5, 2 * reference.size(-1) + 3, device=device, dtype=out_dtype)[:, 3::2]
-        result, tol = op(x, **kwargs), 2e-3 if dtype == torch.float16 else 2e-5
+        # Bluestein's inner transforms are up to 4 times longer than its input
+        tol = self._fft_tolerance(dtype, 4 * length)
+        result = op(x, **kwargs)
         self.assertEqual(result.cpu(), reference.to(result.dtype), atol=tol, rtol=tol)
+
+    def test_fft_channels_last(self, device):
+        x = torch.randn(2, 8, 16, 32).to(memory_format=torch.channels_last)
+        tol = self._fft_tolerance(torch.float32, x.numel())
+        self.assertEqual(torch.fft.rfft2(x.to(device)).cpu(), torch.fft.rfft2(x), atol=tol, rtol=tol)
+
+    # The private ops take unwrapped dims directly; the torch.fft frontends wrap theirs first.
+    def test_fft_private_ops_negative_dims(self, device):
+        x = torch.randn(3, 64, device=device, dtype=torch.complex64)
+        h = torch.fft.rfft(x.real)
+        self.assertEqual(torch._fft_c2c(x, [-1], 0, True), torch.fft.fft(x))
+        self.assertEqual(torch._fft_r2c(x.real, [-1], 0, True), h)
+        self.assertEqual(torch._fft_c2r(h, [-1], 0, 64), torch.fft.irfft(h, n=64, norm="forward"))
+
+    def test_fft_r2c_empty_axis(self, device):
+        x = torch.empty(3, 0)
+        self.assertEqual(torch._fft_r2c(x.to(device), [1], 0, True).cpu(), torch._fft_r2c(x, [1], 0, True))
+
+    # Past two passes, real outputs go through a full complex transform and Bluestein multiplies by its chirps
+    # separately. Impulse inputs have known answers, so no CPU reference of this length is needed.
+    @serialTest()
+    @largeTensorTest("4GB", device="mps")
+    @parametrize("kind", ["fft", "rfft", "irfft"])
+    @parametrize("n", [2 ** 26, 8388617, 5 ** 11])
+    def test_fft_beyond_two_passes(self, device, kind, n):
+        if kind == "irfft":
+            y = torch.fft.irfft(torch.ones(n // 2 + 1, device=device, dtype=torch.complex64), n=n)
+            self.assertLess(abs(y[0].item() - 1), 1e-3)
+            self.assertLess(y[1:].abs().max().item(), 1e-3)
+            return
+        x = torch.zeros(n, device=device, dtype=torch.complex64 if kind == "fft" else torch.float32)
+        x[3] = 1
+        y = getattr(torch.fft, kind)(x).abs()
+        self.assertLess((y - 1).abs().max().item(), 1e-3)
+
+    # Global-memory passes index past 2^25, where integers stop being exact in float; 7^10 has a radix 7 first pass.
+    @serialTest()
+    @largeTensorTest("12GB", device="mps")
+    def test_fft_global_pass_index_above_float_precision(self, device):
+        n = 7 ** 10
+        x = torch.zeros(n, device=device, dtype=torch.complex64)
+        x[2 ** 25 + 2] = 1
+        self.assertLess((torch.fft.fft(x).abs() - 1).abs().max().item(), 1e-3)
+
+    # Kernels index with 32 bits: batches past 2^31 elements are split, a single transform that long is unsupported.
+    @serialTest()
+    @largeTensorTest("10GB", device="mps")
+    def test_fft_batch_over_int32(self, device):
+        x = torch.zeros(2 ** 19, 2 ** 12, device=device, dtype=torch.float16)
+        x[:, 3] = 1
+        y = torch._fft_r2c(x, [1], 0, True)
+        self.assertLess((y[[0, -1]].abs() - 1).abs().max().item(), 2e-3)
+
+    @serialTest()
+    @largeTensorTest("10GB", device="mps")
+    def test_fft_single_transform_over_int32(self, device):
+        x = torch.empty(2 ** 31, device=device, dtype=torch.float16)
+        with self.assertRaisesRegex(NotImplementedError, "single transform"):
+            torch._fft_r2c(x, [0], 0, True)
 
     # Verifies, on teardown, that no OpInfo is still using dynamic dtypes in CI
     @classmethod
