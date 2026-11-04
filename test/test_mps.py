@@ -16344,7 +16344,7 @@ class TestComplex(TestCase):
 class TestCommon(TestCase):
     exact_dtype = True
 
-    @parametrize("shape", [(2, 3, 4, 5, 6), (32, 8192)])
+    @parametrize("shape", [(2, 3, 4, 5, 6), (32, 8192), (2048, 32), (4096, 32), (2048, 2048), (8, 4096, 256)])
     def test_fftn_all_dims(self, device, shape):
         x = torch.randn(shape, dtype=torch.complex64)
         self.assertEqual(torch.fft.fftn(x.to(device)).cpu(), torch.fft.fftn(x), atol=1e-3, rtol=1e-4)
@@ -16356,7 +16356,22 @@ class TestCommon(TestCase):
         self.assertEqual(torch.fft.irfft(y.to(device), n=176400).cpu(), x, atol=1e-4, rtol=1e-4)
 
     @dtypes(torch.float32, torch.float16)
-    @parametrize("n", [64, 128, 200, 240, 256, 512, 1024, 2048, 4096, 4099])
+    @parametrize("kind", ["fft", "rfft", "irfft"])
+    @parametrize("shape", [(32, 32, 32), (16384,), (1048576,)])
+    def test_fft_normalization_intermediates(self, device, dtype, kind, shape):
+        complex_dtype = torch.complex32 if dtype == torch.float16 else torch.complex64
+        in_shape = (*shape[:-1], shape[-1] // 2 + 1) if kind == "irfft" else shape
+        value = 1000 if len(shape) == 1 else 100 if kind == "irfft" else 1e-4
+        x = torch.full(in_shape, value,
+                       dtype=dtype if kind == "rfft" else complex_dtype, device=device)
+        kwargs = {"s": shape, "norm": "backward" if kind == "irfft" else "forward"}
+        op = getattr(torch.fft, kind + "n")
+        ref = op(x.cpu().to(torch.float64 if kind == "rfft" else torch.complex128), **kwargs)
+        result = torch._fft_r2c(x, list(range(x.ndim)), 2, True) if kind == "rfft" else op(x, **kwargs)
+        self.assertEqual(result.cpu(), ref.to(result.dtype), atol=1e-7, rtol=2e-3)
+
+    @dtypes(torch.float32, torch.float16)
+    @parametrize("n", [11, 13, 26, 64, 128, 143, 200, 224, 240, 256, 512, 1001, 1024, 2048, 4096, 4099])
     @parametrize("kind", ["fft", "ifft", "rfft", "irfft"])
     @parametrize("layout", ["contiguous", "transposed", "sliced", "out"])
     def test_fft_strides(self, device, dtype, n, kind, layout):

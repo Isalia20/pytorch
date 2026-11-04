@@ -91,6 +91,25 @@ inline void bfly(thread float2* v, bool inv, constant float2* tw, uint ts) {
     for (uint k1 = 0; k1 < R1; k1++) {
       bfly<R2, S>(v + R2 * k1 * S, inv, tw, ts);
     }
+  } else if (R == 11 || R == 13) {
+    float2 o[R];
+    o[0] = v[0];
+    for (uint r = 1; r <= R / 2; r++) {
+      o[0] += v[r * S] + v[(R - r) * S];
+    }
+    for (uint k = 1; k <= R / 2; k++) {
+      float2 a = v[0], b = 0.0f;
+      for (uint r = 1; r <= R / 2; r++) {
+        const float2 w = tw[((r * k) % R) * ts];
+        a += w.x * (v[r * S] + v[(R - r) * S]);
+        b += (inv ? -w.y : w.y) * mul_i(v[r * S] - v[(R - r) * S]);
+      }
+      o[k] = a + b;
+      o[R - k] = a - b;
+    }
+    for (uint k = 0; k < R; k++) {
+      v[k * S] = o[k];
+    }
   }
 }
 template <uint R> // Composite butterflies leave X[k1 + R1 k2] at k2 + R2 k1
@@ -218,7 +237,7 @@ template <uint R, bool P2, class I, class O, uint F, uint N, uint NS, bool C>
 inline void stage(Bufs<I, O> b, Params p, uint s, uint lane, bool valid) {
   constexpr bool G = F & 32, INV = F & 1;
   constexpr bool UNPACK = !G && !is_complex_v<I> && (F & 2);
-  constexpr uint EPT = G ? R : N == 1024 && (F & 60) == 0 ? 16 : 8;
+  constexpr uint EPT = G ? R : fft_ept(N, F, !is_complex_v<I>, C);
   constexpr uint M = (EPT + R - 1) / R;
   const uint n = N ? N : p.n, J = N ? N / EPT : p.jt, nR = n / R,
              Ns = NS ? NS : p.ns[s],
@@ -309,7 +328,7 @@ inline void stage(Bufs<I, O> b, Params p, uint s, uint lane, bool valid) {
 }
 constexpr uint first_radix(uint n) {
   const uint p2 = (n & -n) < 16 ? n & -n : 16;
-  return p2 > 1 ? p2 : n % 3 == 0 ? 3 : n % 5 == 0 ? 5 : 1;
+  return p2 > 1 ? p2 : n % 3 == 0 ? 3 : n % 5 == 0 ? 5 : n;
 }
 #define GLOBAL_RADICES(_) \
   _(2) _(3) _(4) _(5) _(7) _(8) _(9) _(12) _(15) _(16) _(21) _(25) _(28)
@@ -324,10 +343,22 @@ kernel void fft_kernel(
     constant FFTParams& p,
     threadgroup float2* buf [[threadgroup(0)]],
     uint tid [[thread_index_in_threadgroup]],
-    uint3 tg [[threadgroup_position_in_grid]]) {
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint3 groups [[threadgroups_per_grid]]) {
   constexpr bool G = F & 32, P2 = !G && MASK && (MASK & ~MASK_P2) == 0;
-  constexpr uint EPT = N == 1024 && (F & 60) == 0 ? 16 : 8;
+  constexpr uint EPT = fft_ept(N, F, !is_complex_v<I>, C);
   const uint n = N ? N : p.n, B = C || G ? 1 : p.tgb, J = N ? N / EPT : p.jt;
+  // Consume the tail of freshly written inputs first.
+  if ((C && !is_complex_v<I>) || ((F & 8) && p.mirror_out)) {
+    tg.x = groups.x - 1 - tg.x;
+  }
+  // Linear dispatch keeps neighboring tiles together across batch dimensions.
+  if IF_CONSTEXPR (!G) {
+    if (p.ndim > 1) {
+      const uint nx = (p.sizes[0] + B - 1) / B, ny = p.sizes[1];
+      tg = uint3(tg.x % nx, (tg.x / nx) % ny, tg.x / nx / ny);
+    }
+  }
   const uint first_b = G ? 0 : tg.x * B, nb = min(B, p.sizes[0] - first_b);
   const bool nfast = C || p.in_stride == 1;
   const uint b = G ? 0 : nfast ? tid / J : tid % B;
@@ -346,7 +377,9 @@ kernel void fft_kernel(
     constexpr uint r0 = first_radix(N), r1 = first_radix(N / r0),
                    r2 = first_radix(N / r0 / r1);
     stage<r0, P2, I, O, F, N, 1, C>(bufs, p, 0, lane, valid);
-    stage<r1, P2, I, O, F, N, r0, C>(bufs, p, 1, lane, valid);
+    if IF_CONSTEXPR (r1 > 1) {
+      stage<r1, P2, I, O, F, N, r0, C>(bufs, p, 1, lane, valid);
+    }
     if IF_CONSTEXPR (r2 > 1) {
       stage<r2, P2, I, O, F, N, r0 * r1, C>(bufs, p, 2, lane, valid);
     }
@@ -358,7 +391,7 @@ kernel void fft_kernel(
       stage<RR, P2, I, O, F, 0, 0, C>(bufs, p, s, lane, valid); \
     }                                                           \
     break;
-#define RADICES(_) _(1) GLOBAL_RADICES(_)
+#define RADICES(_) _(1) _(11) _(13) GLOBAL_RADICES(_)
       switch (p.radix[s]) { RADICES(STAGE) }
 #undef STAGE
     }
@@ -394,7 +427,7 @@ kernel void fft_kernel(
 #define INST2(IN, OUT, F, MASK, NAME, N, C)                           \
   template [[host_name("fft_" #IN "_" #OUT "_" NAME #F)]] kernel void \
   fft_kernel<IN, OUT, MASK, F, N, C>(                                 \
-      FFT_ARGS(IN, OUT), threadgroup float2*, uint, uint3);
+      FFT_ARGS(IN, OUT), threadgroup float2*, uint, uint3, uint3);
 #define INST1(...) INST2(__VA_ARGS__)
 #define UNPAREN(...) __VA_ARGS__
 #define INSTF(IN, OUT, F, X) INST1(IN, OUT, F, UNPAREN X)
@@ -418,12 +451,16 @@ kernel void fft_kernel(
 FAMILY(MASK_P2, "p2_")
 FAMILY(MASK_P235, "p235_")
 FAMILY(MASK_P2357, "p2357_")
+FAMILY((MASK_P2357 | (1u << 11) | (1u << 13)), "all_")
 PLAIN(INST, (((1u << 16) | (1u << 1)), "p16_", 0, false))
 #define FIXED_X(N) ((N & (N - 1) ? MASK_P235 : MASK_P2), #N "_", N, false)
 #define FIXED(N) BASIC(INST, FIXED_X(N)) EXT(INST, FIXED_X(N))
 #define FIXED_SIZES(_) \
-  _(64) _(128) _(200) _(240) _(256) _(512) _(1024) _(2048) _(4096)
+  _(64) _(128) _(200) _(224) _(240) _(256) _(512) _(1024) _(2048) _(4096)
 FIXED_SIZES(FIXED)
+PLAIN(INST, FIXED_X(11))
+PLAIN(INST, FIXED_X(13))
+PLAIN(INST, FIXED_X(26))
 #define CONTIG(N) BASIC(INST, (MASK_P2, #N "c_", N, true))
 #define CONTIG_SIZES(_) _(512) _(1024) _(2048) _(4096)
 CONTIG_SIZES(CONTIG)

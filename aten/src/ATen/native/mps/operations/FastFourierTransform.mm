@@ -5,7 +5,7 @@
 #include <ATen/native/mps/OperationUtils.h>
 #include <ATen/native/mps/kernels/FFT.h>
 #include <algorithm>
-#include <numeric>
+#include <limits>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -33,7 +33,8 @@ static auto& lib = MetalShaderLibrary::getBundledLibrary();
 // Complex points per transform that fit in threadgroup memory; longer transforms take several passes
 constexpr int64_t kMaxPoints = 4096;
 // Stage radices of the threadgroup kernels, and of the global-memory passes (one radix per pass)
-constexpr auto kRadices = {16, 8, 4, 2, 3, 5, 7}, kGlobalRadices = {28, 25, 21, 16, 15, 12, 9, 8, 7, 5, 4, 3, 2};
+constexpr auto kRadices = {16, 8, 4, 2, 3, 5, 7, 11, 13},
+               kGlobalRadices = {28, 25, 21, 16, 15, 12, 9, 8, 7, 5, 4, 3, 2};
 // Radix sequence of n over `rs` (largest first; {1} for n = 1), empty when n has other prime factors
 c10::SmallVector<uint32_t, 16> radices(int64_t n, std::initializer_list<int> rs) {
   c10::SmallVector<uint32_t, 16> plan(n == 1, 1);
@@ -43,6 +44,12 @@ c10::SmallVector<uint32_t, 16> radices(int64_t n, std::initializer_list<int> rs)
     }
   }
   return n == 1 ? plan : decltype(plan){};
+}
+bool fixed_length(int64_t n) {
+  return (n >= 64 && (n & (n - 1)) == 0) || n == 200 || n == 224 || n == 240;
+}
+int split_cost(int64_t n) {
+  return radices(n, kRadices).size() * (fixed_length(n) ? 1 : 2);
 }
 bool is_smooth(int64_t n) {
   return !radices(n, kRadices).empty();
@@ -130,20 +137,29 @@ Launch prepare(const Tensor& in, const Tensor& out, int64_t n, bool inv, bool ha
   const auto radix = radices(x.global ? x.global : n, x.global ? kGlobalRadices : kRadices);
   TORCH_INTERNAL_ASSERT(!radix.empty(), "no radix plan for ", n);
   // Kernel family: a global radix, a fixed length, or the smallest radix set factoring n (p16: lengths 1 and 16)
-  const bool fixed = (n >= 64 && (n & (n - 1)) == 0) || n == 200 || n == 240;
-  const auto set = n % 7 == 0 ? "p2357" : n % 3 == 0 || n % 5 == 0 ? "p235" : n == 1 || n == 16 ? "p16" : "p2";
-  const auto family = x.global ? "g" + std::to_string(x.global) : fixed ? std::to_string(n) : set;
+  const auto set = n % 11 == 0 || n % 13 == 0 ? "all"
+      : n % 7 == 0                            ? "p2357"
+      : n % 3 == 0 || n % 5 == 0              ? "p235"
+      : n == 1 || n == 16                     ? "p16"
+                                              : "p2";
   const auto n_sig = x.n_sig ? x.n_sig : n, n_in = x.n_in ? x.n_in : n, n_out = x.n_out ? x.n_out : n;
   const bool ld = x.cl || n_sig < n * x.ld_mul || (x.ld_mul > 1 && in.is_complex() && n_in < n_sig);
-  const bool st = x.out_k_mul > 1 || x.cs, pairs = (half || x.global) && !out.is_complex(), tw4 = x.tt && !x.global;
+  const bool st = x.cs || (x.out_k_mul > 1 && (!out.is_complex() || x.mirror_out || n_out < n_sig));
+  const bool pairs = (half || x.global) && !out.is_complex(), tw4 = x.tt && !x.global;
   const uint32_t F =
       inv | (half ? 2 : 0) | (tw4 ? 4 : 0) | (st ? 8 : 0) | (ld ? 16 : 0) | (x.global ? 32 : 0) | (pairs ? 64 : 0);
-  const int64_t ept = n == 1024 && !(F & 60) ? 16 : 8, rows = b.dims[0].size;
-  const int64_t J = !x.global ? (n + ept - 1) / ept : x.global == 1 ? 256 : 64;
-  // Batch small transforms (<= 5% idle lanes), tile strided axes; pad contiguous rows, interleave strided ones
+  const bool fixed = fixed_length(n) || ((n == 11 || n == 13 || n == 26) && !(F & 60));
+  const auto family = x.global          ? "g" + std::to_string(x.global)
+      : fixed                           ? std::to_string(n)
+      : (n == 1 || n == 16) && (F & 60) ? "p2"
+                                        : set;
   const bool strided = b.si != 1 || b.so != 1;
+  const int64_t ept = fft_ept(n, F, !in.is_complex(), !strided), rows = b.dims[0].size;
+  const int64_t J = !x.global ? (radix.size() == 1 ? 1 : (n + ept - 1) / ept) : x.global == 1 ? 256 : 64;
+  // Batch small transforms (<= 5% idle lanes), tile strided axes; pad contiguous rows, interleave strided ones
   const int64_t padded = n + n / 16 + 1;
-  int64_t B = strided ? std::min<int64_t>({kMaxPoints / n, 1024 / J, std::max<int64_t>(4, 256 / J)}) : 64 / J;
+  const int64_t tile_threads = b.numel * n >= 1 << 22 || (n == 512 && !(F & 60) && b.numel >= 1024) ? 512 : 256;
+  int64_t B = strided ? std::min<int64_t>({kMaxPoints / n, 1024 / J, std::max<int64_t>(4, tile_threads / J)}) : 64 / J;
   int64_t c = std::max<int64_t>(B, 1);
   for (; !strided && c <= 8 && c * padded <= kMaxPoints && ((c * J + 31) / 32 * 32 - c * J) * 20 > c * J; c++) {
   }
@@ -173,10 +189,9 @@ Launch prepare(const Tensor& in, const Tensor& out, int64_t n, bool inv, bool ha
   const auto name = fmt::format(
       "fft_{}_{}_{}{}_{}", scalarToMetalTypeString(in), scalarToMetalTypeString(out), family, contig ? "c" : "", F);
   Launch l{in, out, twiddles(half ? 2 * n : n), x.cl, x.cs, x.tt, params, lib.getPipelineStateForFunc(name)};
-  const int64_t ny = b.dims.size() > 1 ? b.dims[1].size : 1,
-                threads = x.global == 1 ? n / 2 + 1 : n / std::max<int64_t>(x.global, 1);
+  const int64_t threads = x.global == 1 ? n / 2 + 1 : n / std::max<int64_t>(x.global, 1);
   l.grid = x.global ? MTLSizeMake((threads + J - 1) / J, rows, b.numel / rows)
-                    : MTLSizeMake((rows + B - 1) / B, ny, b.numel / rows / ny);
+                    : MTLSizeMake((rows + B - 1) / B * (b.numel / rows), 1, 1);
   l.group = MTLSizeMake(B * J, 1, 1);
   const int64_t bytes = B * (strided ? n : row) * (strided || B > 1 ? 2 : 3) * sizeof(float);
   l.smem = x.global ? 16 : std::min<int64_t>(32768, (bytes + 15) / 16 * 16);
@@ -204,18 +219,53 @@ void fft_batch(const Tensor& in, const Tensor& out, const Batch& b, int64_t n, b
   const bool real = !in.is_complex() || !out.is_complex();
   const int64_t m = real && n % 2 == 0 ? n / 2 : n;
   const bool half = !x.cl && !x.cs && n > 2 && m < n && m <= kMaxPoints;
-  // Strided on both sides past 1024 points the tiles no longer coalesce: two tile passes move less
-  const bool both = std::abs(b.si) != 1 && std::abs(b.so) != 1 && !x.cs && (half ? m : n) > 1024;
+  // Split long strided axes for small batches; large pow2 batches favor fewer global-memory passes.
+  const bool both =
+      std::abs(b.si) != 1 && std::abs(b.so) != 1 && !x.cs && (half ? m : n) > 1024 && (b.numel < 2048 || (n & (n - 1)));
   if ((half ? m : n) <= kMaxPoints && !both) {
     run({prepare(in, out, half ? m : n, inv, half, b, x)});
     return;
   }
-  // Long non-pow2 lengths in fp32: one global-memory stage per radix between two contiguous temps, then the unpack
   const bool plain = !x.cl && !x.cs && !x.n_sig;
   const bool fp32 = c10::toRealValueType(in.scalar_type()) == kFloat && (!real || n % 2 == 0);
   auto gplan = radices(m, kGlobalRadices);
-  if (n >= 1 << 17 && (n & (n - 1)) && plain && fp32 && !gplan.empty()) {
-    gplan.resize(gplan.size() + !in.is_complex(), 1);
+  const bool global = n > kMaxPoints && (n & (n - 1)) && plain && fp32 && !gplan.empty();
+  // Four-step: n = n1*n2, temp [outer batch][n2][n1][inner batch]; pass 1 transforms strided n1-point columns
+  // times W_n^(k1*i0), pass 2 writes k1+n1*k2 (n1 <= 1024 if it recurses). Real transforms halve one pass.
+  const bool big = plain && b.numel * n >= 1 << 17;
+  bool r2c = big && !in.is_complex(), c2r = big && !out.is_complex();
+  const bool nest = !x.cs && n_out == n && out.is_complex();
+  // Prefer fixed-stage plans and fewer passes; nr balances the half-length real transform.
+  int64_t n1 = 0, nr = 0;
+  int best = std::numeric_limits<int>::max(), best_real = best;
+  for (int64_t d = 1; (!global || n < (1 << 17)) && d * d <= n; d++) {
+    const int64_t q = n / d;
+    if (n % d || !is_smooth(d) || !is_smooth(q)) {
+      continue;
+    }
+    const bool extra = nest && q > 1024 && (q > kMaxPoints || b.numel * d < 2048 || (q & (q - 1)));
+    const auto cost = split_cost(d) + split_cost(q) + extra;
+    if ((q <= kMaxPoints || nest) && (!nest || d <= 1024) && cost <= best) {
+      n1 = d;
+      best = cost;
+    }
+    for (const auto first : {d, q}) {
+      const auto second = n / first, h = r2c ? first : second;
+      const auto a = r2c ? first / 2 : first, b = c2r ? second / 2 : second;
+      if (!(r2c || c2r) || h % 2 || h <= 2 || a > kMaxPoints || b > kMaxPoints) {
+        continue;
+      }
+      const auto real_cost = std::max(a, b);
+      if (real_cost < best_real || (real_cost == best_real && first > nr)) {
+        nr = first;
+        best_real = real_cost;
+      }
+    }
+  }
+  // Include the final unpack for real input when comparing global and threadgroup plans.
+  const auto passes = gplan.size() + !in.is_complex();
+  if (global && (n >= (1 << 17) || best >= 2 * static_cast<int>(passes))) {
+    gplan.resize(passes, 1);
     const auto tmp = at::empty({2, b.numel * m}, out.options().dtype(kComplexFloat));
     const auto tt = twiddles(m, true);
     std::vector<Launch> launches;
@@ -233,21 +283,6 @@ void fft_batch(const Tensor& in, const Tensor& out, const Batch& b, int64_t n, b
     }
     run(launches);
     return;
-  }
-  // Four-step: n = n1*n2, temp [outer batch][n2][n1][inner batch]; pass 1 transforms strided n1-point columns
-  // times W_n^(k1*i0), pass 2 writes k1+n1*k2 (n1 <= 256 if it recurses). Real transforms halve one pass.
-  const bool big = plain && b.numel * n >= 1 << 17;
-  bool r2c = big && !in.is_complex(), c2r = big && !out.is_complex();
-  const bool nest = !x.cs && n_out == n && out.is_complex();
-  // n1: the largest smooth divisor <= sqrt(n) whose cofactor fits a pass; nr: with an even halved real pass
-  int64_t n1 = 0, nr = 0;
-  for (int64_t d = 1; d * d <= n; d++) {
-    const int64_t q = n / d, h = r2c ? d : q;
-    if (n % d || !is_smooth(d) || !is_smooth(q)) {
-      continue;
-    }
-    nr = q <= kMaxPoints && h % 2 == 0 && h > 2 && h <= 2 * kMaxPoints ? d : nr;
-    n1 = (q <= kMaxPoints || nest) && (!nest || d <= 256) ? d : n1;
   }
   r2c = r2c && nr, c2r = c2r && nr, n1 = r2c || c2r ? nr : n1;
   TORCH_CHECK(n1 > 0, "MPS FFT does not support transforms of length ", n);
@@ -268,17 +303,20 @@ void fft_batch(const Tensor& in, const Tensor& out, const Batch& b, int64_t n, b
       });
   auto tmp =
       inplace ? out : at::empty({b.numel * rows * rl}, out.options().dtype(c10::toComplexType(out.scalar_type())));
-  const Pass load{
+  // Normalize subtransforms before storing half-precision intermediates.
+  const double scale1 = std::pow(x.scale, std::log(n1) / std::log(n)), scale2 = x.scale / scale1;
+  Pass load{
       .n_sig = n_sig, .n_in = n_in, .n_out = rl, .ld_mul = n2, .cl = x.cl, .tt = twiddles(n, true), .i0_dim1 = inner};
+  load.scale = scale1;
   auto first = prepare(in, tmp, r2c ? n1 / 2 : n1, inv, r2c, b1, load);
   if (r2c || c2r || n2 <= 1024 || !nest) {
-    Pass store{.n_sig = n, .n_out = c2r ? n2 / 2 : n_out, .out_k_mul = c2r ? 1 : n1, .scale = x.scale, .cs = x.cs};
+    Pass store{.n_sig = n, .n_out = c2r ? n2 / 2 : n_out, .out_k_mul = c2r ? 1 : n1, .scale = scale2, .cs = x.cs};
     store.mirror_out = r2c, store.i0_dim1 = inner;
     run({first, prepare(tmp, out, c2r ? n2 / 2 : n2, inv, c2r, b2, store)});
     return;
   }
   run({first});
-  fft_batch(tmp, out, b2, n2, inv, {.scale = x.scale});
+  fft_batch(tmp, out, b2, n2, inv, {.scale = scale2});
 }
 // n-point transforms along `dim`; lengths with other prime factors use Bluestein's algorithm
 void fft_pass(const Tensor& in, const Tensor& out, int64_t dim, int64_t n, bool inv, const Pass& x = {}) {
@@ -295,8 +333,8 @@ void fft_pass(const Tensor& in, const Tensor& out, int64_t dim, int64_t n, bool 
   fft_pass(in, tmp, dim, M, false, {.n_sig = n, .n_in = x.n_in ? x.n_in : n, .scale = x.scale / M, .cl = c, .cs = B});
   fft_pass(tmp, out, dim, M, true, {.n_out = x.n_out ? x.n_out : n, .cs = c});
 }
-double norm_scale(int64_t normalization, const Tensor& t, IntArrayRef dims) {
-  const auto n = std::accumulate(dims.begin(), dims.end(), 1.0, [&](double a, int64_t d) { return a * t.size(d); });
+// Normalize each axis before storing half-precision intermediates to avoid underflow and overflow.
+double norm_scale(int64_t normalization, int64_t n) {
   return std::pow(n, -0.5 * normalization); // fft_norm_mode: none, by_root_n, by_n
 }
 } // anonymous namespace
@@ -336,10 +374,11 @@ Tensor& _fft_r2c_mps_out(const Tensor& self, IntArrayRef dim, int64_t normalizat
     return out;
   }
 
-  const Pass x{.n_out = out.size(last_dim), .scale = norm_scale(normalization, self, dim)};
+  const Pass x{.n_out = out.size(last_dim), .scale = norm_scale(normalization, self.size(last_dim))};
   fft_pass(self, out, last_dim, self.size(last_dim), false, x);
   for (const auto i : c10::irange(dim.size() - 1)) {
-    fft_pass(out, out, dim[i], self.size(dim[i]), false);
+    const auto n = self.size(dim[i]);
+    fft_pass(out, out, dim[i], n, false, {.scale = norm_scale(normalization, n)});
   }
   return out;
 }
@@ -369,9 +408,11 @@ Tensor& _fft_c2r_mps_out(const Tensor& self,
 
   const auto tmp = dim.size() > 1 ? at::empty(self.sizes(), self.options()) : self;
   for (const auto i : c10::irange(dim.size() - 1)) {
-    fft_pass(i ? tmp : self, tmp, dim[i], self.size(dim[i]), true);
+    const auto n = self.size(dim[i]);
+    fft_pass(i ? tmp : self, tmp, dim[i], n, true, {.scale = norm_scale(normalization, n)});
   }
-  const Pass x{.n_in = self.size(dim.back()), .n_out = last_dim_size, .scale = norm_scale(normalization, out, dim)};
+  const Pass x{
+      .n_in = self.size(dim.back()), .n_out = last_dim_size, .scale = norm_scale(normalization, last_dim_size)};
   fft_pass(tmp, out, dim.back(), last_dim_size, true, x);
   return out;
 }
@@ -387,9 +428,9 @@ Tensor& _fft_c2c_mps_out(const Tensor& self, IntArrayRef dim, int64_t normalizat
   if (dim.empty()) {
     return out.copy_(self);
   }
-  const auto scale = norm_scale(normalization, self, dim);
   for (const auto i : c10::irange(dim.size())) {
-    fft_pass(i ? out : self, out, dim[i], self.size(dim[i]), !forward, {.scale = i ? 1.0 : scale});
+    const auto n = self.size(dim[i]);
+    fft_pass(i ? out : self, out, dim[i], n, !forward, {.scale = norm_scale(normalization, n)});
   }
   return out;
 }

@@ -16,3 +16,10 @@ struct FFTParams {
   ::c10::metal::array<uint32_t, ::c10::metal::max_ndim> sizes;
   ::c10::metal::array<int32_t, ::c10::metal::max_ndim> in_strides, out_strides;
 };
+constexpr uint32_t fft_ept(uint32_t n, uint32_t f, bool real, bool contig) {
+  return n == 26 && !(f & 60) ? 13
+      : (n == 512 && ((f & 8) || (real && (f & 4)))) ||
+          ((n == 1024 || (n == 2048 && !contig)) && !(f & 60))
+      ? 16
+      : 8;
+}
