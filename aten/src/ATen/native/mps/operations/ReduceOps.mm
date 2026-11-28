@@ -190,6 +190,7 @@ struct ReductionPlan {
   // [row_stride, element_stride, 0, 0]; see reduction_flat_strided.
   std::array<uint32_t, 4> flat_sizes{};
   std::array<uint32_t, 4> flat_strides{};
+  int64_t peel_dim = -1;
 };
 
 // Full reduction over a non-contiguous input without copying it first. Usable
@@ -393,6 +394,10 @@ static ReductionPlan select_reduction_plan(const Tensor& input, const Tensor& ou
     } else if (input.is_contiguous() && reduced_dims_adjacent) {
       return select_reduction_plan(
           input.flatten(first_reduced, reduced_dim), output.flatten(first_reduced, reduced_dim), is_arg);
+    } else if (input.is_contiguous()) {
+      // reaching this branch means that we are reducing on 2 or more dims and those dims are not adjacent
+      // and of course input is contiguous
+      plan.peel_dim = reduced_dim;
     }
   }
   // Generic single-pass fallback.
@@ -659,6 +664,18 @@ static void reduction_dispatch_mps(Tensor input,
   }
 
   const auto plan = select_reduction_plan(input, output, op.is_arg);
+  if (plan.peel_dim >= 0) {
+    DimVector sizes(input.sizes());
+    sizes[plan.peel_dim] = 1;
+    const auto bytes = c10::multiply_integers(sizes) * static_cast<int64_t>(partial_type.size);
+    const auto partial =
+        at::empty({bytes}, output.options().dtype(kByte)).as_strided(sizes, c10::contiguous_strides(sizes));
+    const ReductionOp first_op{/*is_arg=*/false, op.prefix, op.input_type, partial_type};
+    const ReductionOp combine_op{/*is_arg=*/false, combine_prefix, partial_type, op.output_type, op.param, op.mean};
+    reduction_dispatch_mps(input, partial, first_op, partial_type, combine_prefix, profile_name);
+    reduction_dispatch_mps(partial, output, combine_op, partial_type, combine_prefix, profile_name);
+    return;
+  }
   // Metal thread positions are 32-bit, so a grid with more threads in some dim is sliced into chunks of outputs
   auto grid_threads = [&](const ReductionPlan& p) {
     const auto grid = reduction_launch_size(p, op.is_arg, output.numel()).first;
